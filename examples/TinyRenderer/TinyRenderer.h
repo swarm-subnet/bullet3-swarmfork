@@ -61,6 +61,7 @@ class TinyRenderer
 public:
 	static void renderObjectDepth(TinyRenderObjectData& renderData);
 	static void renderObject(TinyRenderObjectData& renderData);
+	static void renderObjectCameraDepthOnly(TinyRenderObjectData& renderData);
 };
 
 #endif  // TINY_RENDERER_Hbla

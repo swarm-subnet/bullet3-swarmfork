@@ -70,6 +70,49 @@ struct DepthShader : public IShader
 	}
 };
 
+struct CameraDepthOnlyShader : public IShader
+{
+	Model* m_model;
+	Matrix& m_modelMat;
+	Matrix m_invModelMat;
+	Matrix& m_modelView;
+	Matrix& m_projectionMat;
+	Vec3f m_localScaling;
+
+	mat<4, 3, float> varying_tri;
+	mat<4, 3, float> world_tri;
+
+	CameraDepthOnlyShader(Model* model, Matrix& modelView, Matrix& projectionMat, Matrix& modelMat, Vec3f localScaling)
+		: m_model(model),
+		  m_modelMat(modelMat),
+		  m_modelView(modelView),
+		  m_projectionMat(projectionMat),
+		  m_localScaling(localScaling)
+	{
+		m_nearPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] - 1);
+		m_farPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] + 1);
+		m_invModelMat = m_modelMat.invert_transpose();
+	}
+
+	virtual Vec4f vertex(int iface, int nthvert)
+	{
+		Vec3f unScaledVert = m_model->vert(iface, nthvert);
+		Vec3f scaledVert = Vec3f(unScaledVert[0] * m_localScaling[0],
+								 unScaledVert[1] * m_localScaling[1],
+								 unScaledVert[2] * m_localScaling[2]);
+		Vec4f gl_Vertex = m_projectionMat * m_modelView * embed<4>(scaledVert);
+		varying_tri.set_col(nthvert, gl_Vertex);
+		Vec4f world_Vertex = m_modelMat * embed<4>(scaledVert);
+		world_tri.set_col(nthvert, world_Vertex);
+		return gl_Vertex;
+	}
+
+	virtual bool fragment(Vec3f bar, TGAColor& color)
+	{
+		return false;
+	}
+};
+
 struct Shader : public IShader
 {
 	Model* m_model;
@@ -650,6 +693,68 @@ void TinyRenderer::renderObjectDepth(TinyRenderObjectData& renderData)
 			else
 			{
 				triangle(shader.varying_tri, shader, depthFrame, shadowBufferPtr, segmentationMaskBufferPtr, renderData.m_viewportMatrix, renderData.m_objectIndex);
+			}
+		}
+	}
+}
+
+void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
+{
+	int width = renderData.m_rgbColorBuffer.get_width();
+	int height = renderData.m_rgbColorBuffer.get_height();
+
+	Model* model = renderData.m_model;
+	if (0 == model)
+		return;
+	if (model->getColorRGBA()[3] == 0)
+		return;
+
+	renderData.m_viewportMatrix = viewport(0, 0, width, height);
+
+	b3AlignedObjectArray<float>& zbuffer = renderData.m_depthBuffer;
+	int* segmentationMaskBufferPtr = (renderData.m_segmentationMaskBufferPtr && renderData.m_segmentationMaskBufferPtr->size()) ? &renderData.m_segmentationMaskBufferPtr->at(0) : 0;
+
+	{
+		Matrix modelViewMatrix = renderData.m_viewMatrix * renderData.m_modelMatrix;
+		Vec3f localScaling(renderData.m_localScaling[0], renderData.m_localScaling[1], renderData.m_localScaling[2]);
+		Matrix viewMatrixInv = renderData.m_viewMatrix.invert();
+		btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
+
+		CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+
+		for (int i = 0; i < model->nfaces(); i++)
+		{
+			for (int j = 0; j < 3; j++)
+			{
+				shader.vertex(i, j);
+			}
+
+			if (!renderData.m_doubleSided)
+			{
+				btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
+				btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
+				btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
+				btVector3 N = (v1 - v0).cross(v2 - v0);
+				if ((v0 - P).dot(N) >= 0)
+					continue;
+			}
+
+			mat<4, 3, float> stackTris[3];
+			b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
+			clippedTriangles.initializeFromBuffer(stackTris, 0, 3);
+
+			bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
+
+			if (hasClipped)
+			{
+				for (int t = 0; t < clippedTriangles.size(); t++)
+				{
+					triangleClippedDepthOnly(clippedTriangles[t], &zbuffer[0], segmentationMaskBufferPtr, renderData.m_viewportMatrix, renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24), width, height, shader.m_nearPlane, shader.m_farPlane);
+				}
+			}
+			else
+			{
+				triangleDepthOnly(shader.varying_tri, &zbuffer[0], segmentationMaskBufferPtr, renderData.m_viewportMatrix, renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24), width, height, shader.m_nearPlane, shader.m_farPlane);
 			}
 		}
 	}

@@ -13369,6 +13369,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX", ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX);
 	PyModule_AddIntConstant(m, "ER_NO_SEGMENTATION_MASK", ER_NO_SEGMENTATION_MASK);
 	PyModule_AddIntConstant(m, "ER_USE_PROJECTIVE_TEXTURE", ER_USE_PROJECTIVE_TEXTURE);
+	PyModule_AddIntConstant(m, "ER_DEPTH_ONLY", ER_DEPTH_ONLY);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

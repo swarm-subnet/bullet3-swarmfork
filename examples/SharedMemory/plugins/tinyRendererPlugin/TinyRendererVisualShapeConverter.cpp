@@ -1272,7 +1272,9 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		lightSpecularCoeff = m_data->m_lightSpecularCoeff;
 	}
 
-	if (m_data->m_hasShadow)
+	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
+
+	if (m_data->m_hasShadow && !depthOnly)
 	{
 		for (int n = 0; n < m_data->m_swRenderInstances.size(); n++)
 		{
@@ -1314,14 +1316,13 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	{
 		TinyRendererObjectArray** visualArrayPtr = m_data->m_swRenderInstances.getAtIndex(n);
 		if (0 == visualArrayPtr)
-			continue;  //can this ever happen?
+			continue;
 		TinyRendererObjectArray* visualArray = *visualArrayPtr;
 
 		for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 		{
 			TinyRenderObjectData* renderObj = visualArray->m_renderObjects[v];
 
-			//sync the object transform
 			const btTransform& tr = visualArray->m_worldTransform;
 			tr.getOpenGLMatrix(modelMat);
 
@@ -1341,15 +1342,23 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			renderObj->m_lightAmbientCoeff = lightAmbientCoeff;
 			renderObj->m_lightDiffuseCoeff = lightDiffuseCoeff;
 			renderObj->m_lightSpecularCoeff = lightSpecularCoeff;
-			TinyRenderer::renderObject(*renderObj);
+
+			if (depthOnly)
+			{
+				TinyRenderer::renderObjectCameraDepthOnly(*renderObj);
+			}
+			else
+			{
+				TinyRenderer::renderObject(*renderObj);
+			}
 		}
 	}
-	//printf("write tga \n");
-	//m_data->m_rgbColorBuffer.write_tga_file("camera.tga");
-	//	printf("flipped!\n");
-	m_data->m_rgbColorBuffer.flip_vertically();
 
-	//flip z-buffer and segmentation Buffer
+	if (!depthOnly)
+	{
+		m_data->m_rgbColorBuffer.flip_vertically();
+	}
+
 	{
 		int half = m_data->m_swHeight >> 1;
 		for (int j = 0; j < half; j++)
@@ -1359,7 +1368,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			for (int i = 0; i < m_data->m_swWidth; i++)
 			{
 				btSwap(m_data->m_depthBuffer[l1 + i], m_data->m_depthBuffer[l2 + i]);
-				btSwap(m_data->m_shadowBuffer[l1 + i], m_data->m_shadowBuffer[l2 + i]);
+				if (!depthOnly)
+				{
+					btSwap(m_data->m_shadowBuffer[l1 + i], m_data->m_shadowBuffer[l2 + i]);
+				}
 				btSwap(m_data->m_segmentationMaskBuffer[l1 + i], m_data->m_segmentationMaskBuffer[l2 + i]);
 			}
 		}

@@ -218,4 +218,101 @@ void triangle(mat<4, 3, float> &clipc, IShader &shader, TGAImage &image, float *
 		}
 	}
 }
+
+void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane)
+{
+	mat<3, 4, float> pts = (viewPortMatrix * clipc).transpose();
+
+	mat<3, 2, float> pts2;
+	for (int i = 0; i < 3; i++) pts2[i] = proj<2>(pts[i] / pts[i][3]);
+
+	Vec2f bboxmin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+	Vec2f bboxmax(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
+	Vec2f clamp(width - 1, height - 1);
+
+	for (int i = 0; i < 3; i++)
+	{
+		for (int j = 0; j < 2; j++)
+		{
+			bboxmin[j] = b3Max(0.f, b3Min(bboxmin[j], pts2[i][j]));
+			bboxmax[j] = b3Min(clamp[j], b3Max(bboxmax[j], pts2[i][j]));
+		}
+	}
+
+	Vec2i P;
+	for (P.x = bboxmin.x; P.x <= bboxmax.x; P.x++)
+	{
+		for (P.y = bboxmin.y; P.y <= bboxmax.y; P.y++)
+		{
+			Vec3d bc_screen = barycentric(pts2[0], pts2[1], pts2[2], P);
+			Vec3d bc_clip = Vec3d(bc_screen.x / pts[0][3], bc_screen.y / pts[1][3], bc_screen.z / pts[2][3]);
+			bc_clip = bc_clip / (bc_clip.x + bc_clip.y + bc_clip.z);
+			Vec3d clipd(clipc[2].x, clipc[2].y, clipc[2].z);
+			double frag_depth = -1. * (clipd * bc_clip);
+
+			if (bc_screen.x < 0 || bc_screen.y < 0 || bc_screen.z < 0 ||
+				zbuffer[P.x + P.y * width] > frag_depth)
+				continue;
+
+			if (frag_depth < -farPlane || frag_depth > nearPlane)
+				continue;
+
+			zbuffer[P.x + P.y * width] = frag_depth;
+			if (segmentationMaskBuffer)
+			{
+				segmentationMaskBuffer[P.x + P.y * width] = objectAndLinkIndex;
+			}
+		}
+	}
+}
+
+void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane)
+{
+	mat<3, 4, float> screenSpacePts = (viewPortMatrix * clipc).transpose();
+
+	mat<3, 2, float> pts2;
+	for (int i = 0; i < 3; i++)
+	{
+		pts2[i] = proj<2>(screenSpacePts[i] / screenSpacePts[i][3]);
+	}
+
+	Vec2f bboxmin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+	Vec2f bboxmax(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
+	Vec2f clamp(width - 1, height - 1);
+
+	for (int i = 0; i < 3; i++)
+	{
+		for (int j = 0; j < 2; j++)
+		{
+			bboxmin[j] = b3Max(0.f, b3Min(bboxmin[j], pts2[i][j]));
+			bboxmax[j] = b3Min(clamp[j], b3Max(bboxmax[j], pts2[i][j]));
+		}
+	}
+
+	Vec2i P;
+	for (P.x = bboxmin.x; P.x <= bboxmax.x; P.x++)
+	{
+		for (P.y = bboxmin.y; P.y <= bboxmax.y; P.y++)
+		{
+			Vec3d bc_screen = barycentric(pts2[0], pts2[1], pts2[2], P);
+			Vec3d bc_clip = Vec3d(bc_screen.x / screenSpacePts[0][3], bc_screen.y / screenSpacePts[1][3], bc_screen.z / screenSpacePts[2][3]);
+			bc_clip = bc_clip / (bc_clip.x + bc_clip.y + bc_clip.z);
+			Vec3d clipd(clipc[2].x, clipc[2].y, clipc[2].z);
+			double frag_depth = -1. * (clipd * bc_clip);
+
+			if (bc_screen.x < 0 || bc_screen.y < 0 || bc_screen.z < 0 ||
+				zbuffer[P.x + P.y * width] > frag_depth)
+				continue;
+
+			if (frag_depth < -farPlane || frag_depth > nearPlane)
+				continue;
+
+			zbuffer[P.x + P.y * width] = frag_depth;
+			if (segmentationMaskBuffer)
+			{
+				segmentationMaskBuffer[P.x + P.y * width] = objectAndLinkIndex;
+			}
+		}
+	}
+}
 }
