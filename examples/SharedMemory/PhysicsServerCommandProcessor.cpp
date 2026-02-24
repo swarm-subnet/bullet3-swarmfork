@@ -14962,45 +14962,109 @@ bool PhysicsServerCommandProcessor::processLoadBulletCommand(const struct Shared
 		}
 	}
 
+	bool keepImporterAlive = false;
 	if (found && buffer.size())
 	{
+		int numCollisionObjectsBefore = m_data->m_dynamicsWorld->getNumCollisionObjects();
+		int numMultiBodiesBefore = m_data->m_dynamicsWorld->getNumMultibodies();
+
 		bool ok = importer->loadFileFromMemory(&buffer[0], buffer.size());
 		if (ok)
 		{
-			int numRb = importer->getNumRigidBodies();
+			int registeredBodies = 0;
 			serverStatusOut.m_sdfLoadedArgs.m_numBodies = 0;
 			serverStatusOut.m_sdfLoadedArgs.m_numUserConstraints = 0;
+			m_data->m_sdfRecentLoadedBodies.clear();
 
-			for (int i = 0; i < numRb; i++)
+			int numMultiBodiesAfter = m_data->m_dynamicsWorld->getNumMultibodies();
+			for (int i = numMultiBodiesBefore; i < numMultiBodiesAfter; i++)
 			{
-				btCollisionObject* colObj = importer->getRigidBodyByIndex(i);
-				if (colObj)
+				btMultiBody* mb = m_data->m_dynamicsWorld->getMultiBody(i);
+				if (!mb)
 				{
-					btRigidBody* rb = btRigidBody::upcast(colObj);
-					if (rb)
-					{
-						int bodyUniqueId = m_data->m_bodyHandles.allocHandle();
-						InternalBodyHandle* bodyHandle = m_data->m_bodyHandles.getHandle(bodyUniqueId);
-						colObj->setUserIndex2(bodyUniqueId);
-						bodyHandle->m_rigidBody = rb;
-
-						if (serverStatusOut.m_sdfLoadedArgs.m_numBodies < MAX_SDF_BODIES)
-						{
-							serverStatusOut.m_sdfLoadedArgs.m_numBodies++;
-							serverStatusOut.m_sdfLoadedArgs.m_bodyUniqueIds[i] = bodyUniqueId;
-						}
-
-						b3Notification notification;
-						notification.m_notificationType = BODY_ADDED;
-						notification.m_bodyArgs.m_bodyUniqueId = bodyUniqueId;
-						m_data->m_pluginManager.addNotification(notification);
-					}
+					continue;
 				}
+
+				int bodyUniqueId = m_data->m_bodyHandles.allocHandle();
+				InternalBodyHandle* bodyHandle = m_data->m_bodyHandles.getHandle(bodyUniqueId);
+				mb->setUserIndex2(bodyUniqueId);
+				bodyHandle->m_multiBody = mb;
+				bodyHandle->m_linkLocalInertialFrames.resize(mb->getNumLinks());
+				for (int l = 0; l < mb->getNumLinks(); ++l)
+				{
+					bodyHandle->m_linkLocalInertialFrames[l].setIdentity();
+				}
+				m_data->m_sdfRecentLoadedBodies.push_back(bodyUniqueId);
+				registeredBodies++;
+
+				if (serverStatusOut.m_sdfLoadedArgs.m_numBodies < MAX_SDF_BODIES)
+				{
+					int outIndex = serverStatusOut.m_sdfLoadedArgs.m_numBodies;
+					serverStatusOut.m_sdfLoadedArgs.m_bodyUniqueIds[outIndex] = bodyUniqueId;
+					serverStatusOut.m_sdfLoadedArgs.m_numBodies++;
+				}
+
+				b3Notification notification;
+				notification.m_notificationType = BODY_ADDED;
+				notification.m_bodyArgs.m_bodyUniqueId = bodyUniqueId;
+				m_data->m_pluginManager.addNotification(notification);
 			}
 
-			serverCmd.m_type = CMD_BULLET_LOADING_COMPLETED;
-			m_data->m_guiHelper->autogenerateGraphicsObjects(m_data->m_dynamicsWorld);
+			int numCollisionObjectsAfter = m_data->m_dynamicsWorld->getNumCollisionObjects();
+			for (int i = numCollisionObjectsBefore; i < numCollisionObjectsAfter; i++)
+			{
+				btCollisionObject* colObj = m_data->m_dynamicsWorld->getCollisionObjectArray()[i];
+				if (!colObj)
+				{
+					continue;
+				}
+
+				if (btMultiBodyLinkCollider::upcast(colObj))
+				{
+					continue;
+				}
+
+				btRigidBody* rb = btRigidBody::upcast(colObj);
+				if (!rb)
+				{
+					continue;
+				}
+
+				int bodyUniqueId = m_data->m_bodyHandles.allocHandle();
+				InternalBodyHandle* bodyHandle = m_data->m_bodyHandles.getHandle(bodyUniqueId);
+				colObj->setUserIndex2(bodyUniqueId);
+				bodyHandle->m_rigidBody = rb;
+				m_data->m_sdfRecentLoadedBodies.push_back(bodyUniqueId);
+				registeredBodies++;
+
+				if (serverStatusOut.m_sdfLoadedArgs.m_numBodies < MAX_SDF_BODIES)
+				{
+					int outIndex = serverStatusOut.m_sdfLoadedArgs.m_numBodies;
+					serverStatusOut.m_sdfLoadedArgs.m_bodyUniqueIds[outIndex] = bodyUniqueId;
+					serverStatusOut.m_sdfLoadedArgs.m_numBodies++;
+				}
+
+				b3Notification notification;
+				notification.m_notificationType = BODY_ADDED;
+				notification.m_bodyArgs.m_bodyUniqueId = bodyUniqueId;
+				m_data->m_pluginManager.addNotification(notification);
+			}
+
+			if (registeredBodies > 0)
+			{
+				serverCmd.m_type = CMD_BULLET_LOADING_COMPLETED;
+				m_data->m_guiHelper->autogenerateGraphicsObjects(m_data->m_dynamicsWorld);
+				keepImporterAlive = true;
+			}
 		}
+	}
+	if (!keepImporterAlive)
+	{
+		delete importer;
+	}
+	else
+	{
+		m_data->m_worldImporters.push_back(importer);
 	}
 #endif
 	return hasStatus;

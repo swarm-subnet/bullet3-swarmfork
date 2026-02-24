@@ -928,6 +928,44 @@ void PhysicsDirect::postProcessStatus(const struct SharedMemoryStatus& serverCmd
 		{
 			break;
 		}
+		case CMD_BULLET_LOADING_COMPLETED:
+		{
+			m_data->m_tmpInfoRequestCommand.m_type = CMD_SYNC_BODY_INFO;
+			m_data->m_tmpInfoRequestCommand.m_updateFlags = 0;
+
+			bool hasStatus = m_data->m_commandProcessor->processCommand(
+				m_data->m_tmpInfoRequestCommand,
+				m_data->m_tmpInfoStatus,
+				&m_data->m_bulletStreamDataServerToClient[0],
+				SHARED_MEMORY_MAX_STREAM_CHUNK_SIZE);
+
+			b3Clock clock;
+			double startTime = clock.getTimeInSeconds();
+			double timeOutInSeconds = m_data->m_timeOutInSeconds;
+
+			while ((!hasStatus) && (clock.getTimeInSeconds() - startTime < timeOutInSeconds))
+			{
+				hasStatus = m_data->m_commandProcessor->receiveStatus(
+					m_data->m_tmpInfoStatus,
+					&m_data->m_bulletStreamDataServerToClient[0],
+					SHARED_MEMORY_MAX_STREAM_CHUNK_SIZE);
+			}
+
+			if (hasStatus && (m_data->m_tmpInfoStatus.m_type == CMD_SYNC_BODY_INFO_COMPLETED))
+			{
+				postProcessStatus(m_data->m_tmpInfoStatus);
+			}
+			else
+			{
+				const int timedOut = hasStatus ? 0 : 1;
+				b3Warning("CMD_BULLET_LOADING_COMPLETED diagnostics: m_data->m_commandProcessor->receiveStatus hasStatus=%d, timedOut=%d, m_data->m_tmpInfoStatus.m_type=%d, expected CMD_SYNC_BODY_INFO_COMPLETED=%d",
+						  hasStatus ? 1 : 0,
+						  timedOut,
+						  m_data->m_tmpInfoStatus.m_type,
+						  CMD_SYNC_BODY_INFO_COMPLETED);
+			}
+			break;
+		}
 		case CMD_SYNC_BODY_INFO_COMPLETED:
 		case CMD_MJCF_LOADING_COMPLETED:
 		case CMD_SDF_LOADING_COMPLETED:
@@ -1027,10 +1065,6 @@ void PhysicsDirect::postProcessStatus(const struct SharedMemoryStatus& serverCmd
 		case CMD_BULLET_LOADING_FAILED:
 		{
 			b3Warning("Couldn't load .bullet file");
-			break;
-		}
-		case CMD_BULLET_LOADING_COMPLETED:
-		{
 			break;
 		}
 

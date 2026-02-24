@@ -106,6 +106,7 @@ struct PhysicsClientSharedMemoryInternalData
 	{
 		m_cachedMeshData.m_numVertices = 0;
 		m_cachedMeshData.m_vertices = 0;
+		m_tempBackupServerStatus.m_type = CMD_INVALID_STATUS;
 	}
 
 	void processServerStatus();
@@ -434,14 +435,20 @@ void PhysicsClientSharedMemory::processBodyJointInfo(int bodyUniqueId, const Sha
 			Bullet::btMultiBodyDoubleData* mb =
 				(Bullet::btMultiBodyDoubleData*)bf.m_multiBodies[i];
 
-			bodyJoints->m_baseName = mb->m_baseName;
+			if (mb->m_baseName)
+			{
+				bodyJoints->m_baseName = mb->m_baseName;
+			}
 			addJointInfoFromMultiBodyData(mb, bodyJoints, m_data->m_verboseOutput);
 		}
 		else
 		{
 			Bullet::btMultiBodyFloatData* mb =
 				(Bullet::btMultiBodyFloatData*)bf.m_multiBodies[i];
-			bodyJoints->m_baseName = mb->m_baseName;
+			if (mb->m_baseName)
+			{
+				bodyJoints->m_baseName = mb->m_baseName;
+			}
 			addJointInfoFromMultiBodyData(mb, bodyJoints, m_data->m_verboseOutput);
 		}
 	}
@@ -600,6 +607,15 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 					b3Printf("Server loading the SDF OK\n");
 				}
 
+				break;
+			}
+			case CMD_BULLET_LOADING_COMPLETED:
+			{
+				B3_PROFILE("CMD_BULLET_LOADING_COMPLETED");
+				if (m_data->m_verboseOutput)
+				{
+					b3Printf("Server loading the .bullet file OK\n");
+				}
 				break;
 			}
 
@@ -1281,10 +1297,6 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 				b3Warning("Load texture failed");
 				break;
 			}
-			case CMD_BULLET_LOADING_COMPLETED:
-			{
-				break;
-			}
 			case CMD_BULLET_LOADING_FAILED:
 			{
 				b3Warning("Load .bullet failed");
@@ -1577,6 +1589,16 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 			m_data->m_waitingForServer = true;
 		}
 
+		if (serverCmd.m_type == CMD_BULLET_LOADING_COMPLETED)
+		{
+			m_data->m_tempBackupServerStatus = m_data->m_lastServerStatus;
+			SharedMemoryCommand& command = m_data->m_testBlock1->m_clientCommands[0];
+			command.m_type = CMD_SYNC_BODY_INFO;
+			command.m_updateFlags = 0;
+			submitClientCommand(command);
+			return 0;
+		}
+
 		if ((serverCmd.m_type == CMD_SDF_LOADING_COMPLETED) || (serverCmd.m_type == CMD_MJCF_LOADING_COMPLETED) || (serverCmd.m_type == CMD_SYNC_BODY_INFO_COMPLETED))
 		{
 			B3_PROFILE("CMD_LOADING_COMPLETED");
@@ -1603,7 +1625,13 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 			
 			if (numBodies > 0)
 			{
-				m_data->m_tempBackupServerStatus = m_data->m_lastServerStatus;
+				const bool preserveBulletBackup =
+					(serverCmd.m_type == CMD_SYNC_BODY_INFO_COMPLETED) &&
+					(m_data->m_tempBackupServerStatus.m_type == CMD_BULLET_LOADING_COMPLETED);
+				if (!preserveBulletBackup)
+				{
+					m_data->m_tempBackupServerStatus = m_data->m_lastServerStatus;
+				}
 
 				if (serverCmd.m_type == CMD_SYNC_BODY_INFO_COMPLETED)
 				{
@@ -1714,6 +1742,7 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 				return 0;
 			}
 			m_data->m_lastServerStatus = m_data->m_tempBackupServerStatus;
+			m_data->m_tempBackupServerStatus.m_type = CMD_INVALID_STATUS;
 		}
 
 		
@@ -1766,6 +1795,7 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 			else
 			{
 				m_data->m_lastServerStatus = m_data->m_tempBackupServerStatus;
+			m_data->m_tempBackupServerStatus.m_type = CMD_INVALID_STATUS;
 			}
 		}
 
@@ -1801,6 +1831,7 @@ const SharedMemoryStatus* PhysicsClientSharedMemory::processServerStatus()
 				else
 				{
 					m_data->m_lastServerStatus = m_data->m_tempBackupServerStatus;
+			m_data->m_tempBackupServerStatus.m_type = CMD_INVALID_STATUS;
 				}
 			}
 		}
