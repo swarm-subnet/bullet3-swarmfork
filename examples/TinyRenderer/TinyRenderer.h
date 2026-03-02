@@ -54,6 +54,12 @@ struct TinyRenderObjectData
 	int m_objectIndex;
 	int m_linkIndex;
 	bool m_doubleSided;
+
+	btVector3 m_localAABBMin;
+	btVector3 m_localAABBMax;
+	bool m_hasLocalAABB;
+
+	void computeLocalAABB();
 };
 
 class TinyRenderer

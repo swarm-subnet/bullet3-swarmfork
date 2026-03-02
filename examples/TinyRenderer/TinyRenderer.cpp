@@ -256,7 +256,9 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_lightAmbientCoeff = 0.6;
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
-
+	m_hasLocalAABB = false;
+	m_localAABBMin.setValue(0, 0, 0);
+	m_localAABBMax.setValue(0, 0, 0);
 }
 
 TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedObjectArray<float>& depthBuffer, b3AlignedObjectArray<float>* shadowBuffer, b3AlignedObjectArray<int>* segmentationMaskBuffer, int objectIndex, int linkIndex)
@@ -281,6 +283,9 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_lightAmbientCoeff = 0.6;
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
+	m_hasLocalAABB = false;
+	m_localAABBMin.setValue(0, 0, 0);
+	m_localAABBMax.setValue(0, 0, 0);
 }
 
 TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedObjectArray<float>& depthBuffer)
@@ -305,6 +310,9 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_lightAmbientCoeff = 0.6;
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
+	m_hasLocalAABB = false;
+	m_localAABBMin.setValue(0, 0, 0);
+	m_localAABBMax.setValue(0, 0, 0);
 }
 
 TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedObjectArray<float>& depthBuffer, b3AlignedObjectArray<int>* segmentationMaskBuffer, int objectIndex)
@@ -328,6 +336,9 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_lightAmbientCoeff = 0.6;
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
+	m_hasLocalAABB = false;
+	m_localAABBMin.setValue(0, 0, 0);
+	m_localAABBMax.setValue(0, 0, 0);
 }
 
 void TinyRenderObjectData::loadModel(const char* fileName, CommonFileIOInterface* fileIO)
@@ -341,6 +352,7 @@ void TinyRenderObjectData::loadModel(const char* fileName, CommonFileIOInterface
 	else
 	{
 		m_model = new Model(relativeFileName);
+		computeLocalAABB();
 	}
 }
 
@@ -398,6 +410,7 @@ void TinyRenderObjectData::registerMeshShape(const float* vertices, int numVerti
 									 indices[i + 2], indices[i + 2], indices[i + 2]);
 			}
 		}
+		computeLocalAABB();
 	}
 }
 
@@ -431,6 +444,7 @@ void TinyRenderObjectData::registerMesh2(btAlignedObjectArray<btVector3>& vertic
 								 indices[i + 1], indices[i + 1], indices[i + 1],
 								 indices[i + 2], indices[i + 2], indices[i + 2]);
 		}
+		computeLocalAABB();
 	}
 }
 
@@ -471,6 +485,26 @@ void TinyRenderObjectData::createCube(float halfExtentsX, float halfExtentsY, fl
 							 cube_indices[i + 1], cube_indices[i + 1], cube_indices[i + 1],
 							 cube_indices[i + 2], cube_indices[i + 2], cube_indices[i + 2]);
 	}
+	computeLocalAABB();
+}
+
+void TinyRenderObjectData::computeLocalAABB()
+{
+	m_hasLocalAABB = false;
+	if (!m_model || m_model->nverts() == 0)
+		return;
+	Vec3f v = m_model->vert(0);
+	btVector3 aabbMin(v[0], v[1], v[2]);
+	btVector3 aabbMax = aabbMin;
+	for (int i = 1; i < m_model->nverts(); i++)
+	{
+		v = m_model->vert(i);
+		aabbMin.setMin(btVector3(v[0], v[1], v[2]));
+		aabbMax.setMax(btVector3(v[0], v[1], v[2]));
+	}
+	m_localAABBMin = aabbMin;
+	m_localAABBMax = aabbMax;
+	m_hasLocalAABB = true;
 }
 
 TinyRenderObjectData::~TinyRenderObjectData()

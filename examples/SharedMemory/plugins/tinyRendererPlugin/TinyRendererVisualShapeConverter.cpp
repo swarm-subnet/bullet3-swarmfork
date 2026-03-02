@@ -1312,6 +1312,39 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		}
 	}
 
+	// Frustum culling: extract 6 world-space planes from P*V
+	float pvMat[16];
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+		{
+			pvMat[c * 4 + r] = 0;
+			for (int k = 0; k < 4; k++)
+				pvMat[c * 4 + r] += projMat[k * 4 + r] * viewMat[c * 4 + k];
+		}
+	float frustumPlanes[6][4];
+	for (int c = 0; c < 4; c++)
+	{
+		float r0 = pvMat[c * 4 + 0];
+		float r1 = pvMat[c * 4 + 1];
+		float r2 = pvMat[c * 4 + 2];
+		float r3 = pvMat[c * 4 + 3];
+		frustumPlanes[0][c] = r3 + r0;
+		frustumPlanes[1][c] = r3 - r0;
+		frustumPlanes[2][c] = r3 + r1;
+		frustumPlanes[3][c] = r3 - r1;
+		frustumPlanes[4][c] = r3 + r2;
+		frustumPlanes[5][c] = r3 - r2;
+	}
+	for (int pl = 0; pl < 6; pl++)
+	{
+		float len = btSqrt(frustumPlanes[pl][0] * frustumPlanes[pl][0] +
+		                    frustumPlanes[pl][1] * frustumPlanes[pl][1] +
+		                    frustumPlanes[pl][2] * frustumPlanes[pl][2]);
+		if (len > 1e-8f)
+			for (int c = 0; c < 4; c++)
+				frustumPlanes[pl][c] /= len;
+	}
+
 	for (int n = 0; n < m_data->m_swRenderInstances.size(); n++)
 	{
 		TinyRendererObjectArray** visualArrayPtr = m_data->m_swRenderInstances.getAtIndex(n);
@@ -1325,6 +1358,47 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 
 			const btTransform& tr = visualArray->m_worldTransform;
 			tr.getOpenGLMatrix(modelMat);
+
+			if (depthOnly && renderObj->m_hasLocalAABB)
+			{
+				const btVector3& ls = visualArray->m_localScaling;
+				btVector3 sMin, sMax;
+				for (int ax = 0; ax < 3; ax++)
+				{
+					float lo = renderObj->m_localAABBMin[ax] * ls[ax];
+					float hi = renderObj->m_localAABBMax[ax] * ls[ax];
+					sMin[ax] = btMin(lo, hi);
+					sMax[ax] = btMax(lo, hi);
+				}
+				btVector3 wMin, wMax;
+				for (int i = 0; i < 3; i++)
+				{
+					wMin[i] = modelMat[12 + i];
+					wMax[i] = modelMat[12 + i];
+					for (int j = 0; j < 3; j++)
+					{
+						float a = modelMat[j * 4 + i] * sMin[j];
+						float b = modelMat[j * 4 + i] * sMax[j];
+						wMin[i] += btMin(a, b);
+						wMax[i] += btMax(a, b);
+					}
+				}
+				bool outside = false;
+				for (int pl = 0; pl < 6; pl++)
+				{
+					float px = (frustumPlanes[pl][0] >= 0) ? wMax[0] : wMin[0];
+					float py = (frustumPlanes[pl][1] >= 0) ? wMax[1] : wMin[1];
+					float pz = (frustumPlanes[pl][2] >= 0) ? wMax[2] : wMin[2];
+					if (frustumPlanes[pl][0] * px + frustumPlanes[pl][1] * py +
+					    frustumPlanes[pl][2] * pz + frustumPlanes[pl][3] < 0)
+					{
+						outside = true;
+						break;
+					}
+				}
+				if (outside)
+					continue;
+			}
 
 			for (int i = 0; i < 4; i++)
 			{
