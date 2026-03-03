@@ -239,41 +239,72 @@ void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentatio
 		}
 	}
 
-	Vec2i P;
-	for (P.x = bboxmin.x; P.x <= bboxmax.x; P.x++)
-	{
-		for (P.y = bboxmin.y; P.y <= bboxmax.y; P.y++)
-		{
-			Vec3d bc_screen = barycentric(pts2[0], pts2[1], pts2[2], P);
-			Vec3d bc_clip = Vec3d(bc_screen.x / pts[0][3], bc_screen.y / pts[1][3], bc_screen.z / pts[2][3]);
-			bc_clip = bc_clip / (bc_clip.x + bc_clip.y + bc_clip.z);
-			Vec3d clipd(clipc[2].x, clipc[2].y, clipc[2].z);
-			double frag_depth = -1. * (clipd * bc_clip);
+	double Ax = pts2[0].x, Ay = pts2[0].y;
+	double Bx = pts2[1].x, By = pts2[1].y;
+	double Cx = pts2[2].x, Cy = pts2[2].y;
 
-			if (bc_screen.x < 0 || bc_screen.y < 0 || bc_screen.z < 0 ||
-				zbuffer[P.x + P.y * width] > frag_depth)
+	double uz = (Cx - Ax) * (By - Ay) - (Bx - Ax) * (Cy - Ay);
+	if (std::abs(uz) <= 1e-2)
+		return;
+
+	double inv_uz = 1.0 / uz;
+	double dux_dx = By - Ay, dux_dy = -(Bx - Ax);
+	double duy_dx = -(Cy - Ay), duy_dy = Cx - Ax;
+
+	double inv_w0 = 1.0 / pts[0][3];
+	double inv_w1 = 1.0 / pts[1][3];
+	double inv_w2 = 1.0 / pts[2][3];
+	double cz0 = clipc[2].x, cz1 = clipc[2].y, cz2 = clipc[2].z;
+
+	int x0 = (int)bboxmin.x, y0 = (int)bboxmin.y;
+	int x1 = (int)bboxmax.x, y1 = (int)bboxmax.y;
+
+	double ux_row = (Bx - Ax) * (Ay - y0) - (Ax - x0) * (By - Ay);
+	double uy_row = (Ax - x0) * (Cy - Ay) - (Cx - Ax) * (Ay - y0);
+
+	for (int py = y0; py <= y1; py++, ux_row += dux_dy, uy_row += duy_dy)
+	{
+		double ux = ux_row;
+		double uy = uy_row;
+		int row_off = py * width;
+
+		for (int px = x0; px <= x1; px++, ux += dux_dx, uy += duy_dx)
+		{
+			double bc0 = (uz - ux - uy) * inv_uz;
+			double bc1 = uy * inv_uz;
+			double bc2 = ux * inv_uz;
+
+			if (bc0 < 0 || bc1 < 0 || bc2 < 0)
+				continue;
+
+			double c0 = bc0 * inv_w0, c1 = bc1 * inv_w1, c2 = bc2 * inv_w2;
+			double cs = c0 + c1 + c2;
+			c0 /= cs; c1 /= cs; c2 /= cs;
+
+			double frag_depth = -(cz0 * c0 + cz1 * c1 + cz2 * c2);
+
+			int idx = px + row_off;
+			if (zbuffer[idx] > frag_depth)
 				continue;
 
 			if (frag_depth < -farPlane || frag_depth > nearPlane)
 				continue;
 
-			zbuffer[P.x + P.y * width] = frag_depth;
+			zbuffer[idx] = frag_depth;
 			if (segmentationMaskBuffer)
-			{
-				segmentationMaskBuffer[P.x + P.y * width] = objectAndLinkIndex;
-			}
+				segmentationMaskBuffer[idx] = objectAndLinkIndex;
 		}
 	}
 }
 
 void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane)
 {
-	mat<3, 4, float> screenSpacePts = (viewPortMatrix * clipc).transpose();
+	mat<3, 4, float> pts = (viewPortMatrix * clipc).transpose();
 
 	mat<3, 2, float> pts2;
 	for (int i = 0; i < 3; i++)
 	{
-		pts2[i] = proj<2>(screenSpacePts[i] / screenSpacePts[i][3]);
+		pts2[i] = proj<2>(pts[i] / pts[i][3]);
 	}
 
 	Vec2f bboxmin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
@@ -289,29 +320,60 @@ void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segm
 		}
 	}
 
-	Vec2i P;
-	for (P.x = bboxmin.x; P.x <= bboxmax.x; P.x++)
-	{
-		for (P.y = bboxmin.y; P.y <= bboxmax.y; P.y++)
-		{
-			Vec3d bc_screen = barycentric(pts2[0], pts2[1], pts2[2], P);
-			Vec3d bc_clip = Vec3d(bc_screen.x / screenSpacePts[0][3], bc_screen.y / screenSpacePts[1][3], bc_screen.z / screenSpacePts[2][3]);
-			bc_clip = bc_clip / (bc_clip.x + bc_clip.y + bc_clip.z);
-			Vec3d clipd(clipc[2].x, clipc[2].y, clipc[2].z);
-			double frag_depth = -1. * (clipd * bc_clip);
+	double Ax = pts2[0].x, Ay = pts2[0].y;
+	double Bx = pts2[1].x, By = pts2[1].y;
+	double Cx = pts2[2].x, Cy = pts2[2].y;
 
-			if (bc_screen.x < 0 || bc_screen.y < 0 || bc_screen.z < 0 ||
-				zbuffer[P.x + P.y * width] > frag_depth)
+	double uz = (Cx - Ax) * (By - Ay) - (Bx - Ax) * (Cy - Ay);
+	if (std::abs(uz) <= 1e-2)
+		return;
+
+	double inv_uz = 1.0 / uz;
+	double dux_dx = By - Ay, dux_dy = -(Bx - Ax);
+	double duy_dx = -(Cy - Ay), duy_dy = Cx - Ax;
+
+	double inv_w0 = 1.0 / pts[0][3];
+	double inv_w1 = 1.0 / pts[1][3];
+	double inv_w2 = 1.0 / pts[2][3];
+	double cz0 = clipc[2].x, cz1 = clipc[2].y, cz2 = clipc[2].z;
+
+	int x0 = (int)bboxmin.x, y0 = (int)bboxmin.y;
+	int x1 = (int)bboxmax.x, y1 = (int)bboxmax.y;
+
+	double ux_row = (Bx - Ax) * (Ay - y0) - (Ax - x0) * (By - Ay);
+	double uy_row = (Ax - x0) * (Cy - Ay) - (Cx - Ax) * (Ay - y0);
+
+	for (int py = y0; py <= y1; py++, ux_row += dux_dy, uy_row += duy_dy)
+	{
+		double ux = ux_row;
+		double uy = uy_row;
+		int row_off = py * width;
+
+		for (int px = x0; px <= x1; px++, ux += dux_dx, uy += duy_dx)
+		{
+			double bc0 = (uz - ux - uy) * inv_uz;
+			double bc1 = uy * inv_uz;
+			double bc2 = ux * inv_uz;
+
+			if (bc0 < 0 || bc1 < 0 || bc2 < 0)
+				continue;
+
+			double c0 = bc0 * inv_w0, c1 = bc1 * inv_w1, c2 = bc2 * inv_w2;
+			double cs = c0 + c1 + c2;
+			c0 /= cs; c1 /= cs; c2 /= cs;
+
+			double frag_depth = -(cz0 * c0 + cz1 * c1 + cz2 * c2);
+
+			int idx = px + row_off;
+			if (zbuffer[idx] > frag_depth)
 				continue;
 
 			if (frag_depth < -farPlane || frag_depth > nearPlane)
 				continue;
 
-			zbuffer[P.x + P.y * width] = frag_depth;
+			zbuffer[idx] = frag_depth;
 			if (segmentationMaskBuffer)
-			{
-				segmentationMaskBuffer[P.x + P.y * width] = objectAndLinkIndex;
-			}
+				segmentationMaskBuffer[idx] = objectAndLinkIndex;
 		}
 	}
 }

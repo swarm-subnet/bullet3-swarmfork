@@ -77,6 +77,7 @@ struct CameraDepthOnlyShader : public IShader
 	Matrix m_invModelMat;
 	Matrix& m_modelView;
 	Matrix& m_projectionMat;
+	Matrix m_projectionModelViewMat;
 	Vec3f m_localScaling;
 
 	mat<4, 3, float> varying_tri;
@@ -92,6 +93,7 @@ struct CameraDepthOnlyShader : public IShader
 		m_nearPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] - 1);
 		m_farPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] + 1);
 		m_invModelMat = m_modelMat.invert_transpose();
+		m_projectionModelViewMat = m_projectionMat * m_modelView;
 	}
 
 	virtual Vec4f vertex(int iface, int nthvert)
@@ -100,7 +102,7 @@ struct CameraDepthOnlyShader : public IShader
 		Vec3f scaledVert = Vec3f(unScaledVert[0] * m_localScaling[0],
 								 unScaledVert[1] * m_localScaling[1],
 								 unScaledVert[2] * m_localScaling[2]);
-		Vec4f gl_Vertex = m_projectionMat * m_modelView * embed<4>(scaledVert);
+		Vec4f gl_Vertex = m_projectionModelViewMat * embed<4>(scaledVert);
 		varying_tri.set_col(nthvert, gl_Vertex);
 		Vec4f world_Vertex = m_modelMat * embed<4>(scaledVert);
 		world_tri.set_col(nthvert, world_Vertex);
