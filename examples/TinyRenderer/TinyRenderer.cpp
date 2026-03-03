@@ -773,6 +773,22 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 					continue;
 			}
 
+			// Skip triangles entirely beyond the far plane (z > w in clip space)
+			{
+				bool beyond = true;
+				for (int j = 0; j < 3; j++)
+				{
+					float w = shader.varying_tri.col(j)[3];
+					if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
+					{
+						beyond = false;
+						break;
+					}
+				}
+				if (beyond)
+					continue;
+			}
+
 			mat<4, 3, float> stackTris[3];
 			b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
 			clippedTriangles.initializeFromBuffer(stackTris, 0, 3);
