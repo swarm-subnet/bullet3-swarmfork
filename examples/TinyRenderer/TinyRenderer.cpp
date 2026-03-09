@@ -756,57 +756,66 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		Matrix viewMatrixInv = renderData.m_viewMatrix.invert();
 		btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
 
-		CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+		const bool doubleSided = renderData.m_doubleSided;
+		const int objectLinkIndex = renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24);
+		const int nFaces = model->nfaces();
+		float* zbufferPtr = &zbuffer[0];
+		const Matrix& viewportMat = renderData.m_viewportMatrix;
 
-		for (int i = 0; i < model->nfaces(); i++)
+#pragma omp parallel if(nFaces > 256)
 		{
-			for (int j = 0; j < 3; j++)
-			{
-				shader.vertex(i, j);
-			}
+			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
 
-			if (!renderData.m_doubleSided)
+#pragma omp for schedule(dynamic, 64)
+			for (int i = 0; i < nFaces; i++)
 			{
-				btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
-				btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
-				btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
-				btVector3 N = (v1 - v0).cross(v2 - v0);
-				if ((v0 - P).dot(N) >= 0)
-					continue;
-			}
-
-			// Skip triangles entirely beyond the far plane (z > w in clip space)
-			{
-				bool beyond = true;
 				for (int j = 0; j < 3; j++)
 				{
-					float w = shader.varying_tri.col(j)[3];
-					if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
+					shader.vertex(i, j);
+				}
+
+				if (!doubleSided)
+				{
+					btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
+					btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
+					btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
+					btVector3 N = (v1 - v0).cross(v2 - v0);
+					if ((v0 - P).dot(N) >= 0)
+						continue;
+				}
+
+				{
+					bool beyond = true;
+					for (int j = 0; j < 3; j++)
 					{
-						beyond = false;
-						break;
+						float w = shader.varying_tri.col(j)[3];
+						if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
+						{
+							beyond = false;
+							break;
+						}
+					}
+					if (beyond)
+						continue;
+				}
+
+				mat<4, 3, float> stackTris[3];
+				b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
+				clippedTriangles.initializeFromBuffer(stackTris, 0, 3);
+
+				bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
+
+				if (hasClipped)
+				{
+					for (int t = 0; t < clippedTriangles.size(); t++)
+					{
+						triangleClippedDepthOnly(clippedTriangles[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
 					}
 				}
-				if (beyond)
-					continue;
-			}
-
-			mat<4, 3, float> stackTris[3];
-			b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
-			clippedTriangles.initializeFromBuffer(stackTris, 0, 3);
-
-			bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
-
-			if (hasClipped)
-			{
-				for (int t = 0; t < clippedTriangles.size(); t++)
+				else
 				{
-					triangleClippedDepthOnly(clippedTriangles[t], &zbuffer[0], segmentationMaskBufferPtr, renderData.m_viewportMatrix, renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24), width, height, shader.m_nearPlane, shader.m_farPlane);
+					triangleDepthOnly(shader.varying_tri, zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
 				}
-			}
-			else
-			{
-				triangleDepthOnly(shader.varying_tri, &zbuffer[0], segmentationMaskBufferPtr, renderData.m_viewportMatrix, renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24), width, height, shader.m_nearPlane, shader.m_farPlane);
 			}
 		}
 	}
