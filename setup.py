@@ -8,6 +8,7 @@ from distutils.core import setup
 from distutils.extension import Extension
 from distutils.util import get_platform
 from glob import glob
+from pathlib import Path
 
 # monkey-patch for parallel compilation
 import multiprocessing
@@ -504,34 +505,37 @@ if 'BT_USE_EGL' in EGL_CXX_FLAGS:
   extensions.append(eglRender)
 
 setup(
-    name='pybullet',
+    name='swarm-pybullet',
     version='3.2.7',
-    description=
-    'Official Python Interface for the Bullet Physics SDK specialized for Robotics Simulation and Reinforcement Learning',
-    long_description=
-    'pybullet is an easy to use Python module for physics simulation, robotics and deep reinforcement learning based on the Bullet Physics SDK. With pybullet you can load articulated bodies from URDF, SDF and other file formats. pybullet provides forward dynamics simulation, inverse dynamics computation, forward and inverse kinematics and collision detection and ray intersection queries. Aside from physics simulation, pybullet supports to rendering, with a CPU renderer and OpenGL visualization and support for virtual reality headsets.',
-    url='https://github.com/bulletphysics/bullet3',
-    author='Erwin Coumans, Yunfei Bai, Jasmine Hsu',
-    author_email='erwincoumans@google.com',
+    description='Swarm fork of PyBullet with optimized depth-only rendering and simulator loading for robotics benchmark evaluation',
+    long_description=Path('README.md').read_text(encoding='utf-8'),
+    long_description_content_type='text/markdown',
+    url='https://github.com/swarm-subnet/bullet3-swarmfork',
+    author='Swarm Subnet',
     license='zlib',
     platforms='any',
     keywords=[
-        'game development', 'virtual reality', 'physics simulation', 'robotics',
-        'collision detection', 'opengl'
+        'swarm benchmark', 'physics simulation', 'robotics', 'depth rendering',
+        'collision detection', 'pybullet'
     ],
     ext_modules=extensions,
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: zlib/libpng License',
-        'Operating System :: Microsoft :: Windows', 'Operating System :: POSIX :: Linux',
-        'Operating System :: MacOS', 'Intended Audience :: Science/Research',
-        "Programming Language :: Python", 'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3.4', 'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6', 'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8', 'Topic :: Games/Entertainment :: Simulation',
+        'Operating System :: Microsoft :: Windows',
+        'Operating System :: POSIX :: Linux',
+        'Operating System :: MacOS',
+        'Intended Audience :: Science/Research',
+        'Programming Language :: Python',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.10',
+        'Topic :: Games/Entertainment :: Simulation',
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
         'Framework :: Robot Framework'
     ],
+    project_urls={
+        'Source': 'https://github.com/swarm-subnet/bullet3-swarmfork',
+    },
     package_dir={'': 'examples/pybullet/gym'},
     packages=[x for x in find_packages('examples/pybullet/gym')],
     package_data={'pybullet_data': need_files})
