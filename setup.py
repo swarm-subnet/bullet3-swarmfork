@@ -519,6 +519,7 @@ setup(
         'collision detection', 'pybullet'
     ],
     ext_modules=extensions,
+    install_requires=['numpy'],
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: zlib/libpng License',
