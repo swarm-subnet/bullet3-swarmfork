@@ -3,6 +3,7 @@ from sys import platform as _platform
 import sys
 import glob
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from distutils.core import setup
 from distutils.extension import Extension
@@ -12,7 +13,6 @@ from pathlib import Path
 
 # monkey-patch for parallel compilation
 import multiprocessing
-import multiprocessing.pool
 
 
 def parallelCCompile(self,
@@ -55,8 +55,8 @@ def parallelCCompile(self,
     self._compile(obj, src, ext, newcc_args, extra_postargs, pp_opts)
 
   # convert to list, imap is evaluated on-demand
-  pool = multiprocessing.pool.ThreadPool(N)
-  list(pool.imap(_single_compile, objects))
+  with ThreadPoolExecutor(max_workers=N) as pool:
+    list(pool.map(_single_compile, objects))
   return objects
 
 
