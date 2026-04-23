@@ -75,11 +75,13 @@ print(platform)
 _SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
 _IS_LINUX = _platform in ('linux', 'linux2')
 
+_TIER_COMMON = '-mtune=native -flto=auto -ffp-contract=off -fno-math-errno -fno-plt'
+
 _TIER_FLAGS = {
     'safe': '-O2',
-    'v2':   '-O3 -march=x86-64-v2 -flto -ffp-contract=off',
-    'v3':   '-O3 -march=x86-64-v3 -flto -ffp-contract=off',
-    'v4':   '-O3 -march=x86-64-v4 -flto -ffp-contract=off',
+    'v2':   '-O3 -march=x86-64-v2 ' + _TIER_COMMON,
+    'v3':   '-O3 -march=x86-64-v3 ' + _TIER_COMMON,
+    'v4':   '-O3 -march=x86-64-v4 ' + _TIER_COMMON,
 }
 
 _TIER_CPU_REQS = {
