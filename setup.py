@@ -3,6 +3,9 @@ from sys import platform as _platform
 import sys
 import glob
 import os
+import shlex
+import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from distutils.core import setup
@@ -68,6 +71,101 @@ import os
 
 platform = get_platform()
 print(platform)
+
+_SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
+_IS_LINUX = _platform in ('linux', 'linux2')
+
+_TIER_FLAGS = {
+    'safe': '-O2',
+    'v2':   '-O3 -march=x86-64-v2 -flto -ffp-contract=off',
+    'v3':   '-O3 -march=x86-64-v3 -flto -ffp-contract=off',
+    'v4':   '-O3 -march=x86-64-v4 -flto -ffp-contract=off',
+}
+
+_TIER_CPU_REQS = {
+    'v2': [{'sse4_2'}, {'popcnt'}],
+    'v3': [{'avx2'}, {'bmi1'}, {'bmi2'}, {'fma'}, {'f16c'}, {'lzcnt', 'abm'}, {'movbe'}],
+    'v4': [{'avx512f'}, {'avx512bw'}, {'avx512cd'}, {'avx512dq'}, {'avx512vl'}],
+}
+
+
+def _cc_argv():
+  raw = os.environ.get('CC') or 'gcc'
+  parts = shlex.split(raw)
+  return parts or ['gcc']
+
+
+def _cpu_flags_from_proc():
+  try:
+    with open('/proc/cpuinfo') as f:
+      for line in f:
+        if line.startswith('flags'):
+          return set(line.split(':', 1)[1].split())
+  except OSError:
+    pass
+  return set()
+
+
+def _compiler_accepts(cc_argv, flag):
+  with tempfile.NamedTemporaryFile(suffix='.c', delete=False) as t:
+    t.write(b'int main(){return 0;}')
+    src = t.name
+  try:
+    r = subprocess.run(
+        list(cc_argv) + flag.split() + ['-o', os.devnull, src],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+  except (OSError, FileNotFoundError):
+    return False
+  finally:
+    try:
+      os.unlink(src)
+    except OSError:
+      pass
+
+
+def _cpu_meets_tier(cpu, tier):
+  return all(alts & cpu for alts in _TIER_CPU_REQS[tier])
+
+
+def _pick_cpu_tier():
+  override = os.environ.get('SWARM_BULLET3_OPT_LEVEL', '').strip()
+  if override in _TIER_FLAGS:
+    return override
+  cpu = _cpu_flags_from_proc()
+  cc = _cc_argv()
+  for tier in ('v4', 'v3', 'v2'):
+    if _cpu_meets_tier(cpu, tier) and _compiler_accepts(cc, _TIER_FLAGS[tier]):
+      return tier
+  return 'safe'
+
+
+_SWARM_TIER = _pick_cpu_tier() if _IS_LINUX else 'safe'
+_SWARM_TIER_FLAGS = _TIER_FLAGS[_SWARM_TIER] if _IS_LINUX else ''
+print("swarm-pybullet: cpu tier = %s (%s)" % (_SWARM_TIER, _SWARM_TIER_FLAGS.strip()))
+
+_PGO_DIR = os.path.join(_SOURCE_ROOT, 'pgo_data')
+_PGO_MODE = os.environ.get('SWARM_BULLET3_PGO', '').strip().lower()
+if not _PGO_MODE and _IS_LINUX:
+  if os.path.isdir(_PGO_DIR) and any(f.endswith('.gcda') for f in os.listdir(_PGO_DIR)):
+    _PGO_MODE = 'use'
+if not _PGO_MODE:
+  _PGO_MODE = 'off'
+
+_PGO_FLAGS = ''
+if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
+  if _compiler_accepts(_cc_argv(), '-fprofile-prefix-path=' + _SOURCE_ROOT):
+    _PGO_FLAGS = '-fprofile-dir=pgo_data -fprofile-prefix-path=' + _SOURCE_ROOT + ' '
+    if _PGO_MODE == 'generate':
+      _PGO_FLAGS += '-fprofile-generate '
+    else:
+      _PGO_FLAGS += '-fprofile-use -fprofile-correction '
+  else:
+    print("swarm-pybullet: compiler rejects -fprofile-prefix-path, pgo disabled")
+    _PGO_MODE = 'off'
+print("swarm-pybullet: pgo mode = %s" % _PGO_MODE)
+
+LINK_FLAGS = (_SWARM_TIER_FLAGS + ' ' + _PGO_FLAGS).strip() if _IS_LINUX else ''
 
 CXX_FLAGS = ''
 CXX_FLAGS += '-DGWEN_COMPILE_STATIC '
@@ -403,6 +501,8 @@ if _platform == "linux" or _platform == "linux2":
   CXX_FLAGS += '-fno-inline-functions-called-once '
   CXX_FLAGS += '-fvisibility=hidden '
   CXX_FLAGS += '-fvisibility-inlines-hidden '
+  CXX_FLAGS += _SWARM_TIER_FLAGS + ' '
+  CXX_FLAGS += _PGO_FLAGS
   EGL_CXX_FLAGS += '-DBT_USE_EGL '
   EGL_CXX_FLAGS += '-fPIC '  # for plugins
 
@@ -483,6 +583,7 @@ pybullet_ext = Extension(
     sources=sources,
     libraries=libraries,
     extra_compile_args=CXX_FLAGS.split(),
+    extra_link_args=LINK_FLAGS.split(),
     include_dirs=include_dirs + [
         "src", "examples/ThirdPartyLibs", "examples/ThirdPartyLibs/glad",
         "examples/ThirdPartyLibs/enet/include", "examples/ThirdPartyLibs/clsocket/src",
@@ -497,6 +598,7 @@ if 'BT_USE_EGL' in EGL_CXX_FLAGS:
       sources=egl_renderer_sources,
       libraries=libraries,
       extra_compile_args=(CXX_FLAGS + EGL_CXX_FLAGS).split(),
+      extra_link_args=LINK_FLAGS.split(),
       include_dirs=include_dirs + [
           "src", "examples", "examples/ThirdPartyLibs", "examples/ThirdPartyLibs/glad",
           "examples/ThirdPartyLibs/enet/include", "examples/ThirdPartyLibs/clsocket/src"

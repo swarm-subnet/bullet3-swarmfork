@@ -14,3 +14,4 @@ recursive-include examples/SharedMemory/plugins *.*
 recursive-include examples/ThirdPartyLibs/glad *.*
 include examples/ThirdPartyLibs/enet/win32.c
 recursive-include examples/ThirdPartyLibs/Eigen *
+recursive-include pgo_data *.gcda

@@ -4,6 +4,9 @@ set -e -x
 # use this docker command
 # sudo docker run -it -v $(pwd):/io quay.io/pypa/manylinux2014_x86_64
 
+# Redistributable wheels must target the x86_64 baseline, not the build host.
+export SWARM_BULLET3_OPT_LEVEL=safe
+export SWARM_BULLET3_PGO=off
 
 # Compile wheels
 for PYBIN in /opt/python/*/bin; do
