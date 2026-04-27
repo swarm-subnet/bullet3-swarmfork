@@ -610,7 +610,7 @@ if 'BT_USE_EGL' in EGL_CXX_FLAGS:
 
 setup(
     name='swarm-pybullet',
-    version='2.0.0.1',
+    version='2.0.0.2',
     description='Swarm fork of PyBullet with optimized depth-only rendering and simulator loading for robotics benchmark evaluation',
     long_description=Path('README.md').read_text(encoding='utf-8'),
     long_description_content_type='text/markdown',
