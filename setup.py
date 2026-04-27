@@ -144,7 +144,7 @@ def _pick_cpu_tier():
 
 _SWARM_TIER = _pick_cpu_tier() if _IS_LINUX else 'safe'
 _SWARM_TIER_FLAGS = _TIER_FLAGS[_SWARM_TIER] if _IS_LINUX else ''
-print("swarm-pybullet: cpu tier = %s (%s)" % (_SWARM_TIER, _SWARM_TIER_FLAGS.strip()))
+print("swarm-bullet3: cpu tier = %s (%s)" % (_SWARM_TIER, _SWARM_TIER_FLAGS.strip()))
 
 _PGO_DIR = os.path.join(_SOURCE_ROOT, 'pgo_data')
 _PGO_MODE = os.environ.get('SWARM_BULLET3_PGO', '').strip().lower()
@@ -163,9 +163,9 @@ if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
     else:
       _PGO_FLAGS += '-fprofile-use -fprofile-correction '
   else:
-    print("swarm-pybullet: compiler rejects -fprofile-prefix-path, pgo disabled")
+    print("swarm-bullet3: compiler rejects -fprofile-prefix-path, pgo disabled")
     _PGO_MODE = 'off'
-print("swarm-pybullet: pgo mode = %s" % _PGO_MODE)
+print("swarm-bullet3: pgo mode = %s" % _PGO_MODE)
 
 LINK_FLAGS = (_SWARM_TIER_FLAGS + ' ' + _PGO_FLAGS).strip() if _IS_LINUX else ''
 
@@ -609,7 +609,7 @@ if 'BT_USE_EGL' in EGL_CXX_FLAGS:
   extensions.append(eglRender)
 
 setup(
-    name='swarm-pybullet',
+    name='swarm-bullet3',
     version='2.0.0.2',
     description='Swarm fork of PyBullet with optimized depth-only rendering and simulator loading for robotics benchmark evaluation',
     long_description=Path('README.md').read_text(encoding='utf-8'),

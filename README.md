@@ -10,7 +10,7 @@ The fork is maintained for Swarm benchmark and validator workloads that depend h
 - OpenMP acceleration for the TinyRenderer depth-only face loop
 - simulator loading improvements in the shared-memory path
 
-The Python import surface remains `import pybullet`, but the published distribution name for this fork is `swarm-pybullet`.
+The Python import surface remains `import pybullet`, but the published distribution name for this fork is `swarm-bullet3`.
 
 ## Why this fork exists
 
