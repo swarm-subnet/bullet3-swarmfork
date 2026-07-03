@@ -8,6 +8,10 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#if defined(__SSE2__) || defined(_M_X64)
+#define B3_TINY_SIMD 1
+#include <emmintrin.h>
+#endif
 #include "../CommonInterfaces/CommonFileIOInterface.h"
 #include "../OpenGLWindow/ShapeData.h"
 #include "../Utils/b3BulletDefaultFileIO.h"
@@ -87,6 +91,13 @@ struct CameraDepthOnlyShader : public IShader
 	mat<4, 3, float> varying_tri;
 	mat<4, 3, float> world_tri;
 
+#ifdef B3_TINY_SIMD
+	// column vectors of the two vertex matrices; the linear combination below
+	// reproduces the scalar dot's exact accumulation order per component.
+	__m128 m_pmvCol[4];
+	__m128 m_modelCol[4];
+#endif
+
 	CameraDepthOnlyShader(Model* model, Matrix& modelView, Matrix& projectionMat, Matrix& modelMat, Vec3f localScaling)
 		: m_model(model),
 		  m_modelMat(modelMat),
@@ -98,7 +109,29 @@ struct CameraDepthOnlyShader : public IShader
 		m_farPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] + 1);
 		m_invModelMat = m_modelMat.invert_transpose();
 		m_projectionModelViewMat = m_projectionMat * m_modelView;
+#ifdef B3_TINY_SIMD
+		for (int c = 0; c < 4; c++)
+		{
+			m_pmvCol[c] = _mm_setr_ps(m_projectionModelViewMat[0][c], m_projectionModelViewMat[1][c],
+									  m_projectionModelViewMat[2][c], m_projectionModelViewMat[3][c]);
+			m_modelCol[c] = _mm_setr_ps(m_modelMat[0][c], m_modelMat[1][c],
+										m_modelMat[2][c], m_modelMat[3][c]);
+		}
+#endif
 	}
+
+#ifdef B3_TINY_SIMD
+	// ret[i] = ((0 + m[i][3]*v3) + m[i][2]*v2) + m[i][1]*v1) + m[i][0]*v0 —
+	// the same order the scalar vec dot accumulates in.
+	static inline __m128 mulMat4Vec4(const __m128 cols[4], float v0, float v1, float v2, float v3)
+	{
+		__m128 acc = _mm_add_ps(_mm_setzero_ps(), _mm_mul_ps(cols[3], _mm_set1_ps(v3)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[2], _mm_set1_ps(v2)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[1], _mm_set1_ps(v1)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[0], _mm_set1_ps(v0)));
+		return acc;
+	}
+#endif
 
 	virtual Vec4f vertex(int iface, int nthvert)
 	{
@@ -106,11 +139,30 @@ struct CameraDepthOnlyShader : public IShader
 		Vec3f scaledVert = Vec3f(unScaledVert[0] * m_localScaling[0],
 								 unScaledVert[1] * m_localScaling[1],
 								 unScaledVert[2] * m_localScaling[2]);
+#ifdef B3_TINY_SIMD
+		float out[4];
+		_mm_storeu_ps(out, mulMat4Vec4(m_pmvCol, scaledVert[0], scaledVert[1], scaledVert[2], 1.f));
+		Vec4f gl_Vertex;
+		gl_Vertex[0] = out[0];
+		gl_Vertex[1] = out[1];
+		gl_Vertex[2] = out[2];
+		gl_Vertex[3] = out[3];
+		varying_tri.set_col(nthvert, gl_Vertex);
+		_mm_storeu_ps(out, mulMat4Vec4(m_modelCol, scaledVert[0], scaledVert[1], scaledVert[2], 1.f));
+		Vec4f world_Vertex;
+		world_Vertex[0] = out[0];
+		world_Vertex[1] = out[1];
+		world_Vertex[2] = out[2];
+		world_Vertex[3] = out[3];
+		world_tri.set_col(nthvert, world_Vertex);
+		return gl_Vertex;
+#else
 		Vec4f gl_Vertex = m_projectionModelViewMat * embed<4>(scaledVert);
 		varying_tri.set_col(nthvert, gl_Vertex);
 		Vec4f world_Vertex = m_modelMat * embed<4>(scaledVert);
 		world_tri.set_col(nthvert, world_Vertex);
 		return gl_Vertex;
+#endif
 	}
 
 	virtual bool fragment(Vec3f bar, TGAColor& color)
