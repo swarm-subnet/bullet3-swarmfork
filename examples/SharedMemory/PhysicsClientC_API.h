@@ -262,6 +262,7 @@ extern "C"
 	B3_SHARED_API b3SharedMemoryCommandHandle b3InitRequestCameraImage(b3PhysicsClientHandle physClient);
 	B3_SHARED_API b3SharedMemoryCommandHandle b3InitRequestCameraImage2(b3SharedMemoryCommandHandle commandHandle);
 	B3_SHARED_API void b3RequestCameraImageSetCameraMatrices(b3SharedMemoryCommandHandle commandHandle, float viewMatrix[/*16*/], float projectionMatrix[/*16*/]);
+	B3_SHARED_API void b3RequestCameraImageSetBatchViewMatrices(b3SharedMemoryCommandHandle commandHandle, const float* extraViewMatrices, int numExtraCameras);
 	B3_SHARED_API void b3RequestCameraImageSetPixelResolution(b3SharedMemoryCommandHandle commandHandle, int width, int height);
 	B3_SHARED_API void b3RequestCameraImageSetLightDirection(b3SharedMemoryCommandHandle commandHandle, const float lightDirection[/*3*/]);
 	B3_SHARED_API void b3RequestCameraImageSetLightColor(b3SharedMemoryCommandHandle commandHandle, const float lightColor[/*3*/]);

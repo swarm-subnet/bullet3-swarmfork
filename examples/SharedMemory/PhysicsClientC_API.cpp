@@ -4551,6 +4551,26 @@ B3_SHARED_API void b3RequestCameraImageSetCameraMatrices(b3SharedMemoryCommandHa
 	command->m_updateFlags |= REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetBatchViewMatrices(b3SharedMemoryCommandHandle commandHandle, const float* extraViewMatrices, int numExtraCameras)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_REQUEST_CAMERA_IMAGE_DATA);
+	if (numExtraCameras < 0)
+		numExtraCameras = 0;
+	if (numExtraCameras > MAX_BATCH_CAMERAS - 1)
+		numExtraCameras = MAX_BATCH_CAMERAS - 1;
+	for (int c = 0; c < numExtraCameras; c++)
+	{
+		for (int i = 0; i < 16; i++)
+		{
+			command->m_requestPixelDataArguments.m_batchViewMatrices[c][i] = extraViewMatrices[c * 16 + i];
+		}
+	}
+	command->m_requestPixelDataArguments.m_numBatchCameras = numExtraCameras + 1;
+	command->m_updateFlags |= REQUEST_PIXEL_ARGS_HAS_BATCH_CAMERAS;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetLightDirection(b3SharedMemoryCommandHandle commandHandle, const float lightDirection[3])
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
