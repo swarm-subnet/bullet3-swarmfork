@@ -70,4 +70,7 @@ public:
 	static void renderObjectCameraDepthOnly(TinyRenderObjectData& renderData);
 };
 
+// Worker thread count for depth-only render/copy loops (SWARM_RENDER_THREADS, default 2).
+int b3GetSwarmRenderThreads();
+
 #endif  // TINY_RENDERER_Hbla

@@ -1165,16 +1165,31 @@ void TinyRendererVisualShapeConverter::resetCamera(float camDist, float yaw, flo
 
 void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 {
-	float farPlane = m_data->m_camera.getCameraFrustumFar();
-	for (int y = 0; y < m_data->m_swHeight; ++y)
+	const float farPlane = m_data->m_camera.getCameraFrustumFar();
+	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
+	const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
+	const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
+
+	float* depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
+	for (int i = 0; i < numPixels; ++i)
+		depth[i] = -farPlane;
+
+	if (!depthOnly)
 	{
-		for (int x = 0; x < m_data->m_swWidth; ++x)
-		{
-			m_data->m_rgbColorBuffer.set(x, y, clearColor);
-			m_data->m_depthBuffer[x + y * m_data->m_swWidth] = -farPlane;
-			m_data->m_shadowBuffer[x + y * m_data->m_swWidth] = -1e30f;
-			m_data->m_segmentationMaskBuffer[x + y * m_data->m_swWidth] = -1;
-		}
+		for (int y = 0; y < m_data->m_swHeight; ++y)
+			for (int x = 0; x < m_data->m_swWidth; ++x)
+				m_data->m_rgbColorBuffer.set(x, y, clearColor);
+
+		float* shadow = numPixels ? &m_data->m_shadowBuffer[0] : 0;
+		for (int i = 0; i < numPixels; ++i)
+			shadow[i] = -1e30f;
+	}
+
+	if (!noSeg)
+	{
+		int* seg = numPixels ? &m_data->m_segmentationMaskBuffer[0] : 0;
+		for (int i = 0; i < numPixels; ++i)
+			seg[i] = -1;
 	}
 }
 
@@ -1419,7 +1434,13 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 
 			if (depthOnly)
 			{
+				b3AlignedObjectArray<int>* savedSegPtr = renderObj->m_segmentationMaskBufferPtr;
+				if ((m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0)
+				{
+					renderObj->m_segmentationMaskBufferPtr = 0;
+				}
 				TinyRenderer::renderObjectCameraDepthOnly(*renderObj);
+				renderObj->m_segmentationMaskBufferPtr = savedSegPtr;
 			}
 			else
 			{
@@ -1434,6 +1455,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	}
 
 	{
+		const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
 		int half = m_data->m_swHeight >> 1;
 		for (int j = 0; j < half; j++)
 		{
@@ -1446,7 +1468,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 				{
 					btSwap(m_data->m_shadowBuffer[l1 + i], m_data->m_shadowBuffer[l2 + i]);
 				}
-				btSwap(m_data->m_segmentationMaskBuffer[l1 + i], m_data->m_segmentationMaskBuffer[l2 + i]);
+				if (!noSeg)
+				{
+					btSwap(m_data->m_segmentationMaskBuffer[l1 + i], m_data->m_segmentationMaskBuffer[l2 + i]);
+				}
 			}
 		}
 	}
@@ -1492,26 +1517,27 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 	int numRequestedPixels = btMin(rgbaBufferSizeInPixels, numRemainingPixels);
 	if (numRequestedPixels)
 	{
-		for (int i = 0; i < numRequestedPixels; i++)
+		const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
+
+		if (depthBuffer)
 		{
-			if (depthBuffer)
+			const float farPlane = m_data->m_camera.getCameraFrustumFar();
+			const float nearPlane = m_data->m_camera.getCameraFrustumNear();
+			const float* src = &m_data->m_depthBuffer[0] + startPixelIndex;
+			const int renderThreads = b3GetSwarmRenderThreads();
+
+#pragma omp parallel for num_threads(renderThreads) if(renderThreads > 1 && numRequestedPixels > 65536)
+			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				float farPlane = m_data->m_camera.getCameraFrustumFar();
-				float nearPlane = m_data->m_camera.getCameraFrustumNear();
-
 				// TinyRenderer returns clip coordinates, transform to eye coordinates first
-				float z_c = -m_data->m_depthBuffer[i + startPixelIndex];
-				// float distance = (farPlane - nearPlane) / (farPlane + nearPlane) * (z_c + 2. * farPlane * nearPlane / (farPlane - nearPlane));
-
-				// The depth buffer value is between 0 and 1
-				// float a = farPlane / (farPlane - nearPlane);
-				// float b = farPlane * nearPlane / (nearPlane - farPlane);
-				// depthBuffer[i] = a + b / distance;
-
-				// Simply the above expressions
+				float z_c = -src[i];
 				depthBuffer[i] = farPlane * (nearPlane + z_c) / (2. * farPlane * nearPlane + farPlane * z_c - nearPlane * z_c);
 			}
-			if (segmentationMaskBuffer)
+		}
+
+		if (segmentationMaskBuffer)
+		{
+			for (int i = 0; i < numRequestedPixels; i++)
 			{
 				int segMask = m_data->m_segmentationMaskBuffer[i + startPixelIndex];
 				if ((m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0)
@@ -1525,8 +1551,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 				}
 				segmentationMaskBuffer[i] = segMask;
 			}
+		}
 
-			if (pixelsRGBA)
+		// In depth-only mode nothing was shaded, so the color buffer holds no image.
+		if (pixelsRGBA && !depthOnly)
+		{
+			for (int i = 0; i < numRequestedPixels; i++)
 			{
 				pixelsRGBA[i * numBytesPerPixel] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 0];
 				pixelsRGBA[i * numBytesPerPixel + 1] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 1];

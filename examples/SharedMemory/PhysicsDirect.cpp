@@ -569,17 +569,23 @@ bool PhysicsDirect::processCamera(const struct SharedMemoryCommand& orgCommand)
 
 			//  printf("pixel = %d\n", rgbaPixelsReceived[0]);
 
-			for (int i = 0; i < serverCmd.m_sendPixelDataArguments.m_numPixelsCopied; i++)
+			int reqFlags = (command.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_FLAGS) ? command.m_requestPixelDataArguments.m_flags : 0;
+			bool depthOnly = (reqFlags & ER_DEPTH_ONLY) != 0;
+			bool noSeg = (reqFlags & ER_NO_SEGMENTATION_MASK) != 0;
+			int numCopied = serverCmd.m_sendPixelDataArguments.m_numPixelsCopied;
+			int startPixel = serverCmd.m_sendPixelDataArguments.m_startingPixelIndex;
+
+			if (numCopied > 0)
 			{
-				m_data->m_cachedCameraDepthBuffer[i + serverCmd.m_sendPixelDataArguments.m_startingPixelIndex] = depthBuffer[i];
-			}
-			for (int i = 0; i < serverCmd.m_sendPixelDataArguments.m_numPixelsCopied; i++)
-			{
-				m_data->m_cachedSegmentationMask[i + serverCmd.m_sendPixelDataArguments.m_startingPixelIndex] = segmentationMaskBuffer[i];
-			}
-			for (int i = 0; i < serverCmd.m_sendPixelDataArguments.m_numPixelsCopied * numBytesPerPixel; i++)
-			{
-				m_data->m_cachedCameraPixelsRGBA[i + serverCmd.m_sendPixelDataArguments.m_startingPixelIndex * numBytesPerPixel] = rgbaPixelsReceived[i];
+				memcpy(&m_data->m_cachedCameraDepthBuffer[startPixel], depthBuffer, numCopied * sizeof(float));
+				if (!noSeg)
+				{
+					memcpy(&m_data->m_cachedSegmentationMask[startPixel], segmentationMaskBuffer, numCopied * sizeof(int));
+				}
+				if (!depthOnly)
+				{
+					memcpy(&m_data->m_cachedCameraPixelsRGBA[startPixel * numBytesPerPixel], rgbaPixelsReceived, numCopied * numBytesPerPixel);
+				}
 			}
 
 			if (serverCmd.m_sendPixelDataArguments.m_numRemainingPixels > 0 && serverCmd.m_sendPixelDataArguments.m_numPixelsCopied)

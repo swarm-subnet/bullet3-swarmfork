@@ -167,9 +167,15 @@ if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
     _PGO_MODE = 'off'
 print("swarm-bullet3: pgo mode = %s" % _PGO_MODE)
 
-LINK_FLAGS = (_SWARM_TIER_FLAGS + ' ' + _PGO_FLAGS).strip() if _IS_LINUX else ''
+_OPENMP_FLAG = '-fopenmp ' if _IS_LINUX and os.environ.get('SWARM_BULLET3_OPENMP', 'on').strip().lower() != 'off' else ''
+
+LINK_FLAGS = (_SWARM_TIER_FLAGS + ' ' + _PGO_FLAGS + ' ' + _OPENMP_FLAG).strip() if _IS_LINUX else ''
 
 CXX_FLAGS = ''
+CXX_FLAGS += _OPENMP_FLAG
+if _OPENMP_FLAG:
+  CXX_FLAGS += '-DEIGEN_DONT_PARALLELIZE '
+  CXX_FLAGS += '-DUSE_THREAD=0 '
 CXX_FLAGS += '-DGWEN_COMPILE_STATIC '
 CXX_FLAGS += '-DBT_USE_DOUBLE_PRECISION '
 CXX_FLAGS += '-DBT_ENABLE_ENET '
