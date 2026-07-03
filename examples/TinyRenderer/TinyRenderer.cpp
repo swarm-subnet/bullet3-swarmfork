@@ -863,6 +863,35 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 
 		const int renderThreads = b3GetSwarmRenderThreads();
 
+		// Mode selection: the two-phase scratch path only pays off when the fill
+		// can be band-parallelized (few huge triangles on a big framebuffer) or
+		// the transform loop dominates (very dense meshes such as terrain tiles).
+		// Everything else takes the copy-free direct path.
+		const bool parTransform = renderThreads > 1 && nFaces > 4096;
+		const bool bandFill = renderThreads > 1 && (width * height >= 65536) && nFaces <= 64;
+
+		if (!parTransform && !bandFill)
+		{
+			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+			b3DepthOnlyFaceOut faceTmp;
+			for (int i = 0; i < nFaces; i++)
+			{
+				b3ProcessDepthOnlyFace(shader, i, faceTmp, doubleSided, P);
+				for (int t = 0; t < faceTmp.m_count; t++)
+				{
+					if (faceTmp.m_clipped)
+					{
+						triangleClippedDepthOnly(faceTmp.m_tris[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
+					}
+					else
+					{
+						triangleDepthOnly(faceTmp.m_tris[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
+					}
+				}
+			}
+			return;
+		}
+
 		// Phase 1: transform + cull + clip every face into its own slot (no
 		// framebuffer writes, so the face loop parallelizes without races).
 		// The static scratch assumes one render at a time per process (the
@@ -872,7 +901,7 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		faceOut.resize(nFaces);
 		b3DepthOnlyFaceOut* faceOutPtr = nFaces ? &faceOut[0] : 0;
 
-		if (renderThreads > 1 && nFaces > 256)
+		if (parTransform)
 		{
 #pragma omp parallel num_threads(renderThreads)
 			{
@@ -918,7 +947,7 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		// Phase 2: pixel fill. Band-parallel pays off on large framebuffers with
 		// few triangles (each thread re-walks every triangle's rows); dense
 		// meshes on small buffers stay serial.
-		const bool bandParallel = renderThreads > 1 && (width * height >= 65536) && nTris <= 4096;
+		const bool bandParallel = bandFill && nTris <= 4096;
 
 #ifdef _OPENMP
 		if (bandParallel)
