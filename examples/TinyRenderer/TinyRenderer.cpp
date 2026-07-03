@@ -868,7 +868,7 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		// the transform loop dominates (very dense meshes such as terrain tiles).
 		// Everything else takes the copy-free direct path.
 		const bool parTransform = renderThreads > 1 && nFaces > 4096;
-		const bool bandFill = renderThreads > 1 && (width * height >= 65536) && nFaces <= 64;
+		const bool bandFill = renderThreads > 1 && (width * height >= 65536) && nFaces <= 8;
 
 		if (!parTransform && !bandFill)
 		{
