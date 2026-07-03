@@ -94,6 +94,20 @@ struct UrdfRenderingInterface
 	///render an image using the provided view and projection matrix
 	virtual void render(const float viewMat[16], const float projMat[16]) = 0;
 
+	///render several depth-only cameras of the same scene at once; returns false
+	///when unsupported so the caller falls back to per-camera render() calls.
+	virtual bool renderDepthBatch(const float* viewMatrices, int numCameras, const float projMat[16], bool forceRender)
+	{
+		(void)viewMatrices;
+		(void)numCameras;
+		(void)projMat;
+		(void)forceRender;
+		return false;
+	}
+
+	///select which batch camera subsequent copyCameraImageData calls read from
+	virtual void setBatchReadCamera(int camIndex) { (void)camIndex; }
+
 	///load a texture from file, in png or other popular/supported format
 	//virtual int loadTextureFile(const char* filename) = 0;
 	virtual int loadTextureFile(const char* filename, struct CommonFileIOInterface* fileIO)=0;

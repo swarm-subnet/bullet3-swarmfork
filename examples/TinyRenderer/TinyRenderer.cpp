@@ -807,6 +807,50 @@ static inline void b3ProcessDepthOnlyFace(CameraDepthOnlyShader& shader, int i, 
 	}
 }
 
+void TinyRenderer::renderObjectCameraDepthOnlyInto(const TinyRenderObjectData& renderData,
+												   const Matrix& viewMatrix,
+												   const Matrix& projMatrix,
+												   const Matrix& modelMatrix,
+												   const Vec3f& localScaling,
+												   float* zbufferPtr, int width, int height)
+{
+	Model* model = renderData.m_model;
+	if (0 == model)
+		return;
+	if (model->getColorRGBA()[3] == 0)
+		return;
+
+	Matrix viewportMat = viewport(0, 0, width, height);
+	Matrix viewCopy = viewMatrix;
+	Matrix projCopy = projMatrix;
+	Matrix modelCopy = modelMatrix;
+	Matrix modelViewMatrix = viewCopy * modelCopy;
+	Matrix viewMatrixInv = viewCopy.invert();
+	btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
+
+	const bool doubleSided = renderData.m_doubleSided;
+	const int objectLinkIndex = renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24);
+	const int nFaces = model->nfaces();
+
+	CameraDepthOnlyShader shader(model, modelViewMatrix, projCopy, modelCopy, localScaling);
+	b3DepthOnlyFaceOut faceTmp;
+	for (int i = 0; i < nFaces; i++)
+	{
+		b3ProcessDepthOnlyFace(shader, i, faceTmp, doubleSided, P);
+		for (int t = 0; t < faceTmp.m_count; t++)
+		{
+			if (faceTmp.m_clipped)
+			{
+				triangleClippedDepthOnly(faceTmp.m_tris[t], zbufferPtr, 0, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+			}
+			else
+			{
+				triangleDepthOnly(faceTmp.m_tris[t], zbufferPtr, 0, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+			}
+		}
+	}
+}
+
 int b3GetSwarmRenderThreads()
 {
 #ifdef _OPENMP

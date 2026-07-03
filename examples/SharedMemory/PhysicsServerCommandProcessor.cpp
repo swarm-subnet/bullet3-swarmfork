@@ -4302,7 +4302,31 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 					}
 					m_data->m_renderTransformsSynced = true;
 
-					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
+					bool batchRendered = false;
+					if (numBatchCameras > 1 && (clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
+					{
+						float allViews[MAX_BATCH_CAMERAS * 16];
+						for (int i = 0; i < 16; i++)
+						{
+							allViews[i] = clientCmd.m_requestPixelDataArguments.m_viewMatrix[i];
+						}
+						for (int c = 1; c < numBatchCameras; c++)
+						{
+							for (int i = 0; i < 16; i++)
+							{
+								allViews[c * 16 + i] = clientCmd.m_requestPixelDataArguments.m_batchViewMatrices[c - 1][i];
+							}
+						}
+						batchRendered = m_data->m_pluginManager.getRenderInterface()->renderDepthBatch(
+							allViews, numBatchCameras,
+							clientCmd.m_requestPixelDataArguments.m_projectionMatrix,
+							startPixelIndex == 0);
+					}
+					if (batchRendered)
+					{
+						// all cameras rendered; segments only copy from their buffers
+					}
+					else if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
 					{
 						int camIndex = startPixelIndex / camPixels;
 						const float* segmentViewMatrix =
@@ -4375,6 +4399,10 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 				}
 
 				int camRelativeStart = (numBatchCameras > 1 && camPixels > 0) ? (startPixelIndex % camPixels) : startPixelIndex;
+				if (numBatchCameras > 1 && camPixels > 0)
+				{
+					m_data->m_pluginManager.getRenderInterface()->setBatchReadCamera(startPixelIndex / camPixels);
+				}
 				m_data->m_pluginManager.getRenderInterface()->copyCameraImageData(pixelRGBA, numRequestedPixels,
 																				  depthBuffer, numRequestedPixels,
 																				  segmentationMaskBuffer, numRequestedPixels,

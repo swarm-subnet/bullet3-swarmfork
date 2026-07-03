@@ -93,6 +93,11 @@ struct TinyRendererVisualShapeConverterInternalData
 	int m_flags;
 	SimpleCamera m_camera;
 
+	// depth-only camera batch: per-camera buffers rendered in parallel
+	btAlignedObjectArray<b3AlignedObjectArray<float> > m_batchDepthBuffers;
+	int m_batchCameraCount;
+	int m_batchReadCamera;
+
 	TinyRendererVisualShapeConverterInternalData()
 		: m_upAxis(2),
 		m_swWidth(START_WIDTH),
@@ -111,7 +116,9 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_lightSpecularCoeff(0.05),
 		m_hasLightSpecularCoeff(false),
 		m_hasShadow(false),
-		m_flags(0)
+		m_flags(0),
+		m_batchCameraCount(1),
+		m_batchReadCamera(0)
 	{
 		m_depthBuffer.resize(m_swWidth * m_swHeight);
 		m_shadowBuffer.resize(m_swWidth * m_swHeight);
@@ -1193,6 +1200,195 @@ void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 	}
 }
 
+void TinyRendererVisualShapeConverter::setBatchReadCamera(int camIndex)
+{
+	m_data->m_batchReadCamera = camIndex;
+}
+
+bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrices, int numCameras, const float projMat[16], bool forceRender)
+{
+	if (numCameras < 1 || numCameras > 16)
+		return false;
+	if ((m_data->m_flags & ER_DEPTH_ONLY) == 0)
+		return false;
+	if (!forceRender && m_data->m_batchCameraCount == numCameras)
+		return true;
+
+	const int width = m_data->m_swWidth;
+	const int height = m_data->m_swHeight;
+	const int numPixels = width * height;
+	if (numPixels <= 0)
+		return false;
+
+	float nearVal = projMat[14] / (projMat[10] - 1);
+	float farVal = projMat[14] / (projMat[10] + 1);
+	m_data->m_camera.setCameraFrustumNear(nearVal);
+	m_data->m_camera.setCameraFrustumFar(farVal);
+
+	m_data->m_batchDepthBuffers.resize(numCameras);
+	for (int c = 0; c < numCameras; c++)
+	{
+		m_data->m_batchDepthBuffers[c].resize(numPixels);
+	}
+
+	// Gather the scene once; transforms were synced by the caller.
+	struct BatchDrawObj
+	{
+		TinyRenderObjectData* m_obj;
+		float m_modelMat[16];
+		btVector3 m_scaling;
+		btVector3 m_wMin;
+		btVector3 m_wMax;
+		bool m_hasAABB;
+	};
+	btAlignedObjectArray<BatchDrawObj> drawObjs;
+	drawObjs.reserve(m_data->m_swRenderInstances.size());
+	for (int n = 0; n < m_data->m_swRenderInstances.size(); n++)
+	{
+		TinyRendererObjectArray** visualArrayPtr = m_data->m_swRenderInstances.getAtIndex(n);
+		if (0 == visualArrayPtr)
+			continue;
+		TinyRendererObjectArray* visualArray = *visualArrayPtr;
+		for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
+		{
+			BatchDrawObj& rec = drawObjs.expand();
+			rec.m_obj = visualArray->m_renderObjects[v];
+			ATTRIBUTE_ALIGNED16(btScalar glMat[16]);
+			visualArray->m_worldTransform.getOpenGLMatrix(glMat);
+			for (int m = 0; m < 16; m++)
+			{
+				rec.m_modelMat[m] = (float)glMat[m];
+			}
+			rec.m_scaling = visualArray->m_localScaling;
+			rec.m_hasAABB = rec.m_obj->m_hasLocalAABB;
+			if (rec.m_hasAABB)
+			{
+				btVector3 sMin, sMax;
+				for (int ax = 0; ax < 3; ax++)
+				{
+					float lo = rec.m_obj->m_localAABBMin[ax] * rec.m_scaling[ax];
+					float hi = rec.m_obj->m_localAABBMax[ax] * rec.m_scaling[ax];
+					sMin[ax] = btMin(lo, hi);
+					sMax[ax] = btMax(lo, hi);
+				}
+				for (int i = 0; i < 3; i++)
+				{
+					rec.m_wMin[i] = rec.m_modelMat[12 + i];
+					rec.m_wMax[i] = rec.m_modelMat[12 + i];
+					for (int j = 0; j < 3; j++)
+					{
+						float a = rec.m_modelMat[j * 4 + i] * sMin[j];
+						float b = rec.m_modelMat[j * 4 + i] * sMax[j];
+						rec.m_wMin[i] += btMin(a, b);
+						rec.m_wMax[i] += btMax(a, b);
+					}
+				}
+			}
+		}
+	}
+
+	const int renderThreads = b3GetSwarmRenderThreads();
+#pragma omp parallel for num_threads(renderThreads) schedule(dynamic, 1) if(renderThreads > 1 && numCameras > 1)
+	for (int cam = 0; cam < numCameras; cam++)
+	{
+		float* zbuf = &m_data->m_batchDepthBuffers[cam][0];
+		for (int i = 0; i < numPixels; i++)
+		{
+			zbuf[i] = -farVal;
+		}
+
+		const float* viewMat = &viewMatrices[cam * 16];
+
+		float pvMat[16];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+			{
+				pvMat[c * 4 + r] = 0;
+				for (int k = 0; k < 4; k++)
+					pvMat[c * 4 + r] += projMat[k * 4 + r] * viewMat[c * 4 + k];
+			}
+		float frustumPlanes[6][4];
+		for (int c = 0; c < 4; c++)
+		{
+			float r0 = pvMat[c * 4 + 0];
+			float r1 = pvMat[c * 4 + 1];
+			float r2 = pvMat[c * 4 + 2];
+			float r3 = pvMat[c * 4 + 3];
+			frustumPlanes[0][c] = r3 + r0;
+			frustumPlanes[1][c] = r3 - r0;
+			frustumPlanes[2][c] = r3 + r1;
+			frustumPlanes[3][c] = r3 - r1;
+			frustumPlanes[4][c] = r3 + r2;
+			frustumPlanes[5][c] = r3 - r2;
+		}
+		for (int pl = 0; pl < 6; pl++)
+		{
+			float len = btSqrt(frustumPlanes[pl][0] * frustumPlanes[pl][0] +
+							   frustumPlanes[pl][1] * frustumPlanes[pl][1] +
+							   frustumPlanes[pl][2] * frustumPlanes[pl][2]);
+			if (len > 1e-8f)
+				for (int c = 0; c < 4; c++)
+					frustumPlanes[pl][c] /= len;
+		}
+
+		TinyRender::Matrix viewM, projM;
+		for (int i = 0; i < 4; i++)
+			for (int j = 0; j < 4; j++)
+			{
+				viewM[i][j] = viewMat[i + 4 * j];
+				projM[i][j] = projMat[i + 4 * j];
+			}
+
+		for (int o = 0; o < drawObjs.size(); o++)
+		{
+			const BatchDrawObj& rec = drawObjs[o];
+			if (rec.m_hasAABB)
+			{
+				bool outside = false;
+				for (int pl = 0; pl < 6; pl++)
+				{
+					float px = (frustumPlanes[pl][0] >= 0) ? rec.m_wMax[0] : rec.m_wMin[0];
+					float py = (frustumPlanes[pl][1] >= 0) ? rec.m_wMax[1] : rec.m_wMin[1];
+					float pz = (frustumPlanes[pl][2] >= 0) ? rec.m_wMax[2] : rec.m_wMin[2];
+					if (frustumPlanes[pl][0] * px + frustumPlanes[pl][1] * py +
+							frustumPlanes[pl][2] * pz + frustumPlanes[pl][3] < 0)
+					{
+						outside = true;
+						break;
+					}
+				}
+				if (outside)
+					continue;
+			}
+			TinyRender::Matrix modelM;
+			for (int i = 0; i < 4; i++)
+				for (int j = 0; j < 4; j++)
+				{
+					modelM[i][j] = rec.m_modelMat[i + 4 * j];
+				}
+			TinyRender::Vec3f scaling(rec.m_scaling[0], rec.m_scaling[1], rec.m_scaling[2]);
+			TinyRenderer::renderObjectCameraDepthOnlyInto(*rec.m_obj, viewM, projM, modelM, scaling, zbuf, width, height);
+		}
+
+		int half = height >> 1;
+		for (int j = 0; j < half; j++)
+		{
+			unsigned long l1 = j * (unsigned long)width;
+			unsigned long l2 = (height - 1 - j) * (unsigned long)width;
+			for (int i = 0; i < width; i++)
+			{
+				float tmp = zbuf[l1 + i];
+				zbuf[l1 + i] = zbuf[l2 + i];
+				zbuf[l2 + i] = tmp;
+			}
+		}
+	}
+
+	m_data->m_batchCameraCount = numCameras;
+	m_data->m_batchReadCamera = 0;
+	return true;
+}
+
 void TinyRendererVisualShapeConverter::render()
 {
 	ATTRIBUTE_ALIGNED16(float viewMat[16]);
@@ -1217,6 +1413,9 @@ void TinyRendererVisualShapeConverter::syncTransform(int shapeUniqueId, const bt
 
 void TinyRendererVisualShapeConverter::render(const float viewMat[16], const float projMat[16])
 {
+	m_data->m_batchCameraCount = 1;
+	m_data->m_batchReadCamera = 0;
+
 	//clear the color buffer
 	TGAColor clearColor;
 	clearColor.bgra[0] = 255;
@@ -1523,7 +1722,13 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 		{
 			const float farPlane = m_data->m_camera.getCameraFrustumFar();
 			const float nearPlane = m_data->m_camera.getCameraFrustumNear();
-			const float* src = &m_data->m_depthBuffer[0] + startPixelIndex;
+			const float* srcBase =
+				(m_data->m_batchCameraCount > 1 &&
+				 m_data->m_batchReadCamera >= 0 &&
+				 m_data->m_batchReadCamera < m_data->m_batchDepthBuffers.size())
+					? &m_data->m_batchDepthBuffers[m_data->m_batchReadCamera][0]
+					: &m_data->m_depthBuffer[0];
+			const float* src = srcBase + startPixelIndex;
 			const int renderThreads = b3GetSwarmRenderThreads();
 
 #pragma omp parallel for num_threads(renderThreads) if(renderThreads > 1 && numRequestedPixels > 65536)
