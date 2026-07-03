@@ -561,24 +561,26 @@ bool PhysicsDirect::processCamera(const struct SharedMemoryCommand& orgCommand)
 			m_data->m_cachedSegmentationMask.resize(numTotalPixels);
 			m_data->m_cachedCameraPixelsRGBA.resize(numTotalPixels * numBytesPerPixel);
 
-			unsigned char* rgbaPixelsReceived =
-				(unsigned char*)&m_data->m_bulletStreamDataServerToClient[0];
-
-			float* depthBuffer = (float*)&(m_data->m_bulletStreamDataServerToClient[serverCmd.m_sendPixelDataArguments.m_numPixelsCopied * 4]);
-			int* segmentationMaskBuffer = (int*)&(m_data->m_bulletStreamDataServerToClient[serverCmd.m_sendPixelDataArguments.m_numPixelsCopied * 8]);
-
-			//  printf("pixel = %d\n", rgbaPixelsReceived[0]);
-
 			int reqFlags = (command.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_FLAGS) ? command.m_requestPixelDataArguments.m_flags : 0;
 			bool depthOnly = (reqFlags & ER_DEPTH_ONLY) != 0;
 			bool noSeg = (reqFlags & ER_NO_SEGMENTATION_MASK) != 0;
+			// Must mirror the server's compact depth-only stream layout.
+			bool compactDepthStream = depthOnly && ((command.m_updateFlags & ER_BULLET_HARDWARE_OPENGL) == 0);
 			int numCopied = serverCmd.m_sendPixelDataArguments.m_numPixelsCopied;
 			int startPixel = serverCmd.m_sendPixelDataArguments.m_startingPixelIndex;
+
+			unsigned char* rgbaPixelsReceived =
+				(unsigned char*)&m_data->m_bulletStreamDataServerToClient[0];
+
+			float* depthBuffer = compactDepthStream
+									 ? (float*)&m_data->m_bulletStreamDataServerToClient[0]
+									 : (float*)&(m_data->m_bulletStreamDataServerToClient[numCopied * 4]);
+			int* segmentationMaskBuffer = (int*)&(m_data->m_bulletStreamDataServerToClient[numCopied * 8]);
 
 			if (numCopied > 0)
 			{
 				memcpy(&m_data->m_cachedCameraDepthBuffer[startPixel], depthBuffer, numCopied * sizeof(float));
-				if (!noSeg)
+				if (!noSeg && !compactDepthStream)
 				{
 					memcpy(&m_data->m_cachedSegmentationMask[startPixel], segmentationMaskBuffer, numCopied * sizeof(int));
 				}

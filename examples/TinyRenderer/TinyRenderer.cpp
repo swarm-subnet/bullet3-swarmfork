@@ -747,6 +747,66 @@ struct b3DepthOnlyFaceOut
 	bool m_clipped;
 };
 
+static inline void b3ProcessDepthOnlyFace(CameraDepthOnlyShader& shader, int i, b3DepthOnlyFaceOut& out, bool doubleSided, const btVector3& P)
+{
+	out.m_count = 0;
+
+	for (int j = 0; j < 3; j++)
+	{
+		shader.vertex(i, j);
+	}
+
+	if (!doubleSided)
+	{
+		btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
+		btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
+		btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
+		btVector3 N = (v1 - v0).cross(v2 - v0);
+		if ((v0 - P).dot(N) >= 0)
+			return;
+	}
+
+	{
+		bool beyond = true;
+		for (int j = 0; j < 3; j++)
+		{
+			float w = shader.varying_tri.col(j)[3];
+			if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
+			{
+				beyond = false;
+				break;
+			}
+		}
+		if (beyond)
+			return;
+	}
+
+	mat<4, 3, float> stackTris[4];
+	b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
+	clippedTriangles.initializeFromBuffer(stackTris, 0, 4);
+
+	bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
+
+	if (hasClipped)
+	{
+		int n = clippedTriangles.size();
+		if (n > 4)
+			n = 4;
+		for (int t = 0; t < n; t++)
+		{
+			out.m_tris[t] = clippedTriangles[t];
+		}
+		out.m_count = n;
+		out.m_clipped = true;
+	}
+	else
+	{
+		out.m_tris[0] = shader.varying_tri;
+		out.m_count = 1;
+		out.m_clipped = false;
+	}
+}
+
 int b3GetSwarmRenderThreads()
 {
 #ifdef _OPENMP
@@ -812,69 +872,25 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		faceOut.resize(nFaces);
 		b3DepthOnlyFaceOut* faceOutPtr = nFaces ? &faceOut[0] : 0;
 
-#pragma omp parallel num_threads(renderThreads) if(nFaces > 256)
+		if (renderThreads > 1 && nFaces > 256)
 		{
-			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+#pragma omp parallel num_threads(renderThreads)
+			{
+				CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
 
 #pragma omp for schedule(dynamic, 64)
+				for (int i = 0; i < nFaces; i++)
+				{
+					b3ProcessDepthOnlyFace(shader, i, faceOutPtr[i], doubleSided, P);
+				}
+			}
+		}
+		else
+		{
+			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
 			for (int i = 0; i < nFaces; i++)
 			{
-				faceOutPtr[i].m_count = 0;
-
-				for (int j = 0; j < 3; j++)
-				{
-					shader.vertex(i, j);
-				}
-
-				if (!doubleSided)
-				{
-					btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
-					btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
-					btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
-					btVector3 N = (v1 - v0).cross(v2 - v0);
-					if ((v0 - P).dot(N) >= 0)
-						continue;
-				}
-
-				{
-					bool beyond = true;
-					for (int j = 0; j < 3; j++)
-					{
-						float w = shader.varying_tri.col(j)[3];
-						if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
-						{
-							beyond = false;
-							break;
-						}
-					}
-					if (beyond)
-						continue;
-				}
-
-				mat<4, 3, float> stackTris[4];
-				b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
-				clippedTriangles.initializeFromBuffer(stackTris, 0, 4);
-
-				bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
-
-				if (hasClipped)
-				{
-					int n = clippedTriangles.size();
-					if (n > 4)
-						n = 4;
-					for (int t = 0; t < n; t++)
-					{
-						faceOutPtr[i].m_tris[t] = clippedTriangles[t];
-					}
-					faceOutPtr[i].m_count = n;
-					faceOutPtr[i].m_clipped = true;
-				}
-				else
-				{
-					faceOutPtr[i].m_tris[0] = shader.varying_tri;
-					faceOutPtr[i].m_count = 1;
-					faceOutPtr[i].m_clipped = false;
-				}
+				b3ProcessDepthOnlyFace(shader, i, faceOutPtr[i], doubleSided, P);
 			}
 		}
 

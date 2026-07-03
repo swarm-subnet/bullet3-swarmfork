@@ -1608,6 +1608,10 @@ struct SaveStateData
 
 struct PhysicsServerCommandProcessorInternalData
 {
+	// true while renderer transforms are in sync with the world; any command
+	// other than a camera-image request invalidates it.
+	bool m_renderTransformsSynced = false;
+
 	///handle management
 	b3ResizablePool<InternalTextureHandle> m_textureHandles;
 	b3ResizablePool<InternalBodyHandle> m_bodyHandles;
@@ -4061,13 +4065,19 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 
 	if (numRemainingPixels > 0)
 	{
-		int totalBytesPerPixel = 4 + 4 + 4;  //4 for rgb, 4 for depth, 4 for segmentation mask
+		// Depth-only software renders pack the stream buffer with depth alone,
+		// tripling the pixels per chunk; the client mirrors this layout.
+		const bool compactDepthStream = ((flags & ER_DEPTH_ONLY) != 0) &&
+										((clientCmd.m_updateFlags & ER_BULLET_HARDWARE_OPENGL) == 0);
+		int totalBytesPerPixel = compactDepthStream ? 4 : (4 + 4 + 4);  //4 for rgb, 4 for depth, 4 for segmentation mask
 		int maxNumPixels = bufferSizeInBytes / totalBytesPerPixel - 1;
-		unsigned char* pixelRGBA = (unsigned char*)bufferServerToClient;
 		int numRequestedPixels = btMin(maxNumPixels, numRemainingPixels);
+		unsigned char* pixelRGBA = compactDepthStream ? 0 : (unsigned char*)bufferServerToClient;
 
-		float* depthBuffer = (float*)(bufferServerToClient + numRequestedPixels * 4);
-		int* segmentationMaskBuffer = (int*)(bufferServerToClient + numRequestedPixels * 8);
+		float* depthBuffer = compactDepthStream
+								 ? (float*)bufferServerToClient
+								 : (float*)(bufferServerToClient + numRequestedPixels * 4);
+		int* segmentationMaskBuffer = compactDepthStream ? 0 : (int*)(bufferServerToClient + numRequestedPixels * 8);
 
 		serverStatusOut.m_numDataStreamBytes = numRequestedPixels * totalBytesPerPixel;
 		float viewMat[16];
@@ -4220,7 +4230,7 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 						m_data->m_pluginManager.getRenderInterface()->setLightSpecularCoeff(clientCmd.m_requestPixelDataArguments.m_lightSpecularCoeff);
 					}
 
-					for (int i = 0; i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
+					for (int i = 0; !m_data->m_renderTransformsSynced && i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
 					{
 						const btCollisionObject* colObj = m_data->m_dynamicsWorld->getCollisionObjectArray()[i];
 						btVector3 localScaling(1, 1, 1);
@@ -4266,6 +4276,7 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 #endif //SKIP_SOFT_BODY_MULTI_BODY_DYNAMICS_WORLD
 						}
 					}
+					m_data->m_renderTransformsSynced = true;
 
 					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
 					{
@@ -15152,6 +15163,11 @@ bool PhysicsServerCommandProcessor::processCommand(const struct SharedMemoryComm
 	serverStatusOut.m_type = CMD_INVALID_STATUS;
 	serverStatusOut.m_numDataStreamBytes = 0;
 	serverStatusOut.m_dataStream = 0;
+
+	if (clientCmd.m_type != CMD_REQUEST_CAMERA_IMAGE_DATA)
+	{
+		m_data->m_renderTransformsSynced = false;
+	}
 
 	//consume the command
 	switch (clientCmd.m_type)
