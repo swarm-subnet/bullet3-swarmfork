@@ -255,6 +255,8 @@ struct RequestDebugLinesArgs
 	int m_startingLineIndex;
 };
 
+#define MAX_BATCH_CAMERAS 8
+
 struct RequestPixelDataArgs
 {
 	float m_viewMatrix[16];
@@ -272,6 +274,10 @@ struct RequestPixelDataArgs
 	int m_flags;
 	float m_projectiveTextureViewMatrix[16];
 	float m_projectiveTextureProjectionMatrix[16];
+	// depth-only multi-camera batch: m_viewMatrix is camera 0, these hold the rest.
+	// The reply streams the cameras stacked as one image of height N*m_pixelHeight.
+	int m_numBatchCameras;
+	float m_batchViewMatrices[MAX_BATCH_CAMERAS - 1][16];
 };
 
 enum EnumRequestPixelDataUpdateFlags
@@ -287,6 +293,7 @@ enum EnumRequestPixelDataUpdateFlags
 	REQUEST_PIXEL_ARGS_SET_SPECULAR_COEFF = 256,
 	REQUEST_PIXEL_ARGS_HAS_FLAGS = 512,
 	REQUEST_PIXEL_ARGS_HAS_PROJECTIVE_TEXTURE_MATRICES = 1024,
+	REQUEST_PIXEL_ARGS_HAS_BATCH_CAMERAS = 2048,
 
 	//don't exceed (1<<15), because this enum is shared with EnumRenderer in SharedMemoryPublic.h
 

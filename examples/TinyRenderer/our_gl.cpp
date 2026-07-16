@@ -219,7 +219,7 @@ void triangle(mat<4, 3, float> &clipc, IShader &shader, TGAImage &image, float *
 	}
 }
 
-void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane)
+void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane, int bandTid, int bandCount)
 {
 	mat<3, 4, float> pts = (viewPortMatrix * clipc).transpose();
 
@@ -264,6 +264,9 @@ void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentatio
 
 	for (int py = y0; py <= y1; py++, ux_row += dux_dy, uy_row += duy_dy)
 	{
+		if (bandCount > 1 && (int)(((unsigned)py >> 3) % (unsigned)bandCount) != bandTid)
+			continue;
+
 		double ux = ux_row;
 		double uy = uy_row;
 		int row_off = py * width;
@@ -297,7 +300,7 @@ void triangleDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentatio
 	}
 }
 
-void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane)
+void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segmentationMaskBuffer, const Matrix &viewPortMatrix, int objectAndLinkIndex, int width, int height, float nearPlane, float farPlane, int bandTid, int bandCount)
 {
 	mat<3, 4, float> pts = (viewPortMatrix * clipc).transpose();
 
@@ -345,6 +348,9 @@ void triangleClippedDepthOnly(mat<4, 3, float> &clipc, float *zbuffer, int *segm
 
 	for (int py = y0; py <= y1; py++, ux_row += dux_dy, uy_row += duy_dy)
 	{
+		if (bandCount > 1 && (int)(((unsigned)py >> 3) % (unsigned)bandCount) != bandTid)
+			continue;
+
 		double ux = ux_row;
 		double uy = uy_row;
 		int row_off = py * width;

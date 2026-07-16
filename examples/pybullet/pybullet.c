@@ -10247,26 +10247,40 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 										bytesPerPixel};
 				npy_intp dep_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				npy_intp seg_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
+				int depthOnly = (flags >= 0) && ((flags & ER_DEPTH_ONLY) != 0);
 
 				pyResultList = PyTuple_New(5);
 
 				PyTuple_SetItem(pyResultList, 0, PyInt_FromLong(imageData.m_pixelWidth));
 				PyTuple_SetItem(pyResultList, 1, PyInt_FromLong(imageData.m_pixelHeight));
 
-				pyRGB = PyArray_SimpleNew(3, rgb_dims, NPY_UINT8);
 				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
-				pySeg = PyArray_SimpleNew(2, seg_dims, NPY_INT32);
-
-				memcpy(PyArray_DATA(pyRGB), imageData.m_rgbColorData,
-					   imageData.m_pixelHeight * imageData.m_pixelWidth * bytesPerPixel);
 				memcpy(PyArray_DATA(pyDep), imageData.m_depthValues,
 					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
-				memcpy(PyArray_DATA(pySeg), imageData.m_segmentationMaskValues,
-					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(int));
 
-				PyTuple_SetItem(pyResultList, 2, pyRGB);
-				PyTuple_SetItem(pyResultList, 3, pyDep);
-				PyTuple_SetItem(pyResultList, 4, pySeg);
+				if (depthOnly)
+				{
+					// no color/segmentation image exists in depth-only mode
+					Py_INCREF(Py_None);
+					PyTuple_SetItem(pyResultList, 2, Py_None);
+					PyTuple_SetItem(pyResultList, 3, pyDep);
+					Py_INCREF(Py_None);
+					PyTuple_SetItem(pyResultList, 4, Py_None);
+				}
+				else
+				{
+					pyRGB = PyArray_SimpleNew(3, rgb_dims, NPY_UINT8);
+					pySeg = PyArray_SimpleNew(2, seg_dims, NPY_INT32);
+
+					memcpy(PyArray_DATA(pyRGB), imageData.m_rgbColorData,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * bytesPerPixel);
+					memcpy(PyArray_DATA(pySeg), imageData.m_segmentationMaskValues,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(int));
+
+					PyTuple_SetItem(pyResultList, 2, pyRGB);
+					PyTuple_SetItem(pyResultList, 3, pyDep);
+					PyTuple_SetItem(pyResultList, 4, pySeg);
+				}
 			}
 #else   //PYBULLET_USE_NUMPY
 			PyObject* item2;
@@ -10369,6 +10383,119 @@ static PyObject* pybullet_computeViewMatrix(PyObject* self, PyObject* args, PyOb
 	}
 
 	PyErr_SetString(SpamError, "Error in computeViewMatrix.");
+	return NULL;
+}
+
+#define PYB_MAX_BATCH_CAMERAS 8
+
+// Render N depth-only cameras of the same scene in one request; returns a
+// float32 numpy array of shape (N, height, width).
+static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, PyObject* keywds)
+{
+	int width, height;
+	PyObject* objViewMats = 0;
+	PyObject* objProjMat = 0;
+	PyObject* lightDirObj = 0;
+	int flags = -1;
+	int physicsClientId = 0;
+	b3PhysicsClientHandle sm = 0;
+	static char* kwlist[] = {"width", "height", "viewMatrices", "projectionMatrix", "lightDirection", "flags", "physicsClientId", NULL};
+
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "iiOO|Oii", kwlist, &width, &height, &objViewMats, &objProjMat, &lightDirObj, &flags, &physicsClientId))
+	{
+		return NULL;
+	}
+	sm = getPhysicsClient(physicsClientId);
+	if (sm == 0)
+	{
+		PyErr_SetString(SpamError, "Not connected to physics server.");
+		return NULL;
+	}
+
+	{
+		float projectionMatrix[16];
+		float viewMatrix[16];
+		float extraViews[(PYB_MAX_BATCH_CAMERAS - 1) * 16];
+		float lightDir[3];
+		int numCams;
+		int c;
+		b3SharedMemoryCommandHandle command;
+		PyObject* seq = PySequence_Fast(objViewMats, "viewMatrices must be a sequence");
+		if (!seq)
+		{
+			return NULL;
+		}
+		numCams = (int)PySequence_Fast_GET_SIZE(seq);
+		if (numCams < 1 || numCams > PYB_MAX_BATCH_CAMERAS)
+		{
+			Py_DECREF(seq);
+			PyErr_SetString(SpamError, "viewMatrices must hold between 1 and 8 matrices.");
+			return NULL;
+		}
+		if (!pybullet_internalSetMatrix(PySequence_Fast_GET_ITEM(seq, 0), viewMatrix))
+		{
+			Py_DECREF(seq);
+			PyErr_SetString(SpamError, "Invalid view matrix in viewMatrices.");
+			return NULL;
+		}
+		for (c = 1; c < numCams; c++)
+		{
+			if (!pybullet_internalSetMatrix(PySequence_Fast_GET_ITEM(seq, c), &extraViews[(c - 1) * 16]))
+			{
+				Py_DECREF(seq);
+				PyErr_SetString(SpamError, "Invalid view matrix in viewMatrices.");
+				return NULL;
+			}
+		}
+		Py_DECREF(seq);
+		if (!pybullet_internalSetMatrix(objProjMat, projectionMatrix))
+		{
+			PyErr_SetString(SpamError, "Invalid projection matrix.");
+			return NULL;
+		}
+
+		command = b3InitRequestCameraImage(sm);
+		b3RequestCameraImageSetPixelResolution(command, width, height);
+		b3RequestCameraImageSetCameraMatrices(command, viewMatrix, projectionMatrix);
+		if (numCams > 1)
+		{
+			b3RequestCameraImageSetBatchViewMatrices(command, extraViews, numCams - 1);
+		}
+		if (lightDirObj && pybullet_internalSetVector(lightDirObj, lightDir))
+		{
+			b3RequestCameraImageSetLightDirection(command, lightDir);
+		}
+		if (flags < 0)
+		{
+			flags = 0;
+		}
+		flags |= ER_DEPTH_ONLY | ER_NO_SEGMENTATION_MASK;
+		b3RequestCameraImageSetFlags(command, flags);
+
+		if (b3CanSubmitCommand(sm))
+		{
+			b3SharedMemoryStatusHandle statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			if (b3GetStatusType(statusHandle) == CMD_CAMERA_IMAGE_COMPLETED)
+			{
+#ifdef PYBULLET_USE_NUMPY
+				struct b3CameraImageData imageData;
+				PyObject* pyDep;
+				b3GetCameraImageData(sm, &imageData);
+				{
+					npy_intp dep_dims[3] = {numCams, imageData.m_pixelHeight / numCams, imageData.m_pixelWidth};
+					pyDep = PyArray_SimpleNew(3, dep_dims, NPY_FLOAT32);
+					memcpy(PyArray_DATA(pyDep), imageData.m_depthValues,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+					return pyDep;
+				}
+#else
+				PyErr_SetString(SpamError, "getDepthImagesBatch requires numpy support.");
+				return NULL;
+#endif
+			}
+		}
+	}
+	PyErr_SetString(SpamError, "getDepthImagesBatch failed.");
 	return NULL;
 }
 
@@ -12928,6 +13055,11 @@ static PyMethodDef SpamMethods[] = {
 	 " as NumPy arrays"
 #endif
 	},
+
+	{"getDepthImagesBatch", (PyCFunction)pybullet_getDepthImagesBatch, METH_VARARGS | METH_KEYWORDS,
+	 "Render several depth-only cameras of the same scene in one request "
+	 "(width, height, viewMatrices, projectionMatrix, lightDirection, flags, physicsClientId); "
+	 "returns a (numCameras, height, width) float32 NumPy array"},
 
 	{"isNumpyEnabled", (PyCFunction)pybullet_isNumpyEnabled, METH_VARARGS | METH_KEYWORDS,
 	 "return True if PyBullet was compiled with NUMPY support. This makes the getCameraImage API faster"},

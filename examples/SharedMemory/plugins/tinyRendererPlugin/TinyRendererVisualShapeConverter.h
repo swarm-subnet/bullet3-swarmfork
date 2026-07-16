@@ -53,6 +53,8 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 
 	virtual void render();
 	virtual void render(const float viewMat[16], const float projMat[16]);
+	virtual bool renderDepthBatch(const float* viewMatrices, int numCameras, const float projMat[16], bool forceRender);
+	virtual void setBatchReadCamera(int camIndex);
 
 	virtual int loadTextureFile(const char* filename, struct CommonFileIOInterface* fileIO);
 	virtual int registerTexture(unsigned char* texels, int width, int height);

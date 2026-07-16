@@ -68,6 +68,17 @@ public:
 	static void renderObjectDepth(TinyRenderObjectData& renderData);
 	static void renderObject(TinyRenderObjectData& renderData);
 	static void renderObjectCameraDepthOnly(TinyRenderObjectData& renderData);
+	// Thread-safe depth-only render: explicit matrices and target buffer,
+	// no mutation of renderData, so cameras can render concurrently.
+	static void renderObjectCameraDepthOnlyInto(const TinyRenderObjectData& renderData,
+												const TinyRender::Matrix& viewMatrix,
+												const TinyRender::Matrix& projMatrix,
+												const TinyRender::Matrix& modelMatrix,
+												const TinyRender::Vec3f& localScaling,
+												float* zbufferPtr, int width, int height);
 };
+
+// Worker thread count for depth-only render/copy loops (SWARM_RENDER_THREADS, default 2).
+int b3GetSwarmRenderThreads();
 
 #endif  // TINY_RENDERER_Hbla

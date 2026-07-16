@@ -1,9 +1,17 @@
 #include "TinyRenderer.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#if defined(__SSE2__) || defined(_M_X64)
+#define B3_TINY_SIMD 1
+#include <emmintrin.h>
+#endif
 #include "../CommonInterfaces/CommonFileIOInterface.h"
 #include "../OpenGLWindow/ShapeData.h"
 #include "../Utils/b3BulletDefaultFileIO.h"
@@ -83,6 +91,13 @@ struct CameraDepthOnlyShader : public IShader
 	mat<4, 3, float> varying_tri;
 	mat<4, 3, float> world_tri;
 
+#ifdef B3_TINY_SIMD
+	// column vectors of the two vertex matrices; the linear combination below
+	// reproduces the scalar dot's exact accumulation order per component.
+	__m128 m_pmvCol[4];
+	__m128 m_modelCol[4];
+#endif
+
 	CameraDepthOnlyShader(Model* model, Matrix& modelView, Matrix& projectionMat, Matrix& modelMat, Vec3f localScaling)
 		: m_model(model),
 		  m_modelMat(modelMat),
@@ -94,7 +109,29 @@ struct CameraDepthOnlyShader : public IShader
 		m_farPlane = m_projectionMat.col(3)[2] / (m_projectionMat.col(2)[2] + 1);
 		m_invModelMat = m_modelMat.invert_transpose();
 		m_projectionModelViewMat = m_projectionMat * m_modelView;
+#ifdef B3_TINY_SIMD
+		for (int c = 0; c < 4; c++)
+		{
+			m_pmvCol[c] = _mm_setr_ps(m_projectionModelViewMat[0][c], m_projectionModelViewMat[1][c],
+									  m_projectionModelViewMat[2][c], m_projectionModelViewMat[3][c]);
+			m_modelCol[c] = _mm_setr_ps(m_modelMat[0][c], m_modelMat[1][c],
+										m_modelMat[2][c], m_modelMat[3][c]);
+		}
+#endif
 	}
+
+#ifdef B3_TINY_SIMD
+	// ret[i] = ((0 + m[i][3]*v3) + m[i][2]*v2) + m[i][1]*v1) + m[i][0]*v0 —
+	// the same order the scalar vec dot accumulates in.
+	static inline __m128 mulMat4Vec4(const __m128 cols[4], float v0, float v1, float v2, float v3)
+	{
+		__m128 acc = _mm_add_ps(_mm_setzero_ps(), _mm_mul_ps(cols[3], _mm_set1_ps(v3)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[2], _mm_set1_ps(v2)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[1], _mm_set1_ps(v1)));
+		acc = _mm_add_ps(acc, _mm_mul_ps(cols[0], _mm_set1_ps(v0)));
+		return acc;
+	}
+#endif
 
 	virtual Vec4f vertex(int iface, int nthvert)
 	{
@@ -102,11 +139,30 @@ struct CameraDepthOnlyShader : public IShader
 		Vec3f scaledVert = Vec3f(unScaledVert[0] * m_localScaling[0],
 								 unScaledVert[1] * m_localScaling[1],
 								 unScaledVert[2] * m_localScaling[2]);
+#ifdef B3_TINY_SIMD
+		float out[4];
+		_mm_storeu_ps(out, mulMat4Vec4(m_pmvCol, scaledVert[0], scaledVert[1], scaledVert[2], 1.f));
+		Vec4f gl_Vertex;
+		gl_Vertex[0] = out[0];
+		gl_Vertex[1] = out[1];
+		gl_Vertex[2] = out[2];
+		gl_Vertex[3] = out[3];
+		varying_tri.set_col(nthvert, gl_Vertex);
+		_mm_storeu_ps(out, mulMat4Vec4(m_modelCol, scaledVert[0], scaledVert[1], scaledVert[2], 1.f));
+		Vec4f world_Vertex;
+		world_Vertex[0] = out[0];
+		world_Vertex[1] = out[1];
+		world_Vertex[2] = out[2];
+		world_Vertex[3] = out[3];
+		world_tri.set_col(nthvert, world_Vertex);
+		return gl_Vertex;
+#else
 		Vec4f gl_Vertex = m_projectionModelViewMat * embed<4>(scaledVert);
 		varying_tri.set_col(nthvert, gl_Vertex);
 		Vec4f world_Vertex = m_modelMat * embed<4>(scaledVert);
 		world_tri.set_col(nthvert, world_Vertex);
 		return gl_Vertex;
+#endif
 	}
 
 	virtual bool fragment(Vec3f bar, TGAColor& color)
@@ -734,6 +790,141 @@ void TinyRenderer::renderObjectDepth(TinyRenderObjectData& renderData)
 	}
 }
 
+// Near-plane clipping fans a triangle into at most 4 sub-triangles
+// (clipEdge emits up to 6 vertices -> fan of size-2 triangles).
+struct b3DepthOnlyFaceOut
+{
+	mat<4, 3, float> m_tris[4];
+	int m_count;
+	bool m_clipped;
+};
+
+static inline void b3ProcessDepthOnlyFace(CameraDepthOnlyShader& shader, int i, b3DepthOnlyFaceOut& out, bool doubleSided, const btVector3& P)
+{
+	out.m_count = 0;
+
+	for (int j = 0; j < 3; j++)
+	{
+		shader.vertex(i, j);
+	}
+
+	if (!doubleSided)
+	{
+		btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
+		btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
+		btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
+		btVector3 N = (v1 - v0).cross(v2 - v0);
+		if ((v0 - P).dot(N) >= 0)
+			return;
+	}
+
+	{
+		bool beyond = true;
+		for (int j = 0; j < 3; j++)
+		{
+			float w = shader.varying_tri.col(j)[3];
+			if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
+			{
+				beyond = false;
+				break;
+			}
+		}
+		if (beyond)
+			return;
+	}
+
+	mat<4, 3, float> stackTris[4];
+	b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
+	clippedTriangles.initializeFromBuffer(stackTris, 0, 4);
+
+	bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
+
+	if (hasClipped)
+	{
+		int n = clippedTriangles.size();
+		if (n > 4)
+			n = 4;
+		for (int t = 0; t < n; t++)
+		{
+			out.m_tris[t] = clippedTriangles[t];
+		}
+		out.m_count = n;
+		out.m_clipped = true;
+	}
+	else
+	{
+		out.m_tris[0] = shader.varying_tri;
+		out.m_count = 1;
+		out.m_clipped = false;
+	}
+}
+
+void TinyRenderer::renderObjectCameraDepthOnlyInto(const TinyRenderObjectData& renderData,
+												   const Matrix& viewMatrix,
+												   const Matrix& projMatrix,
+												   const Matrix& modelMatrix,
+												   const Vec3f& localScaling,
+												   float* zbufferPtr, int width, int height)
+{
+	Model* model = renderData.m_model;
+	if (0 == model)
+		return;
+	if (model->getColorRGBA()[3] == 0)
+		return;
+
+	Matrix viewportMat = viewport(0, 0, width, height);
+	Matrix viewCopy = viewMatrix;
+	Matrix projCopy = projMatrix;
+	Matrix modelCopy = modelMatrix;
+	Matrix modelViewMatrix = viewCopy * modelCopy;
+	Matrix viewMatrixInv = viewCopy.invert();
+	btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
+
+	const bool doubleSided = renderData.m_doubleSided;
+	const int objectLinkIndex = renderData.m_objectIndex + ((renderData.m_linkIndex + 1) << 24);
+	const int nFaces = model->nfaces();
+
+	CameraDepthOnlyShader shader(model, modelViewMatrix, projCopy, modelCopy, localScaling);
+	b3DepthOnlyFaceOut faceTmp;
+	for (int i = 0; i < nFaces; i++)
+	{
+		b3ProcessDepthOnlyFace(shader, i, faceTmp, doubleSided, P);
+		for (int t = 0; t < faceTmp.m_count; t++)
+		{
+			if (faceTmp.m_clipped)
+			{
+				triangleClippedDepthOnly(faceTmp.m_tris[t], zbufferPtr, 0, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+			}
+			else
+			{
+				triangleDepthOnly(faceTmp.m_tris[t], zbufferPtr, 0, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+			}
+		}
+	}
+}
+
+int b3GetSwarmRenderThreads()
+{
+#ifdef _OPENMP
+	static int cached = 0;
+	if (cached <= 0)
+	{
+		int n = 2;
+		const char* env = getenv("SWARM_RENDER_THREADS");
+		if (env && env[0])
+			n = atoi(env);
+		if (n < 1)
+			n = 1;
+		if (n > 16)
+			n = 16;
+		cached = n;
+	}
+	return cached;
+#else
+	return 1;
+#endif
+}
+
 void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 {
 	int width = renderData.m_rgbColorBuffer.get_width();
@@ -762,60 +953,130 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 		float* zbufferPtr = &zbuffer[0];
 		const Matrix& viewportMat = renderData.m_viewportMatrix;
 
-#pragma omp parallel if(nFaces > 256)
+		// Same formulas as the CameraDepthOnlyShader constructor.
+		const float nearPlaneVal = renderData.m_projectionMatrix.col(3)[2] / (renderData.m_projectionMatrix.col(2)[2] - 1);
+		const float farPlaneVal = renderData.m_projectionMatrix.col(3)[2] / (renderData.m_projectionMatrix.col(2)[2] + 1);
+
+		const int renderThreads = b3GetSwarmRenderThreads();
+
+		// Mode selection: the two-phase scratch path only pays off when the fill
+		// can be band-parallelized (few huge triangles on a big framebuffer) or
+		// the transform loop dominates (very dense meshes such as terrain tiles).
+		// Everything else takes the copy-free direct path.
+		const bool parTransform = renderThreads > 1 && nFaces > 4096;
+		const bool bandFill = renderThreads > 1 && (width * height >= 65536) && nFaces <= 8;
+
+		if (!parTransform && !bandFill)
 		{
 			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
-
-#pragma omp for schedule(dynamic, 64)
+			b3DepthOnlyFaceOut faceTmp;
 			for (int i = 0; i < nFaces; i++)
 			{
-				for (int j = 0; j < 3; j++)
+				b3ProcessDepthOnlyFace(shader, i, faceTmp, doubleSided, P);
+				for (int t = 0; t < faceTmp.m_count; t++)
 				{
-					shader.vertex(i, j);
-				}
-
-				if (!doubleSided)
-				{
-					btVector3 v0(shader.world_tri.col(0)[0], shader.world_tri.col(0)[1], shader.world_tri.col(0)[2]);
-					btVector3 v1(shader.world_tri.col(1)[0], shader.world_tri.col(1)[1], shader.world_tri.col(1)[2]);
-					btVector3 v2(shader.world_tri.col(2)[0], shader.world_tri.col(2)[1], shader.world_tri.col(2)[2]);
-					btVector3 N = (v1 - v0).cross(v2 - v0);
-					if ((v0 - P).dot(N) >= 0)
-						continue;
-				}
-
-				{
-					bool beyond = true;
-					for (int j = 0; j < 3; j++)
+					if (faceTmp.m_clipped)
 					{
-						float w = shader.varying_tri.col(j)[3];
-						if (w <= 0 || shader.varying_tri.col(j)[2] <= w)
-						{
-							beyond = false;
-							break;
-						}
+						triangleClippedDepthOnly(faceTmp.m_tris[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
 					}
-					if (beyond)
-						continue;
-				}
-
-				mat<4, 3, float> stackTris[3];
-				b3AlignedObjectArray<mat<4, 3, float> > clippedTriangles;
-				clippedTriangles.initializeFromBuffer(stackTris, 0, 3);
-
-				bool hasClipped = clipTriangleAgainstNearplane(shader.varying_tri, clippedTriangles);
-
-				if (hasClipped)
-				{
-					for (int t = 0; t < clippedTriangles.size(); t++)
+					else
 					{
-						triangleClippedDepthOnly(clippedTriangles[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+						triangleDepthOnly(faceTmp.m_tris[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
 					}
 				}
-				else
+			}
+			return;
+		}
+
+		// Phase 1: transform + cull + clip every face into its own slot (no
+		// framebuffer writes, so the face loop parallelizes without races).
+		// The static scratch assumes one render at a time per process (the
+		// evaluator runs one worker process per container); concurrent renders
+		// from multiple host threads would corrupt it.
+		static b3AlignedObjectArray<b3DepthOnlyFaceOut> faceOut;
+		faceOut.resize(nFaces);
+		b3DepthOnlyFaceOut* faceOutPtr = nFaces ? &faceOut[0] : 0;
+
+		if (parTransform)
+		{
+#pragma omp parallel num_threads(renderThreads)
+			{
+				CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+
+#pragma omp for schedule(dynamic, 64)
+				for (int i = 0; i < nFaces; i++)
 				{
-					triangleDepthOnly(shader.varying_tri, zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, shader.m_nearPlane, shader.m_farPlane);
+					b3ProcessDepthOnlyFace(shader, i, faceOutPtr[i], doubleSided, P);
 				}
+			}
+		}
+		else
+		{
+			CameraDepthOnlyShader shader(model, modelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, localScaling);
+			for (int i = 0; i < nFaces; i++)
+			{
+				b3ProcessDepthOnlyFace(shader, i, faceOutPtr[i], doubleSided, P);
+			}
+		}
+
+		// Compact surviving triangles in face order so rasterization order
+		// matches the serial pass exactly.
+		static b3AlignedObjectArray<mat<4, 3, float> > flatTris;
+		static b3AlignedObjectArray<unsigned char> flatClipped;
+		flatTris.resize(0);
+		flatClipped.resize(0);
+		for (int i = 0; i < nFaces; i++)
+		{
+			for (int t = 0; t < faceOutPtr[i].m_count; t++)
+			{
+				flatTris.push_back(faceOutPtr[i].m_tris[t]);
+				flatClipped.push_back(faceOutPtr[i].m_clipped ? 1 : 0);
+			}
+		}
+
+		const int nTris = flatTris.size();
+		if (nTris == 0)
+			return;
+		mat<4, 3, float>* triPtr = &flatTris[0];
+		const unsigned char* clipPtr = &flatClipped[0];
+
+		// Phase 2: pixel fill. Band-parallel pays off on large framebuffers with
+		// few triangles (each thread re-walks every triangle's rows); dense
+		// meshes on small buffers stay serial.
+		const bool bandParallel = bandFill && nTris <= 4096;
+
+#ifdef _OPENMP
+		if (bandParallel)
+		{
+#pragma omp parallel num_threads(renderThreads)
+			{
+				const int tid = omp_get_thread_num();
+				const int cnt = omp_get_num_threads();
+				for (int t = 0; t < nTris; t++)
+				{
+					if (clipPtr[t])
+					{
+						triangleClippedDepthOnly(triPtr[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal, tid, cnt);
+					}
+					else
+					{
+						triangleDepthOnly(triPtr[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal, tid, cnt);
+					}
+				}
+			}
+			return;
+		}
+#endif
+
+		for (int t = 0; t < nTris; t++)
+		{
+			if (clipPtr[t])
+			{
+				triangleClippedDepthOnly(triPtr[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
+			}
+			else
+			{
+				triangleDepthOnly(triPtr[t], zbufferPtr, segmentationMaskBufferPtr, viewportMat, objectLinkIndex, width, height, nearPlaneVal, farPlaneVal);
 			}
 		}
 	}

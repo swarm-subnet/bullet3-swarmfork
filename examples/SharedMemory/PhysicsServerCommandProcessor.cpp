@@ -1608,6 +1608,10 @@ struct SaveStateData
 
 struct PhysicsServerCommandProcessorInternalData
 {
+	// true while renderer transforms are in sync with the world; any command
+	// other than a camera-image request invalidates it.
+	bool m_renderTransformsSynced = false;
+
 	///handle management
 	b3ResizablePool<InternalTextureHandle> m_textureHandles;
 	b3ResizablePool<InternalBodyHandle> m_bodyHandles;
@@ -4056,18 +4060,45 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 		m_data->m_pluginManager.getRenderInterface()->setFlags(flags);
 	}
 
-	int numTotalPixels = width * height;
+	// Multi-camera depth batch: cameras stream back-to-back as one image of
+	// height numBatchCameras * height; only the software depth-only path supports it.
+	int numBatchCameras = 1;
+	if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_BATCH_CAMERAS) != 0 &&
+		(flags & ER_DEPTH_ONLY) != 0 &&
+		(clientCmd.m_updateFlags & ER_BULLET_HARDWARE_OPENGL) == 0)
+	{
+		numBatchCameras = clientCmd.m_requestPixelDataArguments.m_numBatchCameras;
+		if (numBatchCameras < 1)
+			numBatchCameras = 1;
+		if (numBatchCameras > MAX_BATCH_CAMERAS)
+			numBatchCameras = MAX_BATCH_CAMERAS;
+	}
+	const int camPixels = width * height;
+
+	int numTotalPixels = width * height * numBatchCameras;
 	int numRemainingPixels = numTotalPixels - startPixelIndex;
 
 	if (numRemainingPixels > 0)
 	{
-		int totalBytesPerPixel = 4 + 4 + 4;  //4 for rgb, 4 for depth, 4 for segmentation mask
+		// Depth-only software renders pack the stream buffer with depth alone,
+		// tripling the pixels per chunk; the client mirrors this layout.
+		const bool compactDepthStream = ((flags & ER_DEPTH_ONLY) != 0) &&
+										((clientCmd.m_updateFlags & ER_BULLET_HARDWARE_OPENGL) == 0);
+		int totalBytesPerPixel = compactDepthStream ? 4 : (4 + 4 + 4);  //4 for rgb, 4 for depth, 4 for segmentation mask
 		int maxNumPixels = bufferSizeInBytes / totalBytesPerPixel - 1;
-		unsigned char* pixelRGBA = (unsigned char*)bufferServerToClient;
 		int numRequestedPixels = btMin(maxNumPixels, numRemainingPixels);
+		if (numBatchCameras > 1)
+		{
+			// never let one chunk span two cameras
+			int remainInCamera = camPixels - (startPixelIndex % camPixels);
+			numRequestedPixels = btMin(numRequestedPixels, remainInCamera);
+		}
+		unsigned char* pixelRGBA = compactDepthStream ? 0 : (unsigned char*)bufferServerToClient;
 
-		float* depthBuffer = (float*)(bufferServerToClient + numRequestedPixels * 4);
-		int* segmentationMaskBuffer = (int*)(bufferServerToClient + numRequestedPixels * 8);
+		float* depthBuffer = compactDepthStream
+								 ? (float*)bufferServerToClient
+								 : (float*)(bufferServerToClient + numRequestedPixels * 4);
+		int* segmentationMaskBuffer = compactDepthStream ? 0 : (int*)(bufferServerToClient + numRequestedPixels * 8);
 
 		serverStatusOut.m_numDataStreamBytes = numRequestedPixels * totalBytesPerPixel;
 		float viewMat[16];
@@ -4181,7 +4212,10 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 		{
 			if (m_data->m_pluginManager.getRenderInterface())
 			{
-				if (clientCmd.m_requestPixelDataArguments.m_startPixelIndex == 0)
+				bool segmentStart = (numBatchCameras > 1)
+										? (camPixels > 0 && startPixelIndex % camPixels == 0)
+										: (startPixelIndex == 0);
+				if (segmentStart)
 				{
 					//   printf("-------------------------------\nRendering\n");
 
@@ -4220,7 +4254,7 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 						m_data->m_pluginManager.getRenderInterface()->setLightSpecularCoeff(clientCmd.m_requestPixelDataArguments.m_lightSpecularCoeff);
 					}
 
-					for (int i = 0; i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
+					for (int i = 0; !m_data->m_renderTransformsSynced && i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
 					{
 						const btCollisionObject* colObj = m_data->m_dynamicsWorld->getCollisionObjectArray()[i];
 						btVector3 localScaling(1, 1, 1);
@@ -4266,11 +4300,41 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 #endif //SKIP_SOFT_BODY_MULTI_BODY_DYNAMICS_WORLD
 						}
 					}
+					m_data->m_renderTransformsSynced = true;
 
-					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
+					bool batchRendered = false;
+					if (numBatchCameras > 1 && (clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
 					{
+						float allViews[MAX_BATCH_CAMERAS * 16];
+						for (int i = 0; i < 16; i++)
+						{
+							allViews[i] = clientCmd.m_requestPixelDataArguments.m_viewMatrix[i];
+						}
+						for (int c = 1; c < numBatchCameras; c++)
+						{
+							for (int i = 0; i < 16; i++)
+							{
+								allViews[c * 16 + i] = clientCmd.m_requestPixelDataArguments.m_batchViewMatrices[c - 1][i];
+							}
+						}
+						batchRendered = m_data->m_pluginManager.getRenderInterface()->renderDepthBatch(
+							allViews, numBatchCameras,
+							clientCmd.m_requestPixelDataArguments.m_projectionMatrix,
+							startPixelIndex == 0);
+					}
+					if (batchRendered)
+					{
+						// all cameras rendered; segments only copy from their buffers
+					}
+					else if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_CAMERA_MATRICES) != 0)
+					{
+						int camIndex = startPixelIndex / camPixels;
+						const float* segmentViewMatrix =
+							(camIndex <= 0)
+								? clientCmd.m_requestPixelDataArguments.m_viewMatrix
+								: clientCmd.m_requestPixelDataArguments.m_batchViewMatrices[camIndex - 1];
 						m_data->m_pluginManager.getRenderInterface()->render(
-							clientCmd.m_requestPixelDataArguments.m_viewMatrix,
+							segmentViewMatrix,
 							clientCmd.m_requestPixelDataArguments.m_projectionMatrix);
 					}
 					else
@@ -4334,10 +4398,15 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 					segmentationMaskBuffer = 0;
 				}
 
+				int camRelativeStart = (numBatchCameras > 1 && camPixels > 0) ? (startPixelIndex % camPixels) : startPixelIndex;
+				if (numBatchCameras > 1 && camPixels > 0)
+				{
+					m_data->m_pluginManager.getRenderInterface()->setBatchReadCamera(startPixelIndex / camPixels);
+				}
 				m_data->m_pluginManager.getRenderInterface()->copyCameraImageData(pixelRGBA, numRequestedPixels,
 																				  depthBuffer, numRequestedPixels,
 																				  segmentationMaskBuffer, numRequestedPixels,
-																				  startPixelIndex, &width, &height, &numPixelsCopied);
+																				  camRelativeStart, &width, &height, &numPixelsCopied);
 				m_data->m_pluginManager.getRenderInterface()->setProjectiveTexture(false);
 			}
 
@@ -4360,7 +4429,7 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 	serverStatusOut.m_sendPixelDataArguments.m_numRemainingPixels = numRemainingPixels - numPixelsCopied;
 	serverStatusOut.m_sendPixelDataArguments.m_startingPixelIndex = startPixelIndex;
 	serverStatusOut.m_sendPixelDataArguments.m_imageWidth = width;
-	serverStatusOut.m_sendPixelDataArguments.m_imageHeight = height;
+	serverStatusOut.m_sendPixelDataArguments.m_imageHeight = height * numBatchCameras;
 	return hasStatus;
 }
 
@@ -15152,6 +15221,11 @@ bool PhysicsServerCommandProcessor::processCommand(const struct SharedMemoryComm
 	serverStatusOut.m_type = CMD_INVALID_STATUS;
 	serverStatusOut.m_numDataStreamBytes = 0;
 	serverStatusOut.m_dataStream = 0;
+
+	if (clientCmd.m_type != CMD_REQUEST_CAMERA_IMAGE_DATA)
+	{
+		m_data->m_renderTransformsSynced = false;
+	}
 
 	//consume the command
 	switch (clientCmd.m_type)

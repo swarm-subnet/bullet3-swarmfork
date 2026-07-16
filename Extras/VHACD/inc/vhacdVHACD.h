@@ -27,7 +27,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include "vhacdMutex.h"
 #include "vhacdVolume.h"
 
+#ifndef USE_THREAD
 #define USE_THREAD 1
+#endif
 #define OCL_MIN_NUM_PRIMITIVES 4096
 #define CH_APP_MIN_NUM_PRIMITIVES 64000
 namespace VHACD
