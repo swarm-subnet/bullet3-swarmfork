@@ -10255,7 +10255,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				PyTuple_SetItem(pyResultList, 1, PyInt_FromLong(imageData.m_pixelHeight));
 
 				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
-				memcpy(PyArray_DATA(pyDep), imageData.m_depthValues,
+				memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
 					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
 
 				if (depthOnly)
@@ -10272,9 +10272,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 					pyRGB = PyArray_SimpleNew(3, rgb_dims, NPY_UINT8);
 					pySeg = PyArray_SimpleNew(2, seg_dims, NPY_INT32);
 
-					memcpy(PyArray_DATA(pyRGB), imageData.m_rgbColorData,
+					memcpy(PyArray_DATA((PyArrayObject*)pyRGB), imageData.m_rgbColorData,
 						   imageData.m_pixelHeight * imageData.m_pixelWidth * bytesPerPixel);
-					memcpy(PyArray_DATA(pySeg), imageData.m_segmentationMaskValues,
+					memcpy(PyArray_DATA((PyArrayObject*)pySeg), imageData.m_segmentationMaskValues,
 						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(int));
 
 					PyTuple_SetItem(pyResultList, 2, pyRGB);
@@ -10484,7 +10484,7 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 				{
 					npy_intp dep_dims[3] = {numCams, imageData.m_pixelHeight / numCams, imageData.m_pixelWidth};
 					pyDep = PyArray_SimpleNew(3, dep_dims, NPY_FLOAT32);
-					memcpy(PyArray_DATA(pyDep), imageData.m_depthValues,
+					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
 						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
 					return pyDep;
 				}
@@ -10810,11 +10810,11 @@ static PyObject* pybullet_renderImageObsolete(PyObject* self, PyObject* args)
 				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
 				pySeg = PyArray_SimpleNew(2, seg_dims, NPY_INT32);
 
-				memcpy(PyArray_DATA(pyRGB), imageData.m_rgbColorData,
+				memcpy(PyArray_DATA((PyArrayObject*)pyRGB), imageData.m_rgbColorData,
 					   imageData.m_pixelHeight * imageData.m_pixelWidth * bytesPerPixel);
-				memcpy(PyArray_DATA(pyDep), imageData.m_depthValues,
+				memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
 					   imageData.m_pixelHeight * imageData.m_pixelWidth);
-				memcpy(PyArray_DATA(pySeg), imageData.m_segmentationMaskValues,
+				memcpy(PyArray_DATA((PyArrayObject*)pySeg), imageData.m_segmentationMaskValues,
 					   imageData.m_pixelHeight * imageData.m_pixelWidth);
 
 				PyTuple_SetItem(pyResultList, 2, pyRGB);
