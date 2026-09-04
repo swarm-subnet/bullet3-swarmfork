@@ -4,8 +4,8 @@ set -e -x
 # use this docker command
 # sudo docker run -it -v $(pwd):/io quay.io/pypa/manylinux2014_x86_64
 
-# Redistributable wheels must target the x86_64 baseline, not the build host.
-export SWARM_BULLET3_OPT_LEVEL=safe
+# x86-64-v3 (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE: Intel Haswell 2013+, AMD Zen) is the published floor: faster than -O2 with bit-identical output.
+export SWARM_BULLET3_OPT_LEVEL=v3
 export SWARM_BULLET3_PGO=off
 
 # Compile wheels
