@@ -54,6 +54,7 @@ struct TinyRenderObjectData
 	int m_objectIndex;
 	int m_linkIndex;
 	bool m_doubleSided;
+	bool m_textureFilter;  // ER_TEXTURE_FILTER: bilinear + mipmap sampling instead of nearest texel
 
 	btVector3 m_localAABBMin;
 	btVector3 m_localAABBMax;

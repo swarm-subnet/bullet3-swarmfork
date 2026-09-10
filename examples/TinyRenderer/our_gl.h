@@ -13,6 +13,13 @@ struct IShader
 {
 	float m_nearPlane;
 	float m_farPlane;
+	// When set, the rasteriser also hands the fragment the perspective-correct
+	// barycentrics of the pixel to the right and the pixel below, so the shader
+	// can measure how much texture one pixel covers.
+	bool m_needUvDerivatives;
+	Vec3f m_barDx;
+	Vec3f m_barDy;
+	IShader() : m_needUvDerivatives(false) {}
 	virtual ~IShader();
 	virtual Vec4f vertex(int iface, int nthvert) = 0;
 	virtual bool fragment(Vec3f bar, TGAColor &color) = 0;

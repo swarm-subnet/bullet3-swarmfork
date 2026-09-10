@@ -13502,6 +13502,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_NO_SEGMENTATION_MASK", ER_NO_SEGMENTATION_MASK);
 	PyModule_AddIntConstant(m, "ER_USE_PROJECTIVE_TEXTURE", ER_USE_PROJECTIVE_TEXTURE);
 	PyModule_AddIntConstant(m, "ER_DEPTH_ONLY", ER_DEPTH_ONLY);
+	PyModule_AddIntConstant(m, "ER_TEXTURE_FILTER", ER_TEXTURE_FILTER);
 	PyModule_AddIntConstant(m, "ER_SWARM_RAYCAST", ER_SWARM_RAYCAST);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);

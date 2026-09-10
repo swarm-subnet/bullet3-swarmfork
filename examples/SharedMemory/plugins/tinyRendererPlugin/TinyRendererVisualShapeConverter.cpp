@@ -1779,6 +1779,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			}
 			else
 			{
+				renderObj->m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 				TinyRenderer::renderObject(*renderObj);
 			}
 		}

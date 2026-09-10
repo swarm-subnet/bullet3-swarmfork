@@ -82,6 +82,16 @@ Vec3d barycentric(Vec2f A1, Vec2f B1, Vec2f C1, Vec2f P1)
 	return Vec3d(-1., 1., 1.);  // in this case generate negative coordinates, it will be thrown away by the rasterizator
 }
 
+// Perspective-correct barycentrics of a screen point, the same maths the pixel
+// itself gets; used for the neighbouring pixels of the texture footprint.
+static Vec3f perspectiveBarycentric(mat<3, 2, float> &pts2, mat<3, 4, float> &pts, Vec2f p)
+{
+	Vec3d bc = barycentric(pts2[0], pts2[1], pts2[2], p);
+	Vec3d c(bc.x / pts[0][3], bc.y / pts[1][3], bc.z / pts[2][3]);
+	c = c / (c.x + c.y + c.z);
+	return Vec3f(c.x, c.y, c.z);
+}
+
 void triangleClipped(mat<4, 3, float> &clipc, mat<4, 3, float> &orgClipc, IShader &shader, TGAImage &image, float *zbuffer, const Matrix &viewPortMatrix)
 {
 	triangleClipped(clipc, orgClipc, shader, image, zbuffer, 0, viewPortMatrix, 0);
@@ -145,6 +155,11 @@ void triangleClipped(mat<4, 3, float> &clipc, mat<4, 3, float> &orgClipc, IShade
 			double frag_depth2 = -1. * (orgClipd * bc_clip2);
 
 			Vec3f bc_clip2f(bc_clip2.x, bc_clip2.y, bc_clip2.z);
+			if (shader.m_needUvDerivatives)
+			{
+				shader.m_barDx = perspectiveBarycentric(orgPts2, orgScreenSpacePts, Vec2f(P.x + 1, P.y));
+				shader.m_barDy = perspectiveBarycentric(orgPts2, orgScreenSpacePts, Vec2f(P.x, P.y + 1));
+			}
 			bool discard = shader.fragment(bc_clip2f, color);
 			
 			if (!discard)
@@ -200,6 +215,11 @@ void triangle(mat<4, 3, float> &clipc, IShader &shader, TGAImage &image, float *
 				zbuffer[P.x + P.y * image.get_width()] > frag_depth)
 				continue;
 			Vec3f bc_clipf(bc_clip.x, bc_clip.y, bc_clip.z);
+			if (shader.m_needUvDerivatives)
+			{
+				shader.m_barDx = perspectiveBarycentric(pts2, pts, Vec2f(P.x + 1, P.y));
+				shader.m_barDy = perspectiveBarycentric(pts2, pts, Vec2f(P.x, P.y + 1));
+			}
 			bool discard = shader.fragment(bc_clipf, color);
 			if (frag_depth < -shader.m_farPlane)
 				discard = true;
