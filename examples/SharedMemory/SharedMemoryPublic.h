@@ -1119,6 +1119,7 @@ enum eFileIOTypes
 enum eEnumUpdateVisualShapeFlags
 {
 	eVISUAL_SHAPE_DOUBLE_SIDED = 4,//see B3_INSTANCE_DOUBLE_SIDED
+	eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY = 8,//double-sided render for multibody visuals, on create and update
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

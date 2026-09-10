@@ -129,6 +129,11 @@ struct UrdfVisual : UrdfShape
 	std::string m_materialName;
 	// Maps user data keys to user data values.
 	btHashMap<btHashString, std::string> m_userData;
+	int m_flags;
+	UrdfVisual()
+		: m_flags(0)
+	{
+	}
 };
 
 struct UrdfCollision : UrdfShape
