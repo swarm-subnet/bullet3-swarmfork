@@ -32,8 +32,17 @@ struct SharedTexture
 	const unsigned char* source_;  // texels the image was built from; a lookup key, never dereferenced blindly
 	int refs_;
 	bool registered_;
+	// Halved copies of img_ down to 1x1, built on the first filtered sample and shared like the image.
+	// TGAImage's copy constructor does not copy pixels, so the levels live on the heap.
+	std::vector<TGAImage*> mips_;
+	bool mipsBuilt_;
 
-	SharedTexture() : source_(0), refs_(1), registered_(false) {}
+	SharedTexture() : source_(0), refs_(1), registered_(false), mipsBuilt_(false) {}
+	~SharedTexture()
+	{
+		for (size_t i = 0; i < mips_.size(); i++)
+			delete mips_[i];
+	}
 };
 
 // Process-wide registries of the blocks currently alive; an entry leaves when its last owner does.
@@ -482,6 +491,132 @@ TGAColor Model::diffuse(Vec2f uvf)
 	return TGAColor(255, 255, 255, 255);
 }
 
+
+// Each level halves the one before with an integer 2x2 box average, down to 1x1.
+// Odd sizes drop their last row or column, as a GPU would.
+static void buildMips(SharedTexture& tex)
+{
+	tex.mipsBuilt_ = true;
+	for (;;)
+	{
+		TGAImage& src = tex.mips_.empty() ? tex.img_ : *tex.mips_[tex.mips_.size() - 1];
+		const int sw = src.get_width(), sh = src.get_height(), bpp = src.get_bytespp();
+		if (sw <= 1 && sh <= 1)
+			return;
+		const int dw = sw > 1 ? sw >> 1 : 1;
+		const int dh = sh > 1 ? sh >> 1 : 1;
+		TGAImage* dst = new TGAImage(dw, dh, bpp);
+		const unsigned char* s = src.buffer();
+		unsigned char* d = dst->buffer();
+		for (int y = 0; y < dh; y++)
+		{
+			const int y0 = 2 * y;
+			const int y1 = (y0 + 1 < sh) ? y0 + 1 : y0;
+			for (int x = 0; x < dw; x++)
+			{
+				const int x0 = 2 * x;
+				const int x1 = (x0 + 1 < sw) ? x0 + 1 : x0;
+				const unsigned char* p00 = s + (x0 + y0 * sw) * bpp;
+				const unsigned char* p10 = s + (x1 + y0 * sw) * bpp;
+				const unsigned char* p01 = s + (x0 + y1 * sw) * bpp;
+				const unsigned char* p11 = s + (x1 + y1 * sw) * bpp;
+				unsigned char* o = d + (x + y * dw) * bpp;
+				for (int c = 0; c < bpp; c++)
+					o[c] = (unsigned char)((p00[c] + p10[c] + p01[c] + p11[c] + 2) >> 2);
+			}
+		}
+		tex.mips_.push_back(dst);
+	}
+}
+
+// Four-texel blend inside one level with 8-bit fixed-point weights, repeat wrap.
+// u and v are already in [0, 1).
+static TGAColor sampleBilinear(TGAImage& img, float u, float v)
+{
+	const int w = img.get_width(), h = img.get_height(), bpp = img.get_bytespp();
+	const float x = u * w - 0.5f;
+	const float y = v * h - 0.5f;
+	const float fx = std::floor(x);
+	const float fy = std::floor(y);
+	const int wx = (int)((x - fx) * 256.f);
+	const int wy = (int)((y - fy) * 256.f);
+	int x0 = ((int)fx % w + w) % w;
+	int y0 = ((int)fy % h + h) % h;
+	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1;
+	const int y1 = (y0 + 1 == h) ? 0 : y0 + 1;
+	const unsigned char* s = img.buffer();
+	const unsigned char* p00 = s + (x0 + y0 * w) * bpp;
+	const unsigned char* p10 = s + (x1 + y0 * w) * bpp;
+	const unsigned char* p01 = s + (x0 + y1 * w) * bpp;
+	const unsigned char* p11 = s + (x1 + y1 * w) * bpp;
+	const int w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy);
+	const int w01 = (256 - wx) * wy, w11 = wx * wy;
+	TGAColor c;
+	c.bytespp = (unsigned char)bpp;
+	for (int i = 0; i < bpp; i++)
+		c.bgra[i] = (unsigned char)((p00[i] * w00 + p10[i] * w10 + p01[i] * w01 + p11[i] * w11 + 32768) >> 16);
+	return c;
+}
+
+// Trilinear sample: the level comes from how many level-0 texels one pixel
+// spans, using the float's own exponent and mantissa for log2 so nothing
+// depends on the maths library. duvdx and duvdy are the uv steps to the pixel
+// to the right and the pixel below.
+TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy)
+{
+	if (!m_diffuse)
+		return TGAColor(255, 255, 255, 255);
+	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
+	if (!w || !h)
+		return TGAColor(255, 255, 255, 255);
+	if (!m_diffuse->mipsBuilt_)
+		buildMips(*m_diffuse);
+
+	double val;
+	uvf[0] = std::modf(uvf[0], &val);
+	if (uvf[0] < 0)
+		uvf[0] = uvf[0] + 1;
+	uvf[1] = std::modf(uvf[1], &val);
+	if (uvf[1] < 0)
+		uvf[1] = uvf[1] + 1;
+
+	const float sx = duvdx[0] * w, tx = duvdx[1] * h;
+	const float sy = duvdy[0] * w, ty = duvdy[1] * h;
+	const float rx2 = sx * sx + tx * tx;
+	const float ry2 = sy * sy + ty * ty;
+	const float rho2 = rx2 > ry2 ? rx2 : ry2;
+
+	float lambda = 0.f;
+	if (rho2 > 1.f)
+	{
+		unsigned int bits;
+		memcpy(&bits, &rho2, sizeof(bits));
+		const int e = (int)((bits >> 23) & 255) - 127;
+		bits = (bits & 0x007fffffu) | 0x3f800000u;
+		float mant;
+		memcpy(&mant, &bits, sizeof(mant));
+		lambda = 0.5f * ((float)e + (mant - 1.f));
+	}
+
+	std::vector<TGAImage*>& mips = m_diffuse->mips_;
+	const int last = (int)mips.size();
+	int level = (int)lambda;
+	float frac = lambda - (float)level;
+	if (level >= last)
+	{
+		level = last;
+		frac = 0.f;
+	}
+	TGAImage& imgA = level == 0 ? m_diffuse->img_ : *mips[level - 1];
+	TGAColor a = sampleBilinear(imgA, uvf[0], uvf[1]);
+	const int wl = (int)(frac * 256.f);
+	if (wl == 0)
+		return a;
+	TGAColor b = sampleBilinear(*mips[level], uvf[0], uvf[1]);
+	for (int i = 0; i < (int)a.bytespp; i++)
+		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
+	return a;
+}
 
 Vec3f Model::normal(Vec2f uvf)
 {

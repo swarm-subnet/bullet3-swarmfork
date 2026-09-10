@@ -62,6 +62,7 @@ public:
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
+	TGAColor diffuseFiltered(Vec2f uv, Vec2f duvdx, Vec2f duvdy);
 	float specular(Vec2f uv);
 	std::vector<int> face(int idx);
 };
