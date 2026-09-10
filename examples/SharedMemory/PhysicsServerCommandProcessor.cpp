@@ -4229,6 +4229,9 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 						m_data->m_pluginManager.getRenderInterface()->setLightColor(clientCmd.m_requestPixelDataArguments.m_lightColor[0], clientCmd.m_requestPixelDataArguments.m_lightColor[1], clientCmd.m_requestPixelDataArguments.m_lightColor[2]);
 					}
 
+					// The sky is per request, unlike the light: absent means the plain clear colour.
+					m_data->m_pluginManager.getRenderInterface()->setSkyColor((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_SKY_COLOR) != 0, clientCmd.m_requestPixelDataArguments.m_skyHorizonColor, clientCmd.m_requestPixelDataArguments.m_skyZenithColor);
+
 					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_LIGHT_DISTANCE) != 0)
 					{
 						m_data->m_pluginManager.getRenderInterface()->setLightDistance(clientCmd.m_requestPixelDataArguments.m_lightDistance);

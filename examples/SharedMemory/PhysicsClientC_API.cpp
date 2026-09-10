@@ -4595,6 +4595,19 @@ B3_SHARED_API void b3RequestCameraImageSetLightColor(b3SharedMemoryCommandHandle
 	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_LIGHT_COLOR;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetSkyColor(b3SharedMemoryCommandHandle commandHandle, const float horizonColor[3], const float zenithColor[3])
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_REQUEST_CAMERA_IMAGE_DATA);
+	for (int i = 0; i < 3; i++)
+	{
+		command->m_requestPixelDataArguments.m_skyHorizonColor[i] = horizonColor[i];
+		command->m_requestPixelDataArguments.m_skyZenithColor[i] = zenithColor[i];
+	}
+	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SKY_COLOR;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetLightDistance(b3SharedMemoryCommandHandle commandHandle, float lightDistance)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;

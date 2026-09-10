@@ -28,6 +28,7 @@ subject to the following restrictions:
 #include "../Importers/ImportMeshUtility/b3ImportMeshUtility.h"
 #include <iostream>
 #include <fstream>
+#include <math.h>
 #include "../Importers/ImportURDFDemo/UrdfParser.h"
 #include "../SharedMemory/SharedMemoryPublic.h"  //for b3VisualShapeData
 #include "../TinyRenderer/model.h"
@@ -81,6 +82,14 @@ struct TinyRendererVisualShapeConverterInternalData
 	bool m_hasLightDirection;
 	btVector3 m_lightColor;
 	bool m_hasLightColor;
+	btVector3 m_skyHorizonColor;
+	btVector3 m_skyZenithColor;
+	bool m_hasSky;
+	b3AlignedObjectArray<float> m_skyInvRayLen;
+	int m_skyRayWidth;
+	int m_skyRayHeight;
+	float m_skyRayInvP00;
+	float m_skyRayInvP11;
 	float m_lightDistance;
 	bool m_hasLightDistance;
 	float m_lightAmbientCoeff;
@@ -107,6 +116,13 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_hasLightDirection(false),
 		m_lightColor(btVector3(1.0, 1.0, 1.0)),
 		m_hasLightColor(false),
+		m_skyHorizonColor(btVector3(1.0, 1.0, 1.0)),
+		m_skyZenithColor(btVector3(1.0, 1.0, 1.0)),
+		m_hasSky(false),
+		m_skyRayWidth(0),
+		m_skyRayHeight(0),
+		m_skyRayInvP00(0.f),
+		m_skyRayInvP11(0.f),
 		m_lightDistance(2.0),
 		m_hasLightDistance(false),
 		m_lightAmbientCoeff(0.6),
@@ -157,6 +173,16 @@ void TinyRendererVisualShapeConverter::setLightColor(float x, float y, float z)
 {
 	m_data->m_lightColor.setValue(x, y, z);
 	m_data->m_hasLightColor = true;
+}
+
+void TinyRendererVisualShapeConverter::setSkyColor(bool enabled, const float horizonColor[3], const float zenithColor[3])
+{
+	m_data->m_hasSky = enabled;
+	if (enabled)
+	{
+		m_data->m_skyHorizonColor.setValue(horizonColor[0], horizonColor[1], horizonColor[2]);
+		m_data->m_skyZenithColor.setValue(zenithColor[0], zenithColor[1], zenithColor[2]);
+	}
 }
 
 void TinyRendererVisualShapeConverter::setLightDistance(float dist)
@@ -1201,6 +1227,71 @@ void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 	}
 }
 
+static unsigned char skyByte(float v)
+{
+	v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+	return (unsigned char)(v * 255.f + 0.5f);
+}
+
+// Colour buffer only: each pixel's view ray is lifted to world space and its
+// component along the up axis blends horizon (level or below) into zenith (straight up).
+void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16])
+{
+	const int width = m_data->m_swWidth;
+	const int height = m_data->m_swHeight;
+	const int up = m_data->m_upAxis;
+	const float hr = (float)m_data->m_skyHorizonColor[0];
+	const float hg = (float)m_data->m_skyHorizonColor[1];
+	const float hb = (float)m_data->m_skyHorizonColor[2];
+	const float sr = (float)m_data->m_skyZenithColor[0] - hr;
+	const float sg = (float)m_data->m_skyZenithColor[1] - hg;
+	const float sb = (float)m_data->m_skyZenithColor[2] - hb;
+	// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
+	// world space needs only the up-axis row of the inverse view rotation.
+	const float invP00 = 1.f / projMat[0];
+	const float invP11 = 1.f / projMat[5];
+	const float rx = viewMat[up * 4 + 0];
+	const float ry = viewMat[up * 4 + 1];
+	const float rz = viewMat[up * 4 + 2];
+
+	// The ray lengths depend only on the resolution and projection, so they are kept between frames.
+	if (m_data->m_skyRayWidth != width || m_data->m_skyRayHeight != height || m_data->m_skyRayInvP00 != invP00 || m_data->m_skyRayInvP11 != invP11)
+	{
+		m_data->m_skyInvRayLen.resize(width * height);
+		for (int y = 0; y < height; ++y)
+		{
+			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
+			for (int x = 0; x < width; ++x)
+			{
+				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
+				m_data->m_skyInvRayLen[y * width + x] = 1.f / sqrtf(dx * dx + dy * dy + 1.f);
+			}
+		}
+		m_data->m_skyRayWidth = width;
+		m_data->m_skyRayHeight = height;
+		m_data->m_skyRayInvP00 = invP00;
+		m_data->m_skyRayInvP11 = invP11;
+	}
+
+	// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
+	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
+	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+	const float* invLen = &m_data->m_skyInvRayLen[0];
+	for (int y = 0; y < height; ++y)
+	{
+		const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
+		for (int x = 0; x < width; ++x, pixel += bytespp)
+		{
+			const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
+			float t = (rx * dx + ry * dy - rz) * invLen[y * width + x];
+			t = t < 0.f ? 0.f : t;
+			pixel[0] = skyByte(hr + sr * t);
+			pixel[1] = skyByte(hg + sg * t);
+			pixel[2] = skyByte(hb + sb * t);
+		}
+	}
+}
+
 void TinyRendererVisualShapeConverter::setBatchReadCamera(int camIndex)
 {
 	m_data->m_batchReadCamera = camIndex;
@@ -1431,6 +1522,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	m_data->m_camera.setCameraFrustumFar(far);
 
 	clearBuffers(clearColor);
+	if (m_data->m_hasSky && (m_data->m_flags & ER_DEPTH_ONLY) == 0)
+	{
+		paintSky(viewMat, projMat);
+	}
 
 	ATTRIBUTE_ALIGNED16(btScalar modelMat[16]);
 

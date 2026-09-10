@@ -67,6 +67,9 @@ struct UrdfRenderingInterface
 	///set the ambient light color, in world coordinates
 	virtual void setLightColor(float x, float y, float z) = 0;
 
+	///paint a horizon-to-zenith sky where nothing is drawn, for this render only; disabled means the plain clear colour
+	virtual void setSkyColor(bool enabled, const float horizonColor[3], const float zenithColor[3]) {}
+
 	///set the light distance
 	virtual void setLightDistance(float dist) = 0;
 

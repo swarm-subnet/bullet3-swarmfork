@@ -35,6 +35,7 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void resetCamera(float camDist, float yaw, float pitch, float camPosX, float camPosY, float camPosZ);
 
 	virtual void clearBuffers(struct TGAColor& clearColor);
+	void paintSky(const float viewMat[16], const float projMat[16]);
 
 	virtual void resetAll();
 
@@ -42,6 +43,7 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void setWidthAndHeight(int width, int height);
 	virtual void setLightDirection(float x, float y, float z);
 	virtual void setLightColor(float x, float y, float z);
+	virtual void setSkyColor(bool enabled, const float horizonColor[3], const float zenithColor[3]);
 	virtual void setLightDistance(float dist);
 	virtual void setLightAmbientCoeff(float ambientCoeff);
 	virtual void setLightDiffuseCoeff(float diffuseCoeff);

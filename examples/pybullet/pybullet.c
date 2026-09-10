@@ -10134,6 +10134,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	/// request an image from a simulated camera, using software or hardware renderer.
 	struct b3CameraImageData imageData;
 	PyObject *objViewMat = 0, *objProjMat = 0, *lightDirObj = 0, *lightColorObj = 0, *objProjectiveTextureView = 0, *objProjectiveTextureProj = 0;
+	PyObject *skyHorizonObj = 0, *skyZenithObj = 0;
 	int width, height;
 	float viewMatrix[16];
 	float projectionMatrix[16];
@@ -10141,6 +10142,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	float projectiveTextureProj[16];
 	float lightDir[3];
 	float lightColor[3];
+	float skyHorizon[3];
+	float skyZenith[3];
+	int hasSkyHorizon, hasSkyZenith;
 	float lightDist = -1;
 	int hasShadow = -1;
 	float lightAmbientCoeff = -1;
@@ -10153,9 +10157,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOi", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj))
 	{
 		return NULL;
 	}
@@ -10183,6 +10187,13 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (pybullet_internalSetVector(lightColorObj, lightColor))
 	{
 		b3RequestCameraImageSetLightColor(command, lightColor);
+	}
+	// one sky colour given means a flat sky of that colour
+	hasSkyHorizon = pybullet_internalSetVector(skyHorizonObj, skyHorizon);
+	hasSkyZenith = pybullet_internalSetVector(skyZenithObj, skyZenith);
+	if (hasSkyHorizon || hasSkyZenith)
+	{
+		b3RequestCameraImageSetSkyColor(command, hasSkyHorizon ? skyHorizon : skyZenith, hasSkyZenith ? skyZenith : skyHorizon);
 	}
 	if (lightDist >= 0)
 	{
@@ -13049,7 +13060,8 @@ static PyMethodDef SpamMethods[] = {
 
 	{"getCameraImage", (PyCFunction)pybullet_getCameraImage, METH_VARARGS | METH_KEYWORDS,
 	 "Render an image (given the pixel resolution width, height, camera viewMatrix "
-	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, and renderer), and return the "
+	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
+	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
