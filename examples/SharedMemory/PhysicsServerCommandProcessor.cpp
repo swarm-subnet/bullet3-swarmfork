@@ -5980,6 +5980,8 @@ bool PhysicsServerCommandProcessor::processCreateVisualShapeCommand(const struct
 		visualShape.m_sourceFileLocation = "in_memory_unknown_line";
 		visualShape.m_linkLocalFrame.setIdentity();
 		visualShape.m_geometry.m_hasLocalMaterial = false;
+		// createVisualShape flags arrive in m_collisionFlags; only the multibody double-sided bit is a visual flag
+		visualShape.m_flags = visShape.m_collisionFlags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY;
 
 		bool hasRGBA = (clientCmd.m_createUserShapeArgs.m_shapes[userShapeIndex].m_visualFlags & GEOM_VISUAL_HAS_RGBA_COLOR) != 0;
 		;
@@ -14607,6 +14609,17 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 						{
 							m_data->m_guiHelper->changeSpecularColor(graphicsIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
 						}
+						if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
+						{
+							// multibodies honour only their own bit, so the soft-body flag keeps ignoring them
+							int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY;
+							if (m_data->m_pluginManager.getRenderInterface())
+							{
+								m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,
+																								 clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex, flags);
+							}
+							m_data->m_guiHelper->changeInstanceFlags(graphicsIndex, flags ? B3_INSTANCE_DOUBLE_SIDED : 0);
+						}
 					}
 				}
 				else
@@ -14640,6 +14653,16 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR)
 							{
 								m_data->m_guiHelper->changeSpecularColor(graphicsIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
+							}
+							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
+							{
+								int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY;
+								if (m_data->m_pluginManager.getRenderInterface())
+								{
+									m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,
+																									 clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex, flags);
+								}
+								m_data->m_guiHelper->changeInstanceFlags(graphicsIndex, flags ? B3_INSTANCE_DOUBLE_SIDED : 0);
 							}
 						}
 					}

@@ -927,6 +927,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			if (vertices.size() && indices.size())
 			{
 				TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
+				tinyObj->m_doubleSided = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY) != 0;
 				unsigned char* textureImage1 = 0;
 				int textureWidth = 0;
 				int textureHeight = 0;
@@ -1085,7 +1086,7 @@ int TinyRendererVisualShapeConverter::getVisualShapesData(int bodyUniqueId, int 
 
 void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags)
 {
-	bool doubleSided = (flags & 4) != 0;
+	bool doubleSided = (flags & (eVISUAL_SHAPE_DOUBLE_SIDED | eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)) != 0;
 	btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes)
 	{
