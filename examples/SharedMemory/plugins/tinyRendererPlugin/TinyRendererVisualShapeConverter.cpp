@@ -1574,7 +1574,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			const btTransform& tr = visualArray->m_worldTransform;
 			tr.getOpenGLMatrix(modelMat);
 
-			if (depthOnly && renderObj->m_hasLocalAABB)
+			if (renderObj->m_hasLocalAABB)
 			{
 				const btVector3& ls = visualArray->m_localScaling;
 				btVector3 sMin, sMax;
