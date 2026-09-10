@@ -272,7 +272,16 @@ struct Shader : public IShader
                                     m_model->specular(uv));
         float diffuse = b3Max(0.f, bn * m_light_dir_local);
 
-        color = m_model->diffuse(uv);
+		if (m_needUvDerivatives)
+		{
+			Vec2f duvdx = varying_uv * m_barDx - uv;
+			Vec2f duvdy = varying_uv * m_barDy - uv;
+			color = m_model->diffuseFiltered(uv, duvdx, duvdy);
+		}
+		else
+		{
+			color = m_model->diffuse(uv);
+		}
 		color[0] *= m_colorRGBA[0];
 		color[1] *= m_colorRGBA[1];
 		color[2] *= m_colorRGBA[2];
@@ -302,7 +311,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userData(0),
 	  m_userIndex(-1),
 	  m_objectIndex(-1),
-	  m_doubleSided(false)
+	  m_doubleSided(false),
+	  m_textureFilter(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -329,7 +339,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userIndex(-1),
 	  m_objectIndex(objectIndex),
 	  m_linkIndex(linkIndex),
-	  m_doubleSided(false)
+	  m_doubleSided(false),
+	  m_textureFilter(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -355,7 +366,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userData(0),
 	  m_userIndex(-1),
 	  m_objectIndex(-1),
-	m_doubleSided(false)
+	m_doubleSided(false),
+	  m_textureFilter(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -382,7 +394,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userData(0),
 	  m_userIndex(-1),
 	  m_objectIndex(objectIndex),
-	m_doubleSided(false)
+	m_doubleSided(false),
+	  m_textureFilter(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -690,6 +703,7 @@ void TinyRenderer::renderObject(TinyRenderObjectData& renderData)
 		btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
 
 		Shader shader(model, light_dir_local, light_color, modelViewMatrix, lightModelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, renderData.m_viewportMatrix, localScaling, model->getColorRGBA(), width, height, shadowBufferPtr, renderData.m_lightAmbientCoeff, renderData.m_lightDiffuseCoeff, renderData.m_lightSpecularCoeff);
+		shader.m_needUvDerivatives = renderData.m_textureFilter;
 
 		{
 			B3_PROFILE("face");

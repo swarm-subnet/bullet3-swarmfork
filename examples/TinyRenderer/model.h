@@ -18,8 +18,12 @@ private:
 	TGAImage normalmap_;
 	TGAImage specularmap_;
 	Vec4f m_colorRGBA;
+	std::vector<TGAImage*> mips_;  // halved copies of diffusemap_, built on first filtered sample
+	bool mipsBuilt_;
 
 	void load_texture(std::string filename, const char* suffix, TGAImage& img);
+	void buildMips();
+	void clearMips();
 
 public:
 	Model(const char* filename);
@@ -71,6 +75,7 @@ public:
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
+	TGAColor diffuseFiltered(Vec2f uv, Vec2f duvdx, Vec2f duvdy);
 	float specular(Vec2f uv);
 	std::vector<int> face(int idx);
 };
