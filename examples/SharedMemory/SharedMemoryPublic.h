@@ -970,6 +970,7 @@ enum eURDF_Flags
 	URDF_IGNORE_COLLISION_SHAPES = 1 << 21,
 	URDF_PRINT_URDF_INFO = 1 << 22,
 	URDF_GOOGLEY_UNDEFINED_COLORS = 1 << 23,
+	URDF_USE_MATERIALS_FROM_MTL = 1 << 24,
 };
 
 enum eUrdfGeomTypes  //sync with UrdfParser UrdfGeomTypes
@@ -989,6 +990,7 @@ enum eUrdfCollisionFlags
 {
 	GEOM_FORCE_CONCAVE_TRIMESH = 1,
 	GEOM_CONCAVE_INTERNAL_EDGE = 2,
+	GEOM_CONCAVE_BVH_CACHE = 4,
 	GEOM_INITIALIZE_SAT_FEATURES = URDF_INITIALIZE_SAT_FEATURES,
 };
 
@@ -1121,6 +1123,7 @@ enum eEnumUpdateVisualShapeFlags
 {
 	eVISUAL_SHAPE_DOUBLE_SIDED = 4,//see B3_INSTANCE_DOUBLE_SIDED
 	eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY = 8,//double-sided render for multibody visuals, on create and update
+	eVISUAL_SHAPE_MATERIALS_FROM_MTL = 16,//one render object per OBJ material, colour and texture from the MTL
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

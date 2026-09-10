@@ -24,6 +24,15 @@
 
 #include "../Utils/b3BulletDefaultFileIO.h"
 #include "BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
 #include "BulletDynamics/Featherstone/btMultiBodyConstraintSolver.h"
 #include "BulletDynamics/Featherstone/btMultiBodyPoint2Point.h"
 #include "BulletDynamics/Featherstone/btMultiBodyLinkCollider.h"
@@ -1606,6 +1615,131 @@ struct SaveStateData
 	btSerializer* m_serializer;
 };
 
+// Concave-mesh BVH disk cache (GEOM_CONCAVE_BVH_CACHE): <SWARM_BVH_CACHE_DIR>/<key>.bvh holds the
+// in-place serialised btOptimizedBvh, keyed by a hash of the scaled triangles and the build layout.
+struct BvhCacheFileHeader
+{
+	char m_magic[8];
+	unsigned long long m_key;
+	unsigned int m_size;
+	unsigned int m_numTriangles;
+};
+
+static const char* gBvhCacheMagic = "SWBVH01";
+
+struct BvhCacheKeyHasher : public btInternalTriangleIndexCallback
+{
+	unsigned long long m_hash;
+
+	BvhCacheKeyHasher() : m_hash(14695981039346656037ULL) {}
+
+	void mix(const void* data, size_t len)
+	{
+		const unsigned char* bytes = (const unsigned char*)data;
+		for (size_t i = 0; i < len; i++)
+		{
+			m_hash ^= bytes[i];
+			m_hash *= 1099511628211ULL;
+		}
+	}
+
+	virtual void internalProcessTriangleIndex(btVector3* triangle, int partId, int triangleIndex)
+	{
+		for (int v = 0; v < 3; v++)
+		{
+			btScalar c[3] = {triangle[v].x(), triangle[v].y(), triangle[v].z()};
+			mix(c, sizeof(c));
+		}
+	}
+};
+
+static unsigned long long bvhCacheKey(btStridingMeshInterface* mesh, btScalar margin, int numTriangles)
+{
+	BvhCacheKeyHasher hasher;
+	hasher.mix(gBvhCacheMagic, 8);
+	int layout[4] = {(int)sizeof(btScalar), (int)sizeof(btQuantizedBvh), (int)sizeof(btQuantizedBvhNode), (int)sizeof(btBvhSubtreeInfo)};
+	hasher.mix(layout, sizeof(layout));
+	hasher.mix(&margin, sizeof(margin));
+	hasher.mix(&numTriangles, sizeof(numTriangles));
+	btVector3 aabbMin(-BT_LARGE_FLOAT, -BT_LARGE_FLOAT, -BT_LARGE_FLOAT);
+	btVector3 aabbMax(BT_LARGE_FLOAT, BT_LARGE_FLOAT, BT_LARGE_FLOAT);
+	mesh->InternalProcessAllTriangles(&hasher, aabbMin, aabbMax);
+	return hasher.m_hash;
+}
+
+static void* readBvhCacheFile(const char* path, unsigned long long key, int numTriangles, unsigned int* sizeOut)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f)
+		return 0;
+	BvhCacheFileHeader header;
+	void* buffer = 0;
+	if (fread(&header, sizeof(header), 1, f) == 1 && memcmp(header.m_magic, gBvhCacheMagic, 8) == 0 &&
+		header.m_key == key && header.m_numTriangles == (unsigned int)numTriangles && header.m_size >= sizeof(btQuantizedBvh))
+	{
+		buffer = btAlignedAlloc(header.m_size, 16);
+		if (fread(buffer, header.m_size, 1, f) != 1)
+		{
+			btAlignedFree(buffer);
+			buffer = 0;
+		}
+		*sizeOut = header.m_size;
+	}
+	fclose(f);
+	return buffer;
+}
+
+static void writeBvhCacheFile(const char* path, unsigned long long key, int numTriangles, const btOptimizedBvh* bvh)
+{
+	BvhCacheFileHeader header;
+	memcpy(header.m_magic, gBvhCacheMagic, 8);
+	header.m_key = key;
+	header.m_size = bvh->calculateSerializeBufferSize();
+	header.m_numTriangles = numTriangles;
+	void* buffer = btAlignedAlloc(header.m_size, 16);
+	bool ok = bvh->serializeInPlace(buffer, header.m_size, false);
+	char tmpPath[1200];
+	snprintf(tmpPath, sizeof(tmpPath), "%s.%d.tmp", path, (int)getpid());
+	FILE* f = ok ? fopen(tmpPath, "wb") : 0;
+	if (f)
+	{
+		ok = fwrite(&header, sizeof(header), 1, f) == 1 && fwrite(buffer, header.m_size, 1, f) == 1;
+		ok = (fclose(f) == 0) && ok;
+		if (!ok || rename(tmpPath, path) != 0)
+			remove(tmpPath);
+	}
+	btAlignedFree(buffer);
+}
+
+// Builds the BVH as before, or loads it from the cache directory when the flag asks for it and a file matches.
+static btBvhTriangleMeshShape* createConcaveTriangleMeshShape(btTriangleMesh* meshInterface, bool useCache, btAlignedObjectArray<void*>& cacheBuffers)
+{
+	const char* cacheDir = useCache ? getenv("SWARM_BVH_CACHE_DIR") : 0;
+	if (!cacheDir || !cacheDir[0])
+		return new btBvhTriangleMeshShape(meshInterface, true, true);
+
+	btBvhTriangleMeshShape* trimesh = new btBvhTriangleMeshShape(meshInterface, true, false);
+	int numTriangles = meshInterface->getNumTriangles();
+	unsigned long long key = bvhCacheKey(meshInterface, trimesh->getMargin(), numTriangles);
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/%016llx.bvh", cacheDir, key);
+
+	unsigned int size = 0;
+	void* buffer = readBvhCacheFile(path, key, numTriangles, &size);
+	btOptimizedBvh* bvh = buffer ? btOptimizedBvh::deSerializeInPlace(buffer, size, false) : 0;
+	if (bvh)
+	{
+		trimesh->setOptimizedBvh(bvh);
+		cacheBuffers.push_back(buffer);
+		return trimesh;
+	}
+	if (buffer)
+		btAlignedFree(buffer);
+	trimesh->buildOptimizedBvh();
+	writeBvhCacheFile(path, key, numTriangles, trimesh->getOptimizedBvh());
+	return trimesh;
+}
+
 struct PhysicsServerCommandProcessorInternalData
 {
 	// true while renderer transforms are in sync with the world; any command
@@ -1664,6 +1798,7 @@ struct PhysicsServerCommandProcessorInternalData
 	btAlignedObjectArray<double*> m_debugPointsDatas;
 	btHashMap<btHashPtr, UrdfCollision> m_bulletCollisionShape2UrdfCollision;
 	btAlignedObjectArray<btStridingMeshInterface*> m_meshInterfaces;
+	btAlignedObjectArray<void*> m_bvhCacheBuffers;
 
 	MyOverlapFilterCallback* m_broadphaseCollisionFilterCallback;
 	btHashedOverlappingPairCache* m_pairCache;
@@ -3044,6 +3179,11 @@ void PhysicsServerCommandProcessor::deleteDynamicsWorld()
 		delete m_data->m_meshInterfaces[j];
 	}
 
+	for (int j = 0; j < m_data->m_bvhCacheBuffers.size(); j++)
+	{
+		btAlignedFree(m_data->m_bvhCacheBuffers[j]);
+	}
+
 	if (m_data->m_guiHelper)
 	{
 		for (int j = 0; j < m_data->m_allocatedTextures.size(); j++)
@@ -3069,6 +3209,7 @@ void PhysicsServerCommandProcessor::deleteDynamicsWorld()
 	m_data->m_allocatedTexturesRequireFree.clear();
 	m_data->m_debugPointsDatas.clear();
 	m_data->m_meshInterfaces.clear();
+	m_data->m_bvhCacheBuffers.clear();
 	m_data->m_collisionShapes.clear();
 	m_data->m_bulletCollisionShape2UrdfCollision.clear();
 	m_data->m_graphicsIndexToSegmentationMask.clear();
@@ -5305,7 +5446,7 @@ bool PhysicsServerCommandProcessor::processCreateCollisionShapeCommand(const str
 
 						{
 							BT_PROFILE("create btBvhTriangleMeshShape");
-							btBvhTriangleMeshShape* trimesh = new btBvhTriangleMeshShape(meshInterface, true, true);
+							btBvhTriangleMeshShape* trimesh = createConcaveTriangleMeshShape(meshInterface, (clientCmd.m_createUserShapeArgs.m_shapes[i].m_collisionFlags & GEOM_CONCAVE_BVH_CACHE) != 0, m_data->m_bvhCacheBuffers);
 							m_data->m_collisionShapes.push_back(trimesh);
 
 							if (clientCmd.m_createUserShapeArgs.m_shapes[i].m_collisionFlags & GEOM_CONCAVE_INTERNAL_EDGE)
@@ -5508,7 +5649,7 @@ bool PhysicsServerCommandProcessor::processCreateCollisionShapeCommand(const str
 
 					{
 						BT_PROFILE("create btBvhTriangleMeshShape");
-						btBvhTriangleMeshShape* trimesh = new btBvhTriangleMeshShape(meshInterface, true, true);
+						btBvhTriangleMeshShape* trimesh = createConcaveTriangleMeshShape(meshInterface, (clientCmd.m_createUserShapeArgs.m_shapes[i].m_collisionFlags & GEOM_CONCAVE_BVH_CACHE) != 0, m_data->m_bvhCacheBuffers);
 						m_data->m_collisionShapes.push_back(trimesh);
 
 						if (clientCmd.m_createUserShapeArgs.m_shapes[i].m_collisionFlags & GEOM_CONCAVE_INTERNAL_EDGE)
@@ -5981,7 +6122,7 @@ bool PhysicsServerCommandProcessor::processCreateVisualShapeCommand(const struct
 		visualShape.m_linkLocalFrame.setIdentity();
 		visualShape.m_geometry.m_hasLocalMaterial = false;
 		// createVisualShape flags arrive in m_collisionFlags; only the multibody double-sided bit is a visual flag
-		visualShape.m_flags = visShape.m_collisionFlags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY;
+		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL);
 
 		bool hasRGBA = (clientCmd.m_createUserShapeArgs.m_shapes[userShapeIndex].m_visualFlags & GEOM_VISUAL_HAS_RGBA_COLOR) != 0;
 		;

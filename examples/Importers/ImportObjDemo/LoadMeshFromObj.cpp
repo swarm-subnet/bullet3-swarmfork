@@ -36,9 +36,12 @@ std::string LoadFromCachedOrFromObj(
 	std::vector<bt_tinyobj::shape_t>& shapes,  // [output]
 	const char* filename,
 	const char* mtl_basepath,
-	struct CommonFileIOInterface* fileIO)
+	struct CommonFileIOInterface* fileIO,
+	bool splitOnMaterial)
 {
-	CachedObjResult* resultPtr = gCachedObjResults[filename];
+	// the two shape groupings of one file must not share a cache entry
+	std::string cacheKey = splitOnMaterial ? std::string(filename) + "|mtl" : std::string(filename);
+	CachedObjResult* resultPtr = gCachedObjResults[cacheKey.c_str()];
 	if (resultPtr)
 	{
 		const CachedObjResult& result = *resultPtr;
@@ -47,14 +50,14 @@ std::string LoadFromCachedOrFromObj(
 		return result.m_msg;
 	}
 
-	std::string err = bt_tinyobj::LoadObj(attribute, shapes, filename, mtl_basepath, fileIO);
+	std::string err = bt_tinyobj::LoadObj(attribute, shapes, filename, mtl_basepath, fileIO, splitOnMaterial);
 	CachedObjResult result;
 	result.m_msg = err;
 	result.m_shapes = shapes;
 	result.m_attribute = attribute;
 	if (gEnableFileCaching)
 	{
-		gCachedObjResults.insert(filename, result);
+		gCachedObjResults.insert(cacheKey.c_str(), result);
 	}
 	return err;
 }

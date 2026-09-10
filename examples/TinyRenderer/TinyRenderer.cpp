@@ -455,31 +455,8 @@ void TinyRenderObjectData::registerMeshShape(const float* vertices, int numVerti
              */
 		}
 		{
-			B3_PROFILE("reserveMemory");
-			m_model->reserveMemory(numVertices, numIndices);
-		}
-		{
-			B3_PROFILE("addVertex");
-			for (int i = 0; i < numVertices; i++)
-			{
-				m_model->addVertex(vertices[i * 9],
-								   vertices[i * 9 + 1],
-								   vertices[i * 9 + 2],
-								   vertices[i * 9 + 4],
-								   vertices[i * 9 + 5],
-								   vertices[i * 9 + 6],
-								   vertices[i * 9 + 7],
-								   vertices[i * 9 + 8]);
-			}
-		}
-		{
-			B3_PROFILE("addTriangle");
-			for (int i = 0; i < numIndices; i += 3)
-			{
-				m_model->addTriangle(indices[i], indices[i], indices[i],
-									 indices[i + 1], indices[i + 1], indices[i + 1],
-									 indices[i + 2], indices[i + 2], indices[i + 2]);
-			}
+			B3_PROFILE("setMeshFromArrays");
+			m_model->setMeshFromArrays(vertices, numVertices, indices, numIndices);
 		}
 		computeLocalAABB();
 	}
@@ -562,19 +539,11 @@ void TinyRenderObjectData::createCube(float halfExtentsX, float halfExtentsY, fl
 void TinyRenderObjectData::computeLocalAABB()
 {
 	m_hasLocalAABB = false;
-	if (!m_model || m_model->nverts() == 0)
+	Vec3f aabbMin, aabbMax;
+	if (!m_model || !m_model->getLocalAABB(aabbMin, aabbMax))
 		return;
-	Vec3f v = m_model->vert(0);
-	btVector3 aabbMin(v[0], v[1], v[2]);
-	btVector3 aabbMax = aabbMin;
-	for (int i = 1; i < m_model->nverts(); i++)
-	{
-		v = m_model->vert(i);
-		aabbMin.setMin(btVector3(v[0], v[1], v[2]));
-		aabbMax.setMax(btVector3(v[0], v[1], v[2]));
-	}
-	m_localAABBMin = aabbMin;
-	m_localAABBMax = aabbMax;
+	m_localAABBMin.setValue(aabbMin[0], aabbMin[1], aabbMin[2]);
+	m_localAABBMax.setValue(aabbMax[0], aabbMax[1], aabbMax[2]);
 	m_hasLocalAABB = true;
 }
 
