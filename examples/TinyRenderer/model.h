@@ -7,19 +7,22 @@
 
 namespace TinyRender
 {
+struct SharedMesh;
+struct SharedTexture;
+
 class Model
 {
 private:
-	std::vector<Vec3f> verts_;
-	std::vector<std::vector<Vec3i> > faces_;  // attention, this Vec3i means vertex/uv/normal
-	std::vector<Vec3f> norms_;
-	std::vector<Vec2f> uv_;
-	TGAImage diffusemap_;
+	// Mesh arrays and the diffuse texture are reference counted and shared
+	// between every Model built from identical data; colour stays per Model.
+	SharedMesh* m_mesh;
+	SharedTexture* m_diffuse;
 	TGAImage normalmap_;
 	TGAImage specularmap_;
 	Vec4f m_colorRGBA;
 
 	void load_texture(std::string filename, const char* suffix, TGAImage& img);
+	void detachMesh();
 
 public:
 	Model(const char* filename);
@@ -36,38 +39,26 @@ public:
 	}
 	void loadDiffuseTexture(const char* relativeFileName);
 	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight);
+	// Vertex stride is 9 floats: xyz, w (ignored), normal xyz, uv.
+	void setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 	void reserveMemory(int numVertices, int numIndices);
 	void addVertex(float x, float y, float z, float normalX, float normalY, float normalZ, float u, float v);
 	void addTriangle(int vertexposIndex0, int normalIndex0, int uvIndex0,
 					 int vertexposIndex1, int normalIndex1, int uvIndex1,
 					 int vertexposIndex2, int normalIndex2, int uvIndex2);
+	bool getLocalAABB(Vec3f& aabbMin, Vec3f& aabbMax);
 
 	~Model();
 	int nverts();
-	int nnormals()
-	{
-		return norms_.size();
-	}
+	int nnormals();
 	int nfaces();
-	
+
 	Vec3f normal(int iface, int nthvert);
 	Vec3f normal(Vec2f uv);
 	Vec3f vert(int i);
 	Vec3f vert(int iface, int nthvert);
-	Vec3f* readWriteVertices() 
-	{
-		if (verts_.size() == 0)
-			return 0;
-		return &verts_[0];
-	}
-
-	Vec3f* readWriteNormals()
-	{
-		if (norms_.size() == 0)
-			return 0;
-		return &norms_[0];
-	}
-	
+	Vec3f* readWriteVertices();
+	Vec3f* readWriteNormals();
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
