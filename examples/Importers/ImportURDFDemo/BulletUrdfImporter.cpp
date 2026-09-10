@@ -31,6 +31,7 @@ subject to the following restrictions:
 #include "../OpenGLWindow/ShapeData.h"
 
 #include "URDF2Bullet.h"  //for flags
+#include "../../SharedMemory/SharedMemoryPublic.h"  //for eVISUAL_SHAPE_MATERIALS_FROM_MTL
 #include "../ImportMeshUtility/b3ImportMeshUtility.h"
 
 static btScalar gUrdfDefaultCollisionMargin = 0.001;
@@ -209,6 +210,17 @@ bool BulletURDFImporter::loadURDF(const char* fileName, bool forceFixedBase)
 				{
 					UrdfLink* linkPtr = *m_data->m_urdfParser.getModel().m_links.getAtIndex(i);
 					linkPtr->m_collisionArray.clear();
+				}
+			}
+			if (m_data->m_flags & CUF_USE_MATERIALS_FROM_MTL)
+			{
+				for (int i=0; i < m_data->m_urdfParser.getModel().m_links.size(); i++)
+				{
+					UrdfLink* linkPtr = *m_data->m_urdfParser.getModel().m_links.getAtIndex(i);
+					for (int v = 0; v < linkPtr->m_visualArray.size(); v++)
+					{
+						linkPtr->m_visualArray[v].m_flags |= eVISUAL_SHAPE_MATERIALS_FROM_MTL;
+					}
 				}
 			}
 			if (m_data->m_urdfParser.getModel().m_rootLinks.size())

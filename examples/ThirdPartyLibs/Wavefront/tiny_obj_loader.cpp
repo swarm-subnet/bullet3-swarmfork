@@ -595,7 +595,8 @@ LoadObj(
 	std::vector<shape_t>& shapes,
 	const char* filename,
 	const char* mtl_basepath,
-	CommonFileIOInterface* fileIO)
+	CommonFileIOInterface* fileIO,
+	bool splitOnMaterial)
 {
 	attrib.vertices.clear();
 	attrib.normals.clear();
@@ -764,6 +765,17 @@ LoadObj(
 		// use mtl
 		if ((0 == strncmp(token, "usemtl", 6)) && isSpace((token[6])))
 		{
+			if (splitOnMaterial)
+			{
+				// flush the faces of the previous material so they keep it instead of the last one seen
+				shape_t shape;
+				if (exportFaceGroupToShape(&shape, faceGroup, material, name, v))
+				{
+					shapes.push_back(shape);
+				}
+				faceGroup.resize(0);
+			}
+
 			char namebuf[4096];
 			token += 7;
 			sscanf(token, "%s", namebuf);

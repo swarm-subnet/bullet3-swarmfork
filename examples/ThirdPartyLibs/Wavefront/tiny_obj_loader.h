@@ -78,6 +78,7 @@ struct attrib_t
 /// The function returns error string.
 /// Returns empty string when loading .obj success.
 /// 'mtl_basepath' is optional, and used for base path for .mtl file.
+/// 'splitOnMaterial' starts a new shape at every 'usemtl', so each shape keeps its own material.
 #ifdef USE_STREAM
 std::string LoadObj(
 	attrib_t& attrib,
@@ -91,7 +92,8 @@ LoadObj(
 	std::vector<shape_t>& shapes,
 	const char* filename,
 	const char* mtl_basepath,
-	CommonFileIOInterface* fileIO);
+	CommonFileIOInterface* fileIO,
+	bool splitOnMaterial = false);
 #endif
 
 };  // namespace bt_tinyobj

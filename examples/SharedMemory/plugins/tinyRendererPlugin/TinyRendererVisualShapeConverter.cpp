@@ -192,7 +192,8 @@ void TinyRendererVisualShapeConverter::setLightSpecularCoeff(float specularCoeff
 	m_data->m_hasLightSpecularCoeff = true;
 }
 
-static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPathPrefix, const btTransform& visualTransform, btAlignedObjectArray<GLInstanceVertex>& verticesOut, btAlignedObjectArray<int>& indicesOut, btAlignedObjectArray<MyTexture2>& texturesOut, b3VisualShapeData& visualShapeOut, struct CommonFileIOInterface* fileIO, int flags)
+// materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
+static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPathPrefix, const btTransform& visualTransform, btAlignedObjectArray<GLInstanceVertex>& verticesOut, btAlignedObjectArray<int>& indicesOut, btAlignedObjectArray<MyTexture2>& texturesOut, b3VisualShapeData& visualShapeOut, struct CommonFileIOInterface* fileIO, int flags, btAlignedObjectArray<b3ImportMeshMaterialGroup>* materialGroupsOut)
 {
 	visualShapeOut.m_visualGeometryType = visual->m_geometry.m_type;
 	visualShapeOut.m_dimensions[0] = 0;
@@ -419,8 +420,21 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 			//glmesh = LoadMeshFromObj(fullPath,visualPathPrefix);
 			b3ImportMeshData meshData;
 
-			if (b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO))
+			if (b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO, materialGroupsOut != 0))
 			{
+				if (materialGroupsOut)
+				{
+					for (int i = 0; i < meshData.m_materialGroups.size(); i++)
+					{
+						b3ImportMeshMaterialGroup group = meshData.m_materialGroups[i];
+						group.m_indexStart += indicesOut.size();
+						if ((flags & URDF_USE_MATERIAL_TRANSPARANCY_FROM_MTL) == 0)
+						{
+							group.m_rgbaColor[3] = 1;
+						}
+						materialGroupsOut->push_back(group);
+					}
+				}
 				if (flags & URDF_USE_MATERIAL_COLORS_FROM_MTL)
 				{
 					if (meshData.m_flags & B3_IMPORT_MESH_HAS_RGBA_COLOR)
@@ -875,9 +889,12 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			visualShape.m_tinyRendererTextureId = -1;
 			visualShape.m_textureUniqueId = -1;
 
+			bool doubleSided = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY) != 0;
+			bool materialsFromMtl = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_MATERIALS_FROM_MTL) != 0;
+			btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 			{
 				B3_PROFILE("convertURDFToVisualShape");
-				convertURDFToVisualShape(vis, pathPrefix, localInertiaFrame.inverse() * childTrans, vertices, indices, textures, visualShape, fileIO, m_data->m_flags);
+				convertURDFToVisualShape(vis, pathPrefix, localInertiaFrame.inverse() * childTrans, vertices, indices, textures, visualShape, fileIO, m_data->m_flags, materialsFromMtl ? &materialGroups : 0);
 				if ((vis->m_geometry.m_type == URDF_GEOM_PLANE) || (vis->m_geometry.m_type == URDF_GEOM_HEIGHTFIELD))
 				{
 					int texWidth = 1024;
@@ -924,10 +941,53 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			rgbaColor[2] = visualShape.m_rgbaColor[2];
 			rgbaColor[3] = visualShape.m_rgbaColor[3];
 
-			if (vertices.size() && indices.size())
+			if (vertices.size() && indices.size() && materialGroups.size())
+			{
+				// one render object per material, all under the same body and link
+				for (int g = 0; g < materialGroups.size(); g++)
+				{
+					const b3ImportMeshMaterialGroup& group = materialGroups[g];
+					int firstVertex = indices[group.m_indexStart];
+					int lastVertex = firstVertex;
+					for (int i = 1; i < group.m_indexCount; i++)
+					{
+						int vertexIndex = indices[group.m_indexStart + i];
+						firstVertex = btMin(firstVertex, vertexIndex);
+						lastVertex = btMax(lastVertex, vertexIndex);
+					}
+					btAlignedObjectArray<int> groupIndices;
+					groupIndices.resize(group.m_indexCount);
+					for (int i = 0; i < group.m_indexCount; i++)
+					{
+						groupIndices[i] = indices[group.m_indexStart + i] - firstVertex;
+					}
+					float groupColor[4] = { (float)group.m_rgbaColor[0], (float)group.m_rgbaColor[1], (float)group.m_rgbaColor[2], (float)group.m_rgbaColor[3] };
+
+					TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
+					tinyObj->m_doubleSided = doubleSided;
+					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
+						group.m_textureImage, group.m_textureWidth, group.m_textureHeight);
+					visuals->m_renderObjects.push_back(tinyObj);
+
+					if (group.m_textureImage)
+					{
+						MyTexture2 texData;
+						texData.m_width = group.m_textureWidth;
+						texData.m_height = group.m_textureHeight;
+						texData.textureData1 = group.m_textureImage;
+						texData.m_isCached = group.m_isCached;
+						if (visualShape.m_tinyRendererTextureId < 0)
+						{
+							visualShape.m_tinyRendererTextureId = m_data->m_textures.size();
+						}
+						m_data->m_textures.push_back(texData);
+					}
+				}
+			}
+			else if (vertices.size() && indices.size())
 			{
 				TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
-				tinyObj->m_doubleSided = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY) != 0;
+				tinyObj->m_doubleSided = doubleSided;
 				unsigned char* textureImage1 = 0;
 				int textureWidth = 0;
 				int textureHeight = 0;
