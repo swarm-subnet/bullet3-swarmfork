@@ -880,6 +880,8 @@ enum EnumRendererAuxFlags
 	ER_USE_PROJECTIVE_TEXTURE = 2,
 	ER_NO_SEGMENTATION_MASK = 4,
 	ER_DEPTH_ONLY = 8,
+	// Ray-cast depth and segmentation through the Embree backend beside TinyRenderer; colour stays cleared.
+	ER_SWARM_RAYCAST = 16,
 };
 
 ///flags to pick the IK solver and other options

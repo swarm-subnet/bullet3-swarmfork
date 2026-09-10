@@ -511,6 +511,17 @@ if _platform == "linux" or _platform == "linux2":
   CXX_FLAGS += '-fvisibility-inlines-hidden '
   CXX_FLAGS += _SWARM_TIER_FLAGS + ' '
   CXX_FLAGS += _PGO_FLAGS
+  # Ray-cast depth backend (ER_SWARM_RAYCAST): Embree 4.4.1, AVX2 only, exact division, linked statically.
+  if os.environ.get('SWARM_RAYCAST', 'on').strip().lower() != 'off':
+    _EMBREE_DIR = os.path.join('examples', 'ThirdPartyLibs', 'embree')
+    _EMBREE_PREFIX = os.path.join(_EMBREE_DIR, 'prefix')
+    if not os.path.isfile(os.path.join(_EMBREE_PREFIX, 'lib', 'libembree4.a')):
+      subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
+    CXX_FLAGS += '-DSWARM_RAYCAST '
+    sources = sources + ['examples/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp']
+    include_dirs += [os.path.join(_EMBREE_PREFIX, 'include')]
+    LINK_FLAGS += ' ' + ' '.join(os.path.join(_EMBREE_PREFIX, 'lib', 'lib%s.a' % name)
+                                 for name in ('embree4', 'embree_avx2', 'sys', 'math', 'simd', 'lexers', 'tasking'))
   EGL_CXX_FLAGS += '-DBT_USE_EGL '
   EGL_CXX_FLAGS += '-fPIC '  # for plugins
 
@@ -616,7 +627,7 @@ if 'BT_USE_EGL' in EGL_CXX_FLAGS:
 
 setup(
     name='swarm-bullet3',
-    version='2.0.0.4',
+    version='2.0.0.5',
     description='Swarm fork of PyBullet with optimized depth-only rendering and simulator loading for robotics benchmark evaluation',
     long_description=Path('README.md').read_text(encoding='utf-8'),
     long_description_content_type='text/markdown',

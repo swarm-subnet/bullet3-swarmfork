@@ -59,6 +59,8 @@ public:
 	Vec3f vert(int iface, int nthvert);
 	Vec3f* readWriteVertices();
 	Vec3f* readWriteNormals();
+	// Identity of the shared vertex block; two Models with the same key draw the same triangles.
+	const void* meshKey() const { return m_mesh; }
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
