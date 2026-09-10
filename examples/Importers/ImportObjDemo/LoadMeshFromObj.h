@@ -13,7 +13,8 @@ std::string LoadFromCachedOrFromObj(
 	std::vector<bt_tinyobj::shape_t>& shapes,  // [output]
 	const char* filename,
 	const char* mtl_basepath,
-	struct CommonFileIOInterface* fileIO);
+	struct CommonFileIOInterface* fileIO,
+	bool splitOnMaterial = false);
 
 GLInstanceGraphicsShape* LoadMeshFromObj(const char* relativeFileName, const char* materialPrefixPath,struct CommonFileIOInterface* fileIO);
 

@@ -5981,7 +5981,7 @@ bool PhysicsServerCommandProcessor::processCreateVisualShapeCommand(const struct
 		visualShape.m_linkLocalFrame.setIdentity();
 		visualShape.m_geometry.m_hasLocalMaterial = false;
 		// createVisualShape flags arrive in m_collisionFlags; only the multibody double-sided bit is a visual flag
-		visualShape.m_flags = visShape.m_collisionFlags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY;
+		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL);
 
 		bool hasRGBA = (clientCmd.m_createUserShapeArgs.m_shapes[userShapeIndex].m_visualFlags & GEOM_VISUAL_HAS_RGBA_COLOR) != 0;
 		;
