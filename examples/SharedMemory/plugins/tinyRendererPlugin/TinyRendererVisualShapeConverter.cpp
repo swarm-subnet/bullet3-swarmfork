@@ -34,6 +34,9 @@ subject to the following restrictions:
 #include "../TinyRenderer/model.h"
 #include "stb_image/stb_image.h"
 #include "../OpenGLWindow/ShapeData.h"
+#ifdef SWARM_RAYCAST
+#include "SwarmRaycast.h"
+#endif
 struct MyTexture2
 {
 	unsigned char* textureData1;
@@ -107,6 +110,11 @@ struct TinyRendererVisualShapeConverterInternalData
 	int m_batchCameraCount;
 	int m_batchReadCamera;
 
+#ifdef SWARM_RAYCAST
+	// Created on the first ER_SWARM_RAYCAST render and kept in step with the render objects from then on.
+	SwarmRaycast* m_raycast;
+#endif
+
 	TinyRendererVisualShapeConverterInternalData()
 		: m_upAxis(2),
 		m_swWidth(START_WIDTH),
@@ -135,6 +143,9 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_flags(0),
 		m_batchCameraCount(1),
 		m_batchReadCamera(0)
+#ifdef SWARM_RAYCAST
+		, m_raycast(0)
+#endif
 	{
 		m_depthBuffer.resize(m_swWidth * m_swHeight);
 		m_shadowBuffer.resize(m_swWidth * m_swHeight);
@@ -143,7 +154,30 @@ struct TinyRendererVisualShapeConverterInternalData
 
 	virtual ~TinyRendererVisualShapeConverterInternalData()
 	{
+#ifdef SWARM_RAYCAST
+		delete m_raycast;
+#endif
 	}
+
+#ifdef SWARM_RAYCAST
+	// Brings every render object into the ray-cast scene and rebuilds the top-level tree.
+	SwarmRaycast& syncRaycast()
+	{
+		if (!m_raycast)
+			m_raycast = new SwarmRaycast();
+		for (int n = 0; n < m_swRenderInstances.size(); n++)
+		{
+			TinyRendererObjectArray** visualArrayPtr = m_swRenderInstances.getAtIndex(n);
+			if (0 == visualArrayPtr)
+				continue;
+			TinyRendererObjectArray* visualArray = *visualArrayPtr;
+			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
+				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
+		}
+		m_raycast->commit();
+		return *m_raycast;
+	}
+#endif
 };
 
 TinyRendererVisualShapeConverter::TinyRendererVisualShapeConverter()
@@ -1120,6 +1154,10 @@ void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVe
 
 			if (renderObj->m_model->nverts() == numVertices)
 			{
+#ifdef SWARM_RAYCAST
+				if (m_data->m_raycast)
+					m_data->m_raycast->meshChanged(renderObj);
+#endif
 				TinyRender::Vec3f* verts = renderObj->m_model->readWriteVertices();
 				//just do a sync
 				for (int i = 0; i < numVertices; i++)
@@ -1440,6 +1478,27 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 	}
 
 	const int renderThreads = b3GetSwarmRenderThreads();
+
+	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
+	{
+#ifdef SWARM_RAYCAST
+		const SwarmRaycast& raycast = m_data->syncRaycast();
+#pragma omp parallel for num_threads(renderThreads) schedule(dynamic, 1) if(renderThreads > 1 && numCameras > 1)
+		for (int cam = 0; cam < numCameras; cam++)
+		{
+			float* zbuf = &m_data->m_batchDepthBuffers[cam][0];
+			for (int i = 0; i < numPixels; i++)
+				zbuf[i] = -farVal;
+			raycast.renderDepth(&viewMatrices[cam * 16], projMat, width, height, zbuf, 0, renderThreads);
+		}
+#else
+		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
+#endif
+		m_data->m_batchCameraCount = numCameras;
+		m_data->m_batchReadCamera = 0;
+		return true;
+	}
+
 #pragma omp parallel for num_threads(renderThreads) schedule(dynamic, 1) if(renderThreads > 1 && numCameras > 1)
 	for (int cam = 0; cam < numCameras; cam++)
 	{
@@ -1643,6 +1702,22 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	}
 
 	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
+
+	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
+	{
+		// Depth and segmentation come from the ray caster, already in output row order; colour stays cleared.
+#ifdef SWARM_RAYCAST
+		const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
+		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
+		m_data->syncRaycast().renderDepth(viewMat, projMat, m_data->m_swWidth, m_data->m_swHeight,
+										  numPixels ? &m_data->m_depthBuffer[0] : 0,
+										  (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0],
+										  b3GetSwarmRenderThreads());
+#else
+		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
+#endif
+		return;
+	}
 
 	if (m_data->m_hasShadow && !depthOnly)
 	{
@@ -1943,6 +2018,10 @@ void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 			m_data->m_visualShapesMap.remove(ptr->m_objectUniqueId);
 			for (int o = 0; o < ptr->m_renderObjects.size(); o++)
 			{
+#ifdef SWARM_RAYCAST
+				if (m_data->m_raycast)
+					m_data->m_raycast->removeObject(ptr->m_renderObjects[o]);
+#endif
 				delete ptr->m_renderObjects[o];
 			}
 		}
@@ -1953,7 +2032,10 @@ void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 
 void TinyRendererVisualShapeConverter::resetAll()
 {
-
+#ifdef SWARM_RAYCAST
+	if (m_data->m_raycast)
+		m_data->m_raycast->removeAll();
+#endif
 
 	for (int i = 0; i < m_data->m_swRenderInstances.size(); i++)
 	{

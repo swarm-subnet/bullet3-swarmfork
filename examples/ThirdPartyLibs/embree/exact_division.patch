@@ -1,0 +1,403 @@
+diff -ruN pristine/common/math/color.h patched/common/math/color.h
+--- a/common/math/color.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/math/color.h	2026-09-10 19:43:41.028886971 +0200
+@@ -160,38 +160,13 @@
+   }
+   __forceinline const Color rcp  ( const Color& a )
+   {
+-#if defined(__aarch64__)
+-    __m128 reciprocal = _mm_rcp_ps(a.m128);
+-    reciprocal = vmulq_f32(vrecpsq_f32(a.m128, reciprocal), reciprocal);
+-    reciprocal = vmulq_f32(vrecpsq_f32(a.m128, reciprocal), reciprocal);
+-    return (const Color)reciprocal;
+-#else
+-#if defined(__AVX512VL__)
+-    const Color r = _mm_rcp14_ps(a.m128);
+-#else
+-    const Color r = _mm_rcp_ps(a.m128);
+-#endif
+-    return _mm_add_ps(r,_mm_mul_ps(r, _mm_sub_ps(_mm_set1_ps(1.0f), _mm_mul_ps(a, r))));   // computes r + r * (1 - a * r)
+-
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), a.m128);
+   }
+   __forceinline const Color rsqrt( const Color& a )
+   {
+-#if defined(__aarch64__)
+-    __m128 r = _mm_rsqrt_ps(a.m128);
+-    r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-    r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-    return r;
+-#else
+-
+-#if defined(__AVX512VL__)
+-    __m128 r = _mm_rsqrt14_ps(a.m128);
+-#else
+-    __m128 r = _mm_rsqrt_ps(a.m128);
+-#endif
+-    return _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f),r), _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
+-
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(a.m128));
+   }
+   __forceinline const Color sqrt ( const Color& a ) { return _mm_sqrt_ps(a.m128); }
+ 
+diff -ruN pristine/common/math/emath.h patched/common/math/emath.h
+--- a/common/math/emath.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/math/emath.h	2026-09-10 19:43:41.028886971 +0200
+@@ -60,31 +60,8 @@
+ 
+   __forceinline float rcp  ( const float x )
+   {
+-#if defined(__aarch64__)
+-      // Move scalar to vector register and do rcp.
+-      __m128 a;
+-      a[0] = x;
+-      float32x4_t reciprocal = vrecpeq_f32(a);
+-      reciprocal = vmulq_f32(vrecpsq_f32(a, reciprocal), reciprocal);
+-      reciprocal = vmulq_f32(vrecpsq_f32(a, reciprocal), reciprocal);
+-      return reciprocal[0];
+-#else
+-
+-    const __m128 a = _mm_set_ss(x);
+-
+-#if defined(__AVX512VL__)
+-    const __m128 r = _mm_rcp14_ss(_mm_set_ss(0.0f),a);
+-#else
+-    const __m128 r = _mm_rcp_ss(a);
+-#endif
+-
+-#if defined(__AVX2__)
+-    return _mm_cvtss_f32(_mm_mul_ss(r,_mm_fnmadd_ss(r, a, _mm_set_ss(2.0f))));
+-#else
+-    return _mm_cvtss_f32(_mm_mul_ss(r,_mm_sub_ss(_mm_set_ss(2.0f), _mm_mul_ss(r, a))));
+-#endif
+-
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return 1.0f / x;
+   }
+ 
+   __forceinline float signmsk ( const float x ) {
+@@ -128,26 +105,8 @@
+   }
+   __forceinline float rsqrt( const float x )
+   {
+-#if defined(__aarch64__)
+-      // FP and Neon shares same vector register in arm64
+-      __m128 a;
+-      a[0] = x;
+-      __m128 value = _mm_rsqrt_ps(a);
+-      value = vmulq_f32(value, vrsqrtsq_f32(vmulq_f32(a, value), value));
+-      value = vmulq_f32(value, vrsqrtsq_f32(vmulq_f32(a, value), value));
+-      return value[0];
+-#else
+-
+-    const __m128 a = _mm_set_ss(x);
+-#if defined(__AVX512VL__)
+-    __m128 r = _mm_rsqrt14_ss(_mm_set_ss(0.0f),a);
+-#else
+-    __m128 r = _mm_rsqrt_ss(a);
+-#endif
+-    const __m128 c = _mm_add_ss(_mm_mul_ss(_mm_set_ss(1.5f), r),
+-                                _mm_mul_ss(_mm_mul_ss(_mm_mul_ss(a, _mm_set_ss(-0.5f)), r), _mm_mul_ss(r, r)));
+-    return _mm_cvtss_f32(c);
+-#endif
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return 1.0f / ::sqrtf(x);
+   }
+ 
+ #if defined(__WIN32__) && defined(_MSC_VER) && (_MSC_VER <= 1700)
+diff -ruN pristine/common/math/vec2fa.h patched/common/math/vec2fa.h
+--- a/common/math/vec2fa.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/math/vec2fa.h	2026-09-10 19:43:41.028886971 +0200
+@@ -102,28 +102,8 @@
+ 
+   __forceinline Vec2fa rcp  ( const Vec2fa& a )
+   {
+-#if defined(__aarch64__)
+-        __m128 reciprocal = _mm_rcp_ps(a.m128);
+-        reciprocal = vmulq_f32(vrecpsq_f32(a.m128, reciprocal), reciprocal);
+-        reciprocal = vmulq_f32(vrecpsq_f32(a.m128, reciprocal), reciprocal);
+-        return (const Vec2fa)reciprocal;
+-#else
+-#if defined(__AVX512VL__)
+-    const Vec2fa r = _mm_rcp14_ps(a.m128);
+-#else
+-    const Vec2fa r = _mm_rcp_ps(a.m128);
+-#endif
+-
+-#if defined(__AVX2__)
+-    const Vec2fa h_n = _mm_fnmadd_ps(a, r, vfloat4(1.0));  // First, compute 1 - a * r (which will be very close to 0)
+-    const Vec2fa res = _mm_fmadd_ps(r, h_n, r);            // Then compute r + r * h_n
+-#else
+-    const Vec2fa h_n = _mm_sub_ps(vfloat4(1.0f), _mm_mul_ps(a, r));  // First, compute 1 - a * r (which will be very close to 0)
+-    const Vec2fa res = _mm_add_ps(r,_mm_mul_ps(r, h_n));             // Then compute r + r * h_n  
+-#endif
+-
+-    return res;
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), a.m128);
+   }
+ 
+   __forceinline Vec2fa sqrt ( const Vec2fa& a ) { return _mm_sqrt_ps(a.m128); }
+@@ -131,21 +111,8 @@
+ 
+   __forceinline Vec2fa rsqrt( const Vec2fa& a )
+   {
+-#if defined(__aarch64__)
+-        __m128 r = _mm_rsqrt_ps(a.m128);
+-        r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-        r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-        return r;
+-#else
+-
+-#if defined(__AVX512VL__)
+-    __m128 r = _mm_rsqrt14_ps(a.m128);
+-#else
+-    __m128 r = _mm_rsqrt_ps(a.m128);
+-#endif
+-    return _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f),r), _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
+-
+-#endif
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(a.m128));
+   }
+ 
+   __forceinline Vec2fa zero_fix(const Vec2fa& a) {
+diff -ruN pristine/common/math/vec3fa.h patched/common/math/vec3fa.h
+--- a/common/math/vec3fa.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/math/vec3fa.h	2026-09-10 19:43:54.136732651 +0200
+@@ -121,26 +121,8 @@
+ 
+   __forceinline Vec3fa rcp  ( const Vec3fa& a )
+   {
+-#if defined(__aarch64__)
+-  return vdivq_f32(vdupq_n_f32(1.0f),a.m128);
+-#else
+-
+-#if defined(__AVX512VL__)
+-    const Vec3fa r = _mm_rcp14_ps(a.m128);
+-#else
+-    const Vec3fa r = _mm_rcp_ps(a.m128);
+-#endif
+-
+-#if defined(__AVX2__)
+-    const Vec3fa h_n = _mm_fnmadd_ps(a.m128, r.m128, vfloat4(1.0));  // First, compute 1 - a * r (which will be very close to 0)
+-    const Vec3fa res = _mm_fmadd_ps(r.m128, h_n.m128, r.m128);       // Then compute r + r * h_n
+-#else
+-    const Vec3fa h_n = _mm_sub_ps(vfloat4(1.0f), _mm_mul_ps(a.m128, r.m128));  // First, compute 1 - a * r (which will be very close to 0)
+-    const Vec3fa res = _mm_add_ps(r.m128,_mm_mul_ps(r.m128, h_n.m128));        // Then compute r + r * h_n  
+-#endif
+-
+-    return res;
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), a.m128);
+   }
+ 
+   __forceinline Vec3fa sqrt ( const Vec3fa& a ) { return _mm_sqrt_ps(a.m128); }
+@@ -148,20 +130,8 @@
+ 
+   __forceinline Vec3fa rsqrt( const Vec3fa& a )
+   {
+-#if defined(__aarch64__)
+-        __m128 r = _mm_rsqrt_ps(a.m128);
+-        r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-        r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a.m128, r), r));
+-        return r;
+-#else
+-
+-#if defined(__AVX512VL__)
+-    __m128 r = _mm_rsqrt14_ps(a.m128);
+-#else
+-    __m128 r = _mm_rsqrt_ps(a.m128);
+-#endif
+-    return _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f),r), _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a.m128, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
+-#endif
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(a.m128));
+   }
+ 
+   __forceinline Vec3fa zero_fix(const Vec3fa& a) {
+@@ -529,20 +499,8 @@
+ 
+   __forceinline Vec3fx rcp  ( const Vec3fx& a )
+   {
+-#if defined(__AVX512VL__)
+-    const Vec3fx r = _mm_rcp14_ps(a.m128);
+-#else
+-    const Vec3fx r = _mm_rcp_ps(a.m128);
+-#endif
+-
+-#if defined(__AVX2__)
+-    const Vec3fx res = _mm_mul_ps(r.m128,_mm_fnmadd_ps(r.m128, a.m128, vfloat4(2.0f)));
+-#else
+-    const Vec3fx res = _mm_mul_ps(r.m128,_mm_sub_ps(vfloat4(2.0f), _mm_mul_ps(r.m128, a.m128)));
+-    //return _mm_sub_ps(_mm_add_ps(r, r), _mm_mul_ps(_mm_mul_ps(r, r), a));
+-#endif
+-
+-    return res;
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), a.m128);
+   }
+ 
+   __forceinline Vec3fx sqrt ( const Vec3fx& a ) { return _mm_sqrt_ps(a.m128); }
+@@ -550,12 +508,8 @@
+ 
+   __forceinline Vec3fx rsqrt( const Vec3fx& a )
+   {
+-#if defined(__AVX512VL__)
+-    __m128 r = _mm_rsqrt14_ps(a.m128);
+-#else
+-    __m128 r = _mm_rsqrt_ps(a.m128);
+-#endif
+-    return _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f),r), _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a.m128, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(a.m128));
+   }
+ 
+   __forceinline Vec3fx zero_fix(const Vec3fx& a) {
+diff -ruN pristine/common/simd/vfloat16_avx512.h patched/common/simd/vfloat16_avx512.h
+--- a/common/simd/vfloat16_avx512.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/simd/vfloat16_avx512.h	2026-09-10 19:43:09.781255146 +0200
+@@ -179,8 +179,8 @@
+ 
+   __forceinline vfloat16 rcp(const vfloat16& a)
+   {
+-    const vfloat16 r = _mm512_rcp14_ps(a);
+-    return _mm512_fmadd_ps(r, _mm512_fnmadd_ps(a, r, vfloat16(1.0)), r);  // computes r + r * (1 - a*r)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm512_div_ps(_mm512_set1_ps(1.0f), a);
+   }
+ 
+   __forceinline vfloat16 sqr (const vfloat16& a) { return _mm512_mul_ps(a,a); }
+@@ -188,9 +188,8 @@
+ 
+   __forceinline vfloat16 rsqrt(const vfloat16& a)
+   {
+-    const vfloat16 r = _mm512_rsqrt14_ps(a);
+-    return _mm512_fmadd_ps(_mm512_set1_ps(1.5f), r,
+-                           _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(a, _mm512_set1_ps(-0.5f)), r), _mm512_mul_ps(r, r))); 
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_sqrt_ps(a));
+   }
+ 
+   ////////////////////////////////////////////////////////////////////////////////
+diff -ruN pristine/common/simd/vfloat4_sse2.h patched/common/simd/vfloat4_sse2.h
+--- a/common/simd/vfloat4_sse2.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/simd/vfloat4_sse2.h	2026-09-10 19:43:09.781255146 +0200
+@@ -303,51 +303,16 @@
+ 
+   __forceinline vfloat4 rcp(const vfloat4& a)
+   {
+-#if defined(__aarch64__)
+-    return vfloat4(vdivq_f32(vdupq_n_f32(1.0f),a.v));
+-#else
+-
+-#if defined(__AVX512VL__)
+-    const vfloat4 r = _mm_rcp14_ps(a);
+-#else
+-    const vfloat4 r = _mm_rcp_ps(a);
+-#endif
+-
+-#if defined(__AVX2__)
+-    return _mm_fmadd_ps(r, _mm_fnmadd_ps(a, r, vfloat4(1.0f)), r);                    // computes r + r * (1 - a * r)
+-#else
+-    return _mm_add_ps(r,_mm_mul_ps(r, _mm_sub_ps(vfloat4(1.0f), _mm_mul_ps(a, r))));  // computes r + r * (1 - a * r)
+-#endif
+-
+-#endif  //defined(__aarch64__)
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), a);
+   }
+   __forceinline vfloat4 sqr (const vfloat4& a) { return _mm_mul_ps(a,a); }
+   __forceinline vfloat4 sqrt(const vfloat4& a) { return _mm_sqrt_ps(a); }
+ 
+   __forceinline vfloat4 rsqrt(const vfloat4& a)
+   {
+-#if defined(__aarch64__)
+-    vfloat4 r = _mm_rsqrt_ps(a);
+-    r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a, r), r));
+-    r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a, r), r));
+-    r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(a, r), r));
+-    return r;
+-#else
+-
+-#if defined(__AVX512VL__)
+-    vfloat4 r = _mm_rsqrt14_ps(a);
+-#else
+-    vfloat4 r = _mm_rsqrt_ps(a);
+-#endif
+-
+-#if defined(__AVX2__)
+-    r = _mm_fmadd_ps(_mm_set1_ps(1.5f), r, _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
+-#else
+-    r = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f), r), _mm_mul_ps(_mm_mul_ps(_mm_mul_ps(a, _mm_set1_ps(-0.5f)), r), _mm_mul_ps(r, r)));
+-#endif
+-
+-#endif
+-    return r;
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(a));
+   }
+ 
+   __forceinline vboolf4 isnan(const vfloat4& a) {
+diff -ruN pristine/common/simd/vfloat8_avx.h patched/common/simd/vfloat8_avx.h
+--- a/common/simd/vfloat8_avx.h	2026-03-17 08:41:53.000000000 +0100
++++ b/common/simd/vfloat8_avx.h	2026-09-10 19:43:09.781255146 +0200
+@@ -253,47 +253,16 @@
+ 
+   static __forceinline vfloat8 rcp(const vfloat8& a)
+   {
+-#if defined(__aarch64__)
+-    vfloat8 ret;
+-    const float32x4_t one = vdupq_n_f32(1.0f);
+-    ret.v.lo = vdivq_f32(one, a.v.lo);
+-    ret.v.hi = vdivq_f32(one, a.v.hi);
+-    return ret;
+-#endif
+-
+-#if defined(__AVX512VL__)
+-    const vfloat8 r = _mm256_rcp14_ps(a);
+-#else
+-    const vfloat8 r = _mm256_rcp_ps(a);
+-#endif
+-
+-#if defined(__AVX2__)
+-    // First, compute 1 - a * r (which will be very close to 0)
+-    const vfloat8 h_n = _mm256_fnmadd_ps(a, r, vfloat8(1.0f));
+-    // Then compute r + r * h_n
+-    return _mm256_fmadd_ps(r, h_n, r);
+-#else
+-    return _mm256_add_ps(r,_mm256_mul_ps(r, _mm256_sub_ps(vfloat8(1.0f), _mm256_mul_ps(a, r))));  // computes r + r * (1 - a * r)
+-#endif
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm256_div_ps(_mm256_set1_ps(1.0f), a);
+   }
+   __forceinline vfloat8 sqr (const vfloat8& a) { return _mm256_mul_ps(a,a); }
+   __forceinline vfloat8 sqrt(const vfloat8& a) { return _mm256_sqrt_ps(a); }
+ 
+   static __forceinline vfloat8 rsqrt(const vfloat8& a)
+   {
+-#if defined(__AVX512VL__)
+-    const vfloat8 r = _mm256_rsqrt14_ps(a);
+-#else
+-    const vfloat8 r = _mm256_rsqrt_ps(a);
+-#endif
+-
+-#if defined(__AVX2__)
+-    return _mm256_fmadd_ps(_mm256_set1_ps(1.5f), r,
+-                           _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(a, _mm256_set1_ps(-0.5f)), r), _mm256_mul_ps(r, r))); 
+-#else
+-    return _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(1.5f), r),
+-                         _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(a, _mm256_set1_ps(-0.5f)), r), _mm256_mul_ps(r, r)));
+-#endif
++    // Hardware approximations round differently on Intel and AMD; division and sqrt are IEEE-exact.
++    return _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_sqrt_ps(a));
+   }
+ 
+   ////////////////////////////////////////////////////////////////////////////////
