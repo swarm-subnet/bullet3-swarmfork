@@ -618,6 +618,17 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy)
 	return a;
 }
 
+void Model::buildMipmaps()
+{
+	if (m_diffuse && !m_diffuse->mipsBuilt_ && m_diffuse->img_.get_width() && m_diffuse->img_.get_height())
+		buildMips(*m_diffuse);
+}
+
+Vec3f Model::storedNormal(int iface, int nthvert) const
+{
+	return m_mesh->norms_[m_mesh->faces_[iface][nthvert][2]];
+}
+
 Vec3f Model::normal(Vec2f uvf)
 {
 	Vec2i uv(uvf[0] * normalmap_.get_width(), uvf[1] * normalmap_.get_height());
