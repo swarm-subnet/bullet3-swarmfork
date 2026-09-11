@@ -278,6 +278,9 @@ struct RequestPixelDataArgs
 	// The reply streams the cameras stacked as one image of height N*m_pixelHeight.
 	int m_numBatchCameras;
 	float m_batchViewMatrices[MAX_BATCH_CAMERAS - 1][16];
+	// sky painted where nothing is drawn: horizon colour at eye level, zenith colour straight up
+	float m_skyHorizonColor[3];
+	float m_skyZenithColor[3];
 };
 
 enum EnumRequestPixelDataUpdateFlags
@@ -294,6 +297,7 @@ enum EnumRequestPixelDataUpdateFlags
 	REQUEST_PIXEL_ARGS_HAS_FLAGS = 512,
 	REQUEST_PIXEL_ARGS_HAS_PROJECTIVE_TEXTURE_MATRICES = 1024,
 	REQUEST_PIXEL_ARGS_HAS_BATCH_CAMERAS = 2048,
+	REQUEST_PIXEL_ARGS_SET_SKY_COLOR = 4096,
 
 	//don't exceed (1<<15), because this enum is shared with EnumRenderer in SharedMemoryPublic.h
 
