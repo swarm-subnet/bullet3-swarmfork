@@ -5,6 +5,9 @@
 #include <string.h>
 #include <map>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "../../../TinyRenderer/TinyRenderer.h"
 #include "Bullet3Common/b3Logging.h"
@@ -14,6 +17,8 @@ namespace
 {
 // Embree reads vertices 16 bytes at a time, so every vertex block carries one spare slot.
 const size_t kVertexPadding = 4;
+// Side of the square pixel tiles that are dealt out to the render threads.
+const int kTileSize = 16;
 
 // A body that never moved since the first frame: its triangles sit in world space inside the one
 // static tree. When it moves later it is retired here and carries on as a mover instance.
@@ -915,55 +920,50 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
-}  // namespace
-
-void SwarmRaycast::render(const float viewMat[16], const float projMat[16], int width, int height,
-						  float* depthOut, int* segOut, const SwarmRaycastShading* shading, int threads) const
+// One camera resolved for the frame: its rays, plus the constant step to the pixel to the right and
+// the one above, which the texture footprint needs.
+struct CameraSetup
 {
-	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0)
-		return;
-	Camera cam;
-	if (!setupCamera(viewMat, projMat, cam))
-		return;
-	if (threads < 1)
-		threads = 1;
-	const bool filtered = shading && shading->m_textureFilter;
-	if (filtered)
-	{
-		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
-		for (std::map<TinyRenderObjectData*, ObjectState>::const_iterator it = m_data->m_objects.begin(); it != m_data->m_objects.end(); ++it)
-			it->first->m_model->buildMipmaps();
-	}
+	Camera m_cam;
+	float m_stepX[3];
+	float m_stepY[3];
+	bool m_valid;
+};
 
-	const std::vector<Instance*>* instances = &m_data->m_byGeomId;
-	const std::vector<StaticMember*>* members = &m_data->m_members;
-	const unsigned staticId = m_data->m_staticInstanceId;
-	RTCScene top = m_data->m_top;
-	// The unnormalised ray direction is affine in the pixel position, so the direction one pixel to
-	// the right or one row up is the pixel's own direction plus a constant step.
-	float stepX[3], stepY[3];
-	for (int i = 0; i < 3; i++)
-	{
-		stepX[i] = (float)((cam.m_far[1][i] - cam.m_near[1][i]) * (2.0 / (double)width));
-		stepY[i] = (float)((cam.m_far[2][i] - cam.m_near[2][i]) * (2.0 / (double)height));
-	}
+// Everything a thread needs to trace one tile; all of it is read-only during the frame.
+struct TileJob
+{
+	RTCScene m_top;
+	const std::vector<Instance*>* m_instances;
+	const std::vector<StaticMember*>* m_members;
+	const SwarmRaycastShading* m_shading;
+	unsigned m_staticId;
+	int m_width;
+	int m_height;
+	bool m_filtered;
+};
 
-#pragma omp parallel for schedule(static) num_threads(threads)
-	for (int row = 0; row < height; row++)
-	{
-		QueryContext ctx;
-		rtcInitRayQueryContext(&ctx.m_context);
-		ctx.m_instances = instances;
-		RTCIntersectArguments args;
-		rtcInitIntersectArguments(&args);
-		args.context = &ctx.m_context;
-		RTCOccludedArguments shadowArgs;
-		rtcInitOccludedArguments(&shadowArgs);
-		shadowArgs.context = &ctx.m_context;
+// Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
+// written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
+void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target,
+				int row0, int row1, int col0, int col1,
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
+{
+	const Camera& cam = setup.m_cam;
+	const SwarmRaycastShading* shading = job.m_shading;
+	const bool filtered = job.m_filtered;
+	const float* stepX = setup.m_stepX;
+	const float* stepY = setup.m_stepY;
+	float* depthOut = target.m_depth;
+	int* segOut = target.m_seg;
+	const int width = job.m_width;
+	const int height = job.m_height;
 
+	for (int row = row0; row < row1; row++)
+	{
 		// Output row `row` is TinyRenderer's raster row height - 1 - row, sampled at the integer pixel corner.
 		const double ndcY = 1.0 - (2.0 * row + 2.0) / (double)height;
-		for (int col = 0; col < width; col++)
+		for (int col = col0; col < col1; col++)
 		{
 			const double ndcX = (2.0 * col) / (double)width - 1.0;
 			float nearPoint[3], farPoint[3];
@@ -1000,7 +1000,7 @@ void SwarmRaycast::render(const float viewMat[16], const float projMat[16], int 
 			rayhit.ray.flags = 0;
 			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-			rtcIntersect1(top, &rayhit, &args);
+			rtcIntersect1(job.m_top, &rayhit, args);
 			if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 				continue;
 
@@ -1014,7 +1014,7 @@ void SwarmRaycast::render(const float viewMat[16], const float projMat[16], int 
 
 			int segmentation = -1;
 			HitSurface surface;
-			const bool known = resolveHit(rayhit.hit, staticId, *members, *instances, segmentation, shading ? &surface : 0);
+			const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, shading ? &surface : 0);
 			if (segOut)
 				segOut[offset] = segmentation;
 			if (!shading || !known)
@@ -1051,7 +1051,7 @@ void SwarmRaycast::render(const float viewMat[16], const float projMat[16], int 
 				ray.mask = (unsigned)-1;
 				ray.id = 0;
 				ray.flags = 0;
-				rtcOccluded1(top, &ray, &shadowArgs);
+				rtcOccluded1(job.m_top, &ray, shadowArgs);
 				// The same 0.8 floor TinyRenderer's shader applies where its shadow buffer says blocked.
 				shadow = (float)(0.8 + 0.2 * (ray.tfar >= 0.0f));
 			}
@@ -1078,7 +1078,89 @@ void SwarmRaycast::render(const float viewMat[16], const float projMat[16], int 
 				}
 			}
 
-			shadeHit(*shading, surface, rayhit.hit, faceNormal, shadow, filtered, duvdx, duvdy, shading->m_rgb + offset * 3);
+			shadeHit(*shading, surface, rayhit.hit, faceNormal, shadow, filtered, duvdx, duvdy, target.m_rgb + offset * 3);
+		}
+	}
+}
+}  // namespace
+
+void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
+						  const SwarmRaycastShading* shading, int threads) const
+{
+	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
+		return;
+	if (threads < 1)
+		threads = 1;
+
+	TileJob job;
+	job.m_top = m_data->m_top;
+	job.m_instances = &m_data->m_byGeomId;
+	job.m_members = &m_data->m_members;
+	job.m_shading = shading;
+	job.m_staticId = m_data->m_staticInstanceId;
+	job.m_width = width;
+	job.m_height = height;
+	job.m_filtered = shading && shading->m_textureFilter;
+	if (job.m_filtered)
+	{
+		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
+		for (std::map<TinyRenderObjectData*, ObjectState>::const_iterator it = m_data->m_objects.begin(); it != m_data->m_objects.end(); ++it)
+			it->first->m_model->buildMipmaps();
+	}
+
+	std::vector<CameraSetup> setups((size_t)numTargets);
+	for (int i = 0; i < numTargets; i++)
+	{
+		CameraSetup& setup = setups[(size_t)i];
+		setup.m_valid = setupCamera(targets[i].m_view, projMat, setup.m_cam);
+		if (!setup.m_valid)
+			continue;
+		// The unnormalised ray direction is affine in the pixel position, so the direction one pixel to
+		// the right or one row up is the pixel's own direction plus a constant step.
+		for (int k = 0; k < 3; k++)
+		{
+			setup.m_stepX[k] = (float)((setup.m_cam.m_far[1][k] - setup.m_cam.m_near[1][k]) * (2.0 / (double)width));
+			setup.m_stepY[k] = (float)((setup.m_cam.m_far[2][k] - setup.m_cam.m_near[2][k]) * (2.0 / (double)height));
+		}
+	}
+
+	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera
+	// whatever the thread count, and thread t traces tiles t, t + threads, t + 2 threads, ...
+	const int tilesX = (width + kTileSize - 1) / kTileSize;
+	const int tilesY = (height + kTileSize - 1) / kTileSize;
+	const int tilesPerCamera = tilesX * tilesY;
+	const int numTiles = tilesPerCamera * numTargets;
+
+#pragma omp parallel num_threads(threads)
+	{
+#ifdef _OPENMP
+		const int tid = omp_get_thread_num();
+		const int cnt = omp_get_num_threads();
+#else
+		const int tid = 0;
+		const int cnt = 1;
+#endif
+		QueryContext ctx;
+		rtcInitRayQueryContext(&ctx.m_context);
+		ctx.m_instances = job.m_instances;
+		RTCIntersectArguments args;
+		rtcInitIntersectArguments(&args);
+		args.context = &ctx.m_context;
+		RTCOccludedArguments shadowArgs;
+		rtcInitOccludedArguments(&shadowArgs);
+		shadowArgs.context = &ctx.m_context;
+
+		for (int tile = tid; tile < numTiles; tile += cnt)
+		{
+			const int camIndex = tile / tilesPerCamera;
+			if (!setups[(size_t)camIndex].m_valid)
+				continue;
+			const int local = tile - camIndex * tilesPerCamera;
+			const int row0 = (local / tilesX) * kTileSize;
+			const int col0 = (local % tilesX) * kTileSize;
+			const int row1 = row0 + kTileSize < height ? row0 + kTileSize : height;
+			const int col1 = col0 + kTileSize < width ? col0 + kTileSize : width;
+			renderTile(job, setups[(size_t)camIndex], targets[camIndex], row0, row1, col0, col1, &args, &shadowArgs);
 		}
 	}
 }

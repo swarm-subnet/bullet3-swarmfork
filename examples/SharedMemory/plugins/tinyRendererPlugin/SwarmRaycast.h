@@ -18,7 +18,6 @@ struct SwarmRaycastShading
 	// wound; a body hidden by a zero alpha lets the light through and so casts no shadow.
 	bool m_shadow;
 	bool m_textureFilter;  // bilinear and mipmapped texture reads instead of the nearest texel
-	unsigned char* m_rgb;  // width * height * 3 bytes, rows in output order; only hit pixels are written
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh
@@ -38,11 +37,26 @@ public:
 	void removeAll();
 	// Rebuilds the top-level tree after a batch of sync calls.
 	void commit();
+
+	// One camera of a render: its view matrix and the buffers it writes. m_seg may be null, and m_rgb
+	// may be null only on a render with no shading; it is width * height * 3 bytes, rows in output
+	// order, and only hit pixels are written.
+	struct Target
+	{
+		const float* m_view;
+		float* m_depth;
+		int* m_seg;
+		unsigned char* m_rgb;
+	};
+
 	// One ray per pixel at the pixel corner, like TinyRenderer, rows already in output order. A hit
-	// writes -z_clip into depthOut, objectIndex + ((linkIndex + 1) << 24) into segOut when given,
-	// and the shaded colour into shading->m_rgb when shading is given.
-	void render(const float viewMat[16], const float projMat[16], int width, int height,
-				float* depthOut, int* segOut, const SwarmRaycastShading* shading, int threads) const;
+	// writes -z_clip into m_depth, objectIndex + ((linkIndex + 1) << 24) into m_seg when given,
+	// and the shaded colour into m_rgb when shading is given.
+	// Every camera shares projMat, the frame size and the light. The pixels of all cameras are cut
+	// into fixed tiles before the frame starts and tile k always goes to thread k mod threads, so the
+	// bytes never depend on the thread count or on the order threads finish.
+	void render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
+				const SwarmRaycastShading* shading, int threads) const;
 
 private:
 	struct Data;

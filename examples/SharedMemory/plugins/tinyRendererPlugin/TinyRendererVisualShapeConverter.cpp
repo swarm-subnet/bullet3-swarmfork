@@ -1483,14 +1483,20 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 	{
 #ifdef SWARM_RAYCAST
 		const SwarmRaycast& raycast = m_data->syncRaycast();
-#pragma omp parallel for num_threads(renderThreads) schedule(dynamic, 1) if(renderThreads > 1 && numCameras > 1)
+		// All cameras go into one tile schedule, so the threads share the whole batch, not one camera each.
+		btAlignedObjectArray<SwarmRaycast::Target> targets;
+		targets.resize(numCameras);
 		for (int cam = 0; cam < numCameras; cam++)
 		{
 			float* zbuf = &m_data->m_batchDepthBuffers[cam][0];
 			for (int i = 0; i < numPixels; i++)
 				zbuf[i] = -farVal;
-			raycast.render(&viewMatrices[cam * 16], projMat, width, height, zbuf, 0, 0, renderThreads);
+			targets[cam].m_view = &viewMatrices[cam * 16];
+			targets[cam].m_depth = zbuf;
+			targets[cam].m_seg = 0;
+			targets[cam].m_rgb = 0;
 		}
+		raycast.render(&targets[0], numCameras, projMat, width, height, 0, renderThreads);
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif
@@ -1725,10 +1731,12 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_specularCoeff = lightSpecularCoeff;
 		shading.m_shadow = m_data->m_hasShadow;
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
-		shading.m_rgb = m_data->m_rgbColorBuffer.buffer();
-		m_data->syncRaycast().render(viewMat, projMat, m_data->m_swWidth, m_data->m_swHeight,
-									 numPixels ? &m_data->m_depthBuffer[0] : 0,
-									 (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0],
+		SwarmRaycast::Target target;
+		target.m_view = viewMat;
+		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
+		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
+		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
+		m_data->syncRaycast().render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
 									 b3GetSwarmRenderThreads());
 #else
