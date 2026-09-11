@@ -54,6 +54,8 @@ public:
 	int nfaces();
 
 	Vec3f normal(int iface, int nthvert);
+	// The stored corner normal as loaded, read without writing back to the shared array.
+	Vec3f storedNormal(int iface, int nthvert) const;
 	Vec3f normal(Vec2f uv);
 	Vec3f vert(int i);
 	Vec3f vert(int iface, int nthvert);
@@ -65,6 +67,8 @@ public:
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
 	TGAColor diffuseFiltered(Vec2f uv, Vec2f duvdx, Vec2f duvdy);
+	// Builds the mip chain now, so later diffuseFiltered calls only read; safe to call from many threads after this.
+	void buildMipmaps();
 	float specular(Vec2f uv);
 	std::vector<int> face(int idx);
 };

@@ -1489,7 +1489,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 			float* zbuf = &m_data->m_batchDepthBuffers[cam][0];
 			for (int i = 0; i < numPixels; i++)
 				zbuf[i] = -farVal;
-			raycast.renderDepth(&viewMatrices[cam * 16], projMat, width, height, zbuf, 0, renderThreads);
+			raycast.render(&viewMatrices[cam * 16], projMat, width, height, zbuf, 0, 0, renderThreads);
 		}
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
@@ -1705,14 +1705,32 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
-		// Depth and segmentation come from the ray caster, already in output row order; colour stays cleared.
+		// Depth, segmentation and colour come from the ray caster, already in output row order; a
+		// pixel that hits nothing keeps what clearBuffers left in it.
 #ifdef SWARM_RAYCAST
 		const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
 		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
-		m_data->syncRaycast().renderDepth(viewMat, projMat, m_data->m_swWidth, m_data->m_swHeight,
-										  numPixels ? &m_data->m_depthBuffer[0] : 0,
-										  (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0],
-										  b3GetSwarmRenderThreads());
+		// The sky is painted for the flip the rasterised path does once it has drawn; this path
+		// writes its rows the right way up and never flips, so the sky is turned over here.
+		if (m_data->m_hasSky && !depthOnly)
+			m_data->m_rgbColorBuffer.flip_vertically();
+		SwarmRaycastShading shading;
+		for (int i = 0; i < 3; i++)
+		{
+			shading.m_lightDir[i] = (float)lightDirWorld[i];
+			shading.m_lightColor[i] = (float)lightColor[i];
+		}
+		shading.m_ambientCoeff = lightAmbientCoeff;
+		shading.m_diffuseCoeff = lightDiffuseCoeff;
+		shading.m_specularCoeff = lightSpecularCoeff;
+		shading.m_shadow = m_data->m_hasShadow;
+		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
+		shading.m_rgb = m_data->m_rgbColorBuffer.buffer();
+		m_data->syncRaycast().render(viewMat, projMat, m_data->m_swWidth, m_data->m_swHeight,
+									 numPixels ? &m_data->m_depthBuffer[0] : 0,
+									 (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0],
+									 (depthOnly || !numPixels) ? 0 : &shading,
+									 b3GetSwarmRenderThreads());
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif

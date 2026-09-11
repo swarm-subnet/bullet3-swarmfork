@@ -881,7 +881,7 @@ enum EnumRendererAuxFlags
 	ER_NO_SEGMENTATION_MASK = 4,
 	ER_DEPTH_ONLY = 8,
 	ER_TEXTURE_FILTER = 16,  // bilinear + mipmapped texture sampling on the software colour path
-	// Ray-cast depth and segmentation through the Embree backend beside TinyRenderer; colour stays cleared.
+	// Depth, segmentation and shaded colour through the Embree ray-cast backend beside TinyRenderer.
 	ER_SWARM_RAYCAST = 32,
 };
 
