@@ -951,6 +951,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 
 			bool doubleSided = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY) != 0;
 			bool materialsFromMtl = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_MATERIALS_FROM_MTL) != 0;
+			bool renderTreeCache = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_TREE_CACHE) != 0;
 			btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 			{
 				B3_PROFILE("convertURDFToVisualShape");
@@ -1025,6 +1026,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 
 					TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 					tinyObj->m_doubleSided = doubleSided;
+					tinyObj->m_renderTreeCache = renderTreeCache;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
 						group.m_textureImage, group.m_textureWidth, group.m_textureHeight);
 					visuals->m_renderObjects.push_back(tinyObj);
@@ -1048,6 +1050,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			{
 				TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 				tinyObj->m_doubleSided = doubleSided;
+				tinyObj->m_renderTreeCache = renderTreeCache;
 				unsigned char* textureImage1 = 0;
 				int textureWidth = 0;
 				int textureHeight = 0;

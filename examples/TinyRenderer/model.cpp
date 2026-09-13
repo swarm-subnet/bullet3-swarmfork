@@ -418,6 +418,11 @@ int Model::nfaces()
 	return (int)m_mesh->faces_.size();
 }
 
+unsigned long long Model::meshHash() const
+{
+	return m_mesh->hash_;
+}
+
 std::vector<int> Model::face(int idx)
 {
 	std::vector<int> face;

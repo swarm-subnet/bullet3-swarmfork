@@ -55,6 +55,7 @@ struct TinyRenderObjectData
 	int m_linkIndex;
 	bool m_doubleSided;
 	bool m_textureFilter;  // ER_TEXTURE_FILTER: bilinear + mipmap sampling instead of nearest texel
+	bool m_renderTreeCache;  // VISUAL_SHAPE_RENDER_TREE_CACHE: the ray-cast tree of this static body is kept on disk
 
 	btVector3 m_localAABBMin;
 	btVector3 m_localAABBMax;

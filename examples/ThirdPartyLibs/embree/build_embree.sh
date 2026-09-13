@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds Embree 4.4.1 as static libraries for the ray-cast depth backend: one AVX2 code path, no runtime
 # dispatch, every hardware reciprocal replaced by IEEE division (exact_division.patch), single-threaded
-# tree builds. Output lands in prefix/ next to this script; setup.py runs it when that folder is missing.
+# tree builds, and a built tree saved and loaded as one image (tree_cache.patch). Output lands in
+# prefix/ next to this script; setup.py runs it when that folder is missing.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +33,7 @@ rm -rf "${SOURCE_DIR}" "${BUILD_DIR}" "${PREFIX_DIR}"
 mkdir -p "${SOURCE_DIR}"
 tar -xzf "${ARCHIVE}" --strip-components=1 -C "${SOURCE_DIR}"
 patch -d "${SOURCE_DIR}" -p1 --quiet < "${SCRIPT_DIR}/exact_division.patch"
+patch -d "${SOURCE_DIR}" -p1 --quiet < "${SCRIPT_DIR}/tree_cache.patch"
 
 # The patch must leave no approximate reciprocal or inverse square root in any code that gets compiled.
 if grep -rnE '_mm(256|512)?_(rcp14|rsqrt14|rcp|rsqrt)_[sp]s' --include='*.h' --include='*.cpp' \
