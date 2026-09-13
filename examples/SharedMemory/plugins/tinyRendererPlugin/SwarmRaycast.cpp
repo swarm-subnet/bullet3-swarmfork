@@ -19,6 +19,51 @@ namespace
 const size_t kVertexPadding = 4;
 // Side of the square pixel tiles that are dealt out to the render threads.
 const int kTileSize = 16;
+// The shadow map never exceeds this many cells a side, and a cell is never smaller than this: a small
+// scene builds fast and a large one keeps a bounded map.
+const int kShadowMapMaxCells = 4096;
+const float kShadowMapMinCell = 0.005f;
+
+inline float dot3(const float a[3], const float b[3])
+{
+	return (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2];
+}
+
+inline void cross3(const float a[3], const float b[3], float out[3])
+{
+	out[0] = a[1] * b[2] - a[2] * b[1];
+	out[1] = a[2] * b[0] - a[0] * b[2];
+	out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+// Scales to unit length the way TinyRenderer's vectors do, by one reciprocal; a zero vector stays zero.
+inline void normalize3(float v[3])
+{
+	const float length = sqrtf(dot3(v, v));
+	if (length > 0.0f)
+	{
+		const float inv = 1.0f / length;
+		for (int i = 0; i < 3; i++)
+			v[i] *= inv;
+	}
+}
+
+// The light's view of the static tree: a grid laid across the map at right angles to the light, and
+// for each cell how far a ray from the light side travels before it meets a drawn surface.
+struct ShadowMap
+{
+	float m_lightDir[3];
+	// Unit grid axes, both at right angles to the light, and the world corner of cell (0, 0) on the
+	// plane the rays start from.
+	float m_axisU[3];
+	float m_axisV[3];
+	float m_origin[3];
+	float m_cell;
+	int m_cols;
+	int m_rows;
+	std::vector<float> m_depth;  // INFINITY where the ray met nothing
+	bool m_built;
+};
 
 // A body that never moved since the first frame: its triangles sit in world space inside the one
 // static tree. When it moves later it is retired here and carries on as a mover instance.
@@ -82,6 +127,8 @@ struct QueryContext
 {
 	RTCRayQueryContext m_context;
 	const std::vector<Instance*>* m_instances;
+	// Set for the rays that build the shadow map: any drawn face stops them, like a shadow ray.
+	bool m_anyWinding;
 };
 
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
@@ -93,15 +140,15 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		return;
 	const RTCHit* hit = (const RTCHit*)args->hit;
 	const RTCRay* ray = (const RTCRay*)args->ray;
+	const QueryContext* ctx = (const QueryContext*)args->context;
 	const float facing = hit->Ng_x * ray->dir_x + hit->Ng_y * ray->dir_y + hit->Ng_z * ray->dir_z;
 	if (args->geometryUserPtr)
 	{
 		const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
-		if (member->m_retired || !member->m_visible || (!member->m_doubleSided && facing >= 0.0f))
+		if (member->m_retired || !member->m_visible || (!member->m_doubleSided && !ctx->m_anyWinding && facing >= 0.0f))
 			args->valid[0] = 0;
 		return;
 	}
-	const QueryContext* ctx = (const QueryContext*)args->context;
 	const unsigned instId = hit->instID[0];
 	if (instId == RTC_INVALID_GEOMETRY_ID || instId >= ctx->m_instances->size())
 		return;
@@ -387,6 +434,149 @@ struct SwarmRaycast::Data
 	std::vector<Instance*> m_byGeomId;
 	std::vector<unsigned> m_freeGeomIds;
 	std::map<TinyRenderObjectData*, ObjectState> m_objects;
+	ShadowMap m_shadowMap;
+	// Static members whose shadow changed since the map was cast: retired, hidden or shown again.
+	std::vector<StaticMember*> m_shadowDirty;
+
+	void shadowChanged(StaticMember* member)
+	{
+		if (m_shadowMap.m_built)
+			m_shadowDirty.push_back(member);
+	}
+
+	// Casts the cells [col0, col1) x [row0, row1) of the shadow map from the start plane along -light
+	// into the static tree. Each cell is written by exactly one ray, so the thread count cannot change
+	// the bytes.
+	void castShadowCells(int col0, int col1, int row0, int row1, int threads)
+	{
+		ShadowMap& map = m_shadowMap;
+		const float dir[3] = {-map.m_lightDir[0], -map.m_lightDir[1], -map.m_lightDir[2]};
+#pragma omp parallel for num_threads(threads) schedule(static)
+		for (int row = row0; row < row1; row++)
+		{
+			QueryContext ctx;
+			rtcInitRayQueryContext(&ctx.m_context);
+			ctx.m_instances = 0;
+			ctx.m_anyWinding = true;
+			RTCIntersectArguments args;
+			rtcInitIntersectArguments(&args);
+			args.context = &ctx.m_context;
+			const float v = ((float)row + 0.5f) * map.m_cell;
+			for (int col = col0; col < col1; col++)
+			{
+				const float u = ((float)col + 0.5f) * map.m_cell;
+				RTCRayHit rayhit;
+				rayhit.ray.org_x = map.m_origin[0] + map.m_axisU[0] * u + map.m_axisV[0] * v;
+				rayhit.ray.org_y = map.m_origin[1] + map.m_axisU[1] * u + map.m_axisV[1] * v;
+				rayhit.ray.org_z = map.m_origin[2] + map.m_axisU[2] * u + map.m_axisV[2] * v;
+				rayhit.ray.dir_x = dir[0];
+				rayhit.ray.dir_y = dir[1];
+				rayhit.ray.dir_z = dir[2];
+				rayhit.ray.tnear = 0.0f;
+				rayhit.ray.tfar = INFINITY;
+				rayhit.ray.time = 0.0f;
+				rayhit.ray.mask = (unsigned)-1;
+				rayhit.ray.id = 0;
+				rayhit.ray.flags = 0;
+				rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+				rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+				rtcIntersect1(m_static, &rayhit, &args);
+				map.m_depth[(size_t)row * map.m_cols + col] = rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID ? INFINITY : rayhit.ray.tfar;
+			}
+		}
+	}
+
+	// Lays the grid over the bounds of the static tree for this light, then casts every cell.
+	void buildShadowMap(const float lightDir[3], int threads)
+	{
+		ShadowMap& map = m_shadowMap;
+		map.m_built = false;
+		std::vector<float>().swap(map.m_depth);
+		m_shadowDirty.clear();
+		RTCBounds bounds;
+		rtcGetSceneBounds(m_static, &bounds);
+		if (!(bounds.lower_x <= bounds.upper_x))
+			return;
+		for (int i = 0; i < 3; i++)
+			map.m_lightDir[i] = lightDir[i];
+		// The grid axes come from the world axis furthest from the light, so they are never degenerate.
+		const bool steep = fabsf(lightDir[2]) >= 0.9f;
+		const float helper[3] = {steep ? 1.0f : 0.0f, 0.0f, steep ? 0.0f : 1.0f};
+		cross3(helper, lightDir, map.m_axisU);
+		normalize3(map.m_axisU);
+		cross3(lightDir, map.m_axisU, map.m_axisV);
+		normalize3(map.m_axisV);
+		if (dot3(map.m_axisU, map.m_axisU) == 0.0f || dot3(map.m_axisV, map.m_axisV) == 0.0f)
+			return;
+		// Extent of the eight corners of the bounds along the two axes, and the far edge along the light.
+		float uMin = INFINITY, uMax = -INFINITY, vMin = INFINITY, vMax = -INFINITY, lMax = -INFINITY;
+		for (int c = 0; c < 8; c++)
+		{
+			const float corner[3] = {(c & 1) ? bounds.upper_x : bounds.lower_x,
+									 (c & 2) ? bounds.upper_y : bounds.lower_y,
+									 (c & 4) ? bounds.upper_z : bounds.lower_z};
+			const float u = dot3(corner, map.m_axisU), v = dot3(corner, map.m_axisV), l = dot3(corner, lightDir);
+			uMin = u < uMin ? u : uMin;
+			uMax = u > uMax ? u : uMax;
+			vMin = v < vMin ? v : vMin;
+			vMax = v > vMax ? v : vMax;
+			lMax = l > lMax ? l : lMax;
+		}
+		const float extent = (uMax - uMin) > (vMax - vMin) ? (uMax - uMin) : (vMax - vMin);
+		float cell = extent / (float)kShadowMapMaxCells;
+		if (cell < kShadowMapMinCell)
+			cell = kShadowMapMinCell;
+		map.m_cell = cell;
+		// One spare cell of margin on every side; the rays start one cell beyond the light-side edge.
+		map.m_cols = (int)((uMax - uMin) / cell) + 3;
+		map.m_rows = (int)((vMax - vMin) / cell) + 3;
+		for (int i = 0; i < 3; i++)
+			map.m_origin[i] = (map.m_axisU[i] * (uMin - cell) + map.m_axisV[i] * (vMin - cell)) + lightDir[i] * (lMax + cell);
+		map.m_depth.assign((size_t)map.m_cols * map.m_rows, INFINITY);
+		castShadowCells(0, map.m_cols, 0, map.m_rows, threads);
+		map.m_built = true;
+	}
+
+	// Recasts the cells under one member's vertices, one cell wider on every side.
+	void recastMember(const StaticMember* member, int threads)
+	{
+		const ShadowMap& map = m_shadowMap;
+		float uMin = INFINITY, uMax = -INFINITY, vMin = INFINITY, vMax = -INFINITY;
+		const size_t numVerts = (member->m_vertices.size() - kVertexPadding) / 3;
+		for (size_t i = 0; i < numVerts; i++)
+		{
+			float rel[3];
+			for (int k = 0; k < 3; k++)
+				rel[k] = member->m_vertices[i * 3 + k] - map.m_origin[k];
+			const float u = dot3(rel, map.m_axisU) / map.m_cell, v = dot3(rel, map.m_axisV) / map.m_cell;
+			uMin = u < uMin ? u : uMin;
+			uMax = u > uMax ? u : uMax;
+			vMin = v < vMin ? v : vMin;
+			vMax = v > vMax ? v : vMax;
+		}
+		if (!(uMin <= uMax) || !(vMin <= vMax))
+			return;
+		const int col0 = uMin < 1.0f ? 0 : (int)uMin - 1;
+		const int row0 = vMin < 1.0f ? 0 : (int)vMin - 1;
+		const int col1 = uMax + 2.0f >= (float)map.m_cols ? map.m_cols : (int)uMax + 2;
+		const int row1 = vMax + 2.0f >= (float)map.m_rows ? map.m_rows : (int)vMax + 2;
+		if (col0 < col1 && row0 < row1)
+			castShadowCells(col0, col1, row0, row1, threads);
+	}
+
+	// Brings the map up to date for this light: cast in full when there is none or the light moved,
+	// otherwise only under the members that changed since.
+	void prepareShadowMap(const float lightDir[3], int threads)
+	{
+		if (!m_shadowMap.m_built || memcmp(m_shadowMap.m_lightDir, lightDir, sizeof(m_shadowMap.m_lightDir)) != 0)
+		{
+			buildShadowMap(lightDir, threads);
+			return;
+		}
+		for (size_t i = 0; i < m_shadowDirty.size(); i++)
+			recastMember(m_shadowDirty[i], threads);
+		m_shadowDirty.clear();
+	}
 
 	void createStaticScene()
 	{
@@ -570,6 +760,9 @@ struct SwarmRaycast::Data
 
 	void releaseStatic()
 	{
+		m_shadowMap.m_built = false;
+		std::vector<float>().swap(m_shadowMap.m_depth);
+		m_shadowDirty.clear();
 		for (size_t i = 0; i < m_members.size(); i++)
 		{
 			rtcReleaseGeometry(m_members[i]->m_geometry);
@@ -594,6 +787,7 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_staticInstanceId = 0;
 	m_data->m_staticBuilt = false;
 	m_data->m_topDirty = false;
+	m_data->m_shadowMap.m_built = false;
 	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
 	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
 	if (!m_data->m_device)
@@ -643,6 +837,8 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		const bool moved = memcmp(transform, member->m_transform, sizeof(transform)) != 0 || member->m_meshKey != model->meshKey();
 		if (!moved)
 		{
+			if (member->m_visible != visible)
+				m_data->shadowChanged(member);
 			member->m_visible = visible;
 			member->m_doubleSided = doubleSided;
 			member->m_segmentation = segmentation;
@@ -650,6 +846,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		}
 		// The static tree stays as built; the hit filter ignores this member from now on.
 		member->m_retired = true;
+		m_data->shadowChanged(member);
 	}
 	else if (!member && !m_data->m_staticBuilt)
 	{
@@ -686,7 +883,10 @@ void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)
 	ObjectState state = found->second;
 	m_data->m_objects.erase(found);
 	if (state.m_member)
+	{
 		state.m_member->m_retired = true;
+		m_data->shadowChanged(state.m_member);
+	}
 	if (state.m_instance)
 		m_data->dropInstance(state.m_instance);
 }
@@ -742,28 +942,27 @@ struct HitSurface
 // Shadow rays start this far off the surface, along the face normal, so a surface never shades itself.
 const float kShadowBias = 1e-3f;
 
-inline float dot3(const float a[3], const float b[3])
+// Whether the light's view of the static tree has a surface in front of `point`. A face turned away
+// from the light is in its own shadow, as the shadow ray finds when it crosses the face it left. On a
+// face turned towards it, the point is moved one cell along its normal and the stored depth gets one
+// cell of slack, so a lit surface never shadows itself through the coarseness of the grid. Outside
+// the grid, where the ray met nothing, or with no map at all, the point is lit.
+inline bool shadowMapBlocked(const ShadowMap& map, const float point[3], const float unitNormal[3])
 {
-	return (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2];
-}
-
-inline void cross3(const float a[3], const float b[3], float out[3])
-{
-	out[0] = a[1] * b[2] - a[2] * b[1];
-	out[1] = a[2] * b[0] - a[0] * b[2];
-	out[2] = a[0] * b[1] - a[1] * b[0];
-}
-
-// Scales to unit length the way TinyRenderer's vectors do, by one reciprocal; a zero vector stays zero.
-inline void normalize3(float v[3])
-{
-	const float length = sqrtf(dot3(v, v));
-	if (length > 0.0f)
-	{
-		const float inv = 1.0f / length;
-		for (int i = 0; i < 3; i++)
-			v[i] *= inv;
-	}
+	if (!map.m_built)
+		return false;
+	if (dot3(unitNormal, map.m_lightDir) <= 0.0f)
+		return true;
+	float rel[3];
+	for (int i = 0; i < 3; i++)
+		rel[i] = (point[i] + unitNormal[i] * map.m_cell) - map.m_origin[i];
+	const float u = dot3(rel, map.m_axisU) / map.m_cell;
+	const float v = dot3(rel, map.m_axisV) / map.m_cell;
+	if (!(u >= 0.0f) || !(v >= 0.0f) || u >= (float)map.m_cols || v >= (float)map.m_rows)
+		return false;
+	// Distance from the start plane along the ray direction, which is -light.
+	const float depth = -dot3(rel, map.m_lightDir);
+	return depth > map.m_depth[(size_t)(int)v * map.m_cols + (int)u] + map.m_cell;
 }
 
 // Column-major 4x4 times (v, 1), the same accumulation order as copyWorldVertices.
@@ -937,6 +1136,8 @@ struct TileJob
 	const std::vector<Instance*>* m_instances;
 	const std::vector<StaticMember*>* m_members;
 	const SwarmRaycastShading* m_shading;
+	// The light's view of the static tree when the shadow comes from the map; null for shadow rays.
+	const ShadowMap* m_shadowMap;
 	unsigned m_staticId;
 	int m_width;
 	int m_height;
@@ -1034,7 +1235,14 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
 
 			float shadow = 1.0f;
-			if (shading->m_shadow)
+			if (shading->m_shadow && job.m_shadowMap)
+			{
+				float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+				normalize3(unitNormal);
+				const float point[3] = {hx, hy, hz};
+				shadow = (float)(0.8 + 0.2 * !shadowMapBlocked(*job.m_shadowMap, point, unitNormal));
+			}
+			else if (shading->m_shadow)
 			{
 				float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 				normalize3(unitNormal);
@@ -1101,6 +1309,13 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_width = width;
 	job.m_height = height;
 	job.m_filtered = shading && shading->m_textureFilter;
+	// The map is cast on the calling thread's schedule before the pixel loop, which then only reads it.
+	job.m_shadowMap = 0;
+	if (shading && shading->m_shadow && shading->m_shadowMap)
+	{
+		m_data->prepareShadowMap(shading->m_lightDir, threads);
+		job.m_shadowMap = &m_data->m_shadowMap;
+	}
 	if (job.m_filtered)
 	{
 		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
@@ -1143,6 +1358,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		QueryContext ctx;
 		rtcInitRayQueryContext(&ctx.m_context);
 		ctx.m_instances = job.m_instances;
+		ctx.m_anyWinding = false;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;

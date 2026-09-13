@@ -17,6 +17,10 @@ struct SwarmRaycastShading
 	// One occlusion ray towards the light per hit. Any drawn surface stops it, whichever way it is
 	// wound; a body hidden by a zero alpha lets the light through and so casts no shadow.
 	bool m_shadow;
+	// With m_shadow: the light's view of the static bodies is cast once into a depth grid and each hit
+	// looks itself up there instead of casting a ray. The grid is rebuilt when the light direction
+	// changes; a body that moves or is hidden has only its own cells recast. Movers cast no shadow.
+	bool m_shadowMap;
 	bool m_textureFilter;  // bilinear and mipmapped texture reads instead of the nearest texel
 };
 

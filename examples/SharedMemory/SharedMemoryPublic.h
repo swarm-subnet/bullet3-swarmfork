@@ -883,6 +883,9 @@ enum EnumRendererAuxFlags
 	ER_TEXTURE_FILTER = 16,  // bilinear + mipmapped texture sampling on the software colour path
 	// Depth, segmentation and shaded colour through the Embree ray-cast backend beside TinyRenderer.
 	ER_SWARM_RAYCAST = 32,
+	// With shadow=1 on the ray-cast path: sun shadows read from a map cast once per light direction
+	// over the static bodies, instead of one shadow ray per pixel per frame.
+	ER_SWARM_SHADOW_MAP = 64,
 };
 
 ///flags to pick the IK solver and other options
