@@ -891,6 +891,9 @@ enum EnumRendererAuxFlags
 	ER_SWARM_MOVER_SHADOW = 128,
 	// Exact triangle coverage on every pixel that sits on an object or depth edge, colour only, on the ray-cast path.
 	ER_EDGE_ANTIALIAS = 256,
+	// On the ray-cast path a hit on a texel whose alpha is below the cut-out threshold is a miss and
+	// the ray carries on, in colour, depth and shadow alike.
+	ER_ALPHA_CUTOUT = 512,
 };
 
 ///flags to pick the IK solver and other options

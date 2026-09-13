@@ -23,6 +23,8 @@ const int kTileSize = 16;
 // scene builds fast and a large one keeps a bounded map.
 const int kShadowMapMaxCells = 4096;
 const float kShadowMapMinCell = 0.005f;
+// A texel with alpha below this is a hole when cut-outs are on.
+const unsigned char kAlphaCutoff = 128;
 
 inline float dot3(const float a[3], const float b[3])
 {
@@ -63,6 +65,8 @@ struct ShadowMap
 	int m_rows;
 	std::vector<float> m_depth;  // INFINITY where the ray met nothing
 	bool m_built;
+	// Whether the cells were cast with cut-outs on; the map is recast when a frame asks for the other.
+	bool m_alphaCutout;
 };
 
 // A body that never moved since the first frame: its triangles sit in world space inside the one
@@ -84,6 +88,8 @@ struct StaticMember
 	bool m_doubleSided;
 	bool m_visible;
 	bool m_retired;
+	// The texture carries an alpha plane, so hits may be cut out.
+	bool m_hasAlpha;
 	int m_segmentation;
 };
 
@@ -114,6 +120,7 @@ struct Instance
 	float m_rotation[9];
 	bool m_enabled;
 	bool m_doubleSided;
+	bool m_hasAlpha;
 	// Sign of the instance determinant: a mirroring scale flips which side of a face is the front.
 	float m_facingSign;
 	int m_segmentation;
@@ -131,11 +138,37 @@ struct QueryContext
 	const std::vector<Instance*>* m_instances;
 	// Set for the rays that build the shadow map: any drawn face stops them, like a shadow ray.
 	bool m_anyWinding;
+	bool m_alphaCutout;
 };
+
+// True when the hit lands on a texel the texture marks as see-through. The uv is accumulated in the
+// same order as the shader, so the texel tested here is the texel the colour would read.
+bool cutOut(const TinyRender::Model* model, const std::vector<float>& uvs, const std::vector<unsigned>& indices, const RTCHit* hit)
+{
+	const unsigned* ids = &indices[(size_t)hit->primID * 3];
+	const float weights[3] = {1.0f - hit->u - hit->v, hit->u, hit->v};
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	for (int j = 0; j < 3; j++)
+	{
+		uv.x += uvs[(size_t)ids[j] * 2] * weights[j];
+		uv.y += uvs[(size_t)ids[j] * 2 + 1] * weights[j];
+	}
+	return model->alpha(uv) < kAlphaCutoff;
+}
+
+// The instance a hit belongs to, or null for the static tree and for an id the scene does not know.
+const Instance* hitInstance(const QueryContext* ctx, const RTCHit* hit)
+{
+	const unsigned instId = hit->instID[0];
+	if (instId == RTC_INVALID_GEOMETRY_ID || instId >= ctx->m_instances->size())
+		return 0;
+	return (*ctx->m_instances)[instId];
+}
 
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
 // filter does the same in object space, where Embree hands over both the ray and the hit. Static
 // members also drop out here when retired or fully transparent, so the static tree is never rebuilt.
+// With cut-outs on, a hit on a see-through texel drops out too and the ray carries on behind it.
 void hitFilter(const RTCFilterFunctionNArguments* args)
 {
 	if (args->N != 1)
@@ -149,25 +182,40 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
 		if (member->m_retired || !member->m_visible || (!member->m_doubleSided && !ctx->m_anyWinding && facing >= 0.0f))
 			args->valid[0] = 0;
+		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
+			args->valid[0] = 0;
 		return;
 	}
-	const unsigned instId = hit->instID[0];
-	if (instId == RTC_INVALID_GEOMETRY_ID || instId >= ctx->m_instances->size())
+	const Instance* inst = hitInstance(ctx, hit);
+	if (!inst)
 		return;
-	const Instance* inst = (*ctx->m_instances)[instId];
-	if (inst && !inst->m_doubleSided && facing * inst->m_facingSign >= 0.0f)
+	if (!inst->m_doubleSided && facing * inst->m_facingSign >= 0.0f)
+		args->valid[0] = 0;
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs, inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
 }
 
 // A shadow ray is stopped by any surface it meets, whichever way that surface is wound: a single-sided
 // roof hides the sun from the ground even though the camera would see through its underside. Only the
-// bodies that are not drawn at all, retired static members and fully transparent ones, let light past.
+// bodies that are not drawn at all, retired static members and fully transparent ones, let light past,
+// and so does a see-through texel when cut-outs are on.
 void shadowFilter(const RTCFilterFunctionNArguments* args)
 {
-	if (args->N != 1 || !args->geometryUserPtr)
+	if (args->N != 1)
 		return;
-	const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
-	if (member->m_retired || !member->m_visible)
+	const RTCHit* hit = (const RTCHit*)args->hit;
+	const QueryContext* ctx = (const QueryContext*)args->context;
+	if (args->geometryUserPtr)
+	{
+		const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
+		if (member->m_retired || !member->m_visible)
+			args->valid[0] = 0;
+		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
+			args->valid[0] = 0;
+		return;
+	}
+	const Instance* inst = hitInstance(ctx, hit);
+	if (inst && inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs, inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
 }
 
@@ -466,6 +514,7 @@ struct SwarmRaycast::Data
 			rtcInitRayQueryContext(&ctx.m_context);
 			ctx.m_instances = 0;
 			ctx.m_anyWinding = true;
+			ctx.m_alphaCutout = map.m_alphaCutout;
 			RTCIntersectArguments args;
 			rtcInitIntersectArguments(&args);
 			args.context = &ctx.m_context;
@@ -495,10 +544,11 @@ struct SwarmRaycast::Data
 	}
 
 	// Lays the grid over the bounds of the static tree for this light, then casts every cell.
-	void buildShadowMap(const float lightDir[3], int threads)
+	void buildShadowMap(const float lightDir[3], bool alphaCutout, int threads)
 	{
 		ShadowMap& map = m_shadowMap;
 		map.m_built = false;
+		map.m_alphaCutout = alphaCutout;
 		std::vector<float>().swap(map.m_depth);
 		m_shadowDirty.clear();
 		RTCBounds bounds;
@@ -572,13 +622,14 @@ struct SwarmRaycast::Data
 			castShadowCells(col0, col1, row0, row1, threads);
 	}
 
-	// Brings the map up to date for this light: cast in full when there is none or the light moved,
-	// otherwise only under the members that changed since.
-	void prepareShadowMap(const float lightDir[3], int threads)
+	// Brings the map up to date for this light: cast in full when there is none, the light moved or the
+	// frame asks for the other cut-out setting, otherwise only under the members that changed since.
+	void prepareShadowMap(const float lightDir[3], bool alphaCutout, int threads)
 	{
-		if (!m_shadowMap.m_built || memcmp(m_shadowMap.m_lightDir, lightDir, sizeof(m_shadowMap.m_lightDir)) != 0)
+		if (!m_shadowMap.m_built || m_shadowMap.m_alphaCutout != alphaCutout ||
+			memcmp(m_shadowMap.m_lightDir, lightDir, sizeof(m_shadowMap.m_lightDir)) != 0)
 		{
-			buildShadowMap(lightDir, threads);
+			buildShadowMap(lightDir, alphaCutout, threads);
 			return;
 		}
 		for (size_t i = 0; i < m_shadowDirty.size(); i++)
@@ -692,7 +743,7 @@ struct SwarmRaycast::Data
 		tree.m_dirty = false;
 	}
 
-	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const float transform[16], bool enabled, bool doubleSided, int segmentation)
+	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, int segmentation)
 	{
 		TinyRender::Model* model = obj->m_model;
 		Instance* inst = state.m_instance;
@@ -751,6 +802,7 @@ struct SwarmRaycast::Data
 			changed = true;
 		}
 		inst->m_doubleSided = doubleSided;
+		inst->m_hasAlpha = hasAlpha;
 		inst->m_segmentation = segmentation;
 		if (changed)
 		{
@@ -857,6 +909,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	// TinyRenderer skips a fully transparent object; both trees hide it the same way.
 	const bool visible = model->getColorRGBA()[3] != 0.0f;
 	const bool doubleSided = renderObj->m_doubleSided;
+	const bool hasAlpha = model->hasAlpha();
 	const int segmentation = renderObj->m_objectIndex + ((renderObj->m_linkIndex + 1) << 24);
 
 	ObjectState& state = m_data->m_objects[renderObj];
@@ -870,6 +923,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 				m_data->shadowChanged(member);
 			member->m_visible = visible;
 			member->m_doubleSided = doubleSided;
+			member->m_hasAlpha = hasAlpha;
 			member->m_segmentation = segmentation;
 			return;
 		}
@@ -882,6 +936,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		member = m_data->addMember(renderObj, worldTransform, localScaling, transform);
 		member->m_visible = visible;
 		member->m_doubleSided = doubleSided;
+		member->m_hasAlpha = hasAlpha;
 		member->m_segmentation = segmentation;
 		state.m_member = member;
 		state.m_instance = 0;
@@ -889,7 +944,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	if (!member)
 		state.m_member = 0;
-	m_data->syncInstance(state, renderObj, worldTransform, transform, visible, doubleSided, segmentation);
+	m_data->syncInstance(state, renderObj, worldTransform, transform, visible, doubleSided, hasAlpha, segmentation);
 }
 
 void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
@@ -1708,7 +1763,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 }  // namespace
 
 void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
-						  const SwarmRaycastShading* shading, int threads) const
+						  const SwarmRaycastShading* shading, int threads, bool alphaCutout) const
 {
 	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
 		return;
@@ -1729,7 +1784,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_movers = 0;
 	if (shading && shading->m_shadow && shading->m_shadowMap)
 	{
-		m_data->prepareShadowMap(shading->m_lightDir, threads);
+		m_data->prepareShadowMap(shading->m_lightDir, alphaCutout, threads);
 		job.m_shadowMap = &m_data->m_shadowMap;
 		if (shading->m_moverShadow)
 			job.m_movers = m_data->m_movers;
@@ -1792,6 +1847,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		rtcInitRayQueryContext(&ctx.m_context);
 		ctx.m_instances = job.m_instances;
 		ctx.m_anyWinding = false;
+		ctx.m_alphaCutout = alphaCutout;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;
