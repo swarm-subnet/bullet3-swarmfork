@@ -105,6 +105,8 @@ struct Instance
 {
 	TinyRenderObjectData* m_obj;
 	RTCGeometry m_geometry;
+	// The same instance again inside the mover scene, so a shadow ray can skip the static tree.
+	RTCGeometry m_shadowGeometry;
 	unsigned m_geomId;
 	MeshTree* m_tree;
 	const void* m_meshKey;
@@ -425,10 +427,13 @@ struct SwarmRaycast::Data
 	RTCDevice m_device;
 	RTCScene m_top;
 	RTCScene m_static;
+	// Only the mover instances, so a shadow ray from a lit hit never walks the static tree.
+	RTCScene m_movers;
 	RTCGeometry m_staticInstance;
 	unsigned m_staticInstanceId;
 	bool m_staticBuilt;
 	bool m_topDirty;
+	bool m_moversDirty;
 	std::vector<StaticMember*> m_members;
 	std::map<const void*, MeshTree*> m_trees;
 	std::vector<Instance*> m_byGeomId;
@@ -697,6 +702,7 @@ struct SwarmRaycast::Data
 			inst->m_enabled = true;
 			inst->m_facingSign = 1.0f;
 			inst->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
+			inst->m_shadowGeometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
 			state.m_instance = inst;
 			fresh = true;
 		}
@@ -708,6 +714,7 @@ struct SwarmRaycast::Data
 			inst->m_tree = acquireTree(model, key);
 			inst->m_meshKey = key;
 			rtcSetGeometryInstancedScene(inst->m_geometry, inst->m_tree->m_scene);
+			rtcSetGeometryInstancedScene(inst->m_shadowGeometry, inst->m_tree->m_scene);
 			changed = true;
 		}
 		else if (inst->m_tree->m_dirty)
@@ -720,6 +727,7 @@ struct SwarmRaycast::Data
 			memcpy(inst->m_transform, transform, 16 * sizeof(float));
 			copyRotation(worldTransform, inst->m_rotation);
 			rtcSetGeometryTransform(inst->m_geometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, transform);
+			rtcSetGeometryTransform(inst->m_shadowGeometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, transform);
 			const float det = transform[0] * (transform[5] * transform[10] - transform[9] * transform[6]) - transform[4] * (transform[1] * transform[10] - transform[9] * transform[2]) + transform[8] * (transform[1] * transform[6] - transform[5] * transform[2]);
 			inst->m_facingSign = (det < 0.0f) ? -1.0f : 1.0f;
 			changed = true;
@@ -727,9 +735,15 @@ struct SwarmRaycast::Data
 		if (enabled != inst->m_enabled)
 		{
 			if (enabled)
+			{
 				rtcEnableGeometry(inst->m_geometry);
+				rtcEnableGeometry(inst->m_shadowGeometry);
+			}
 			else
+			{
 				rtcDisableGeometry(inst->m_geometry);
+				rtcDisableGeometry(inst->m_shadowGeometry);
+			}
 			inst->m_enabled = enabled;
 			changed = true;
 		}
@@ -738,24 +752,30 @@ struct SwarmRaycast::Data
 		if (changed)
 		{
 			rtcCommitGeometry(inst->m_geometry);
+			rtcCommitGeometry(inst->m_shadowGeometry);
 			m_topDirty = true;
+			m_moversDirty = true;
 		}
 		if (fresh)
 		{
 			inst->m_geomId = allocateGeomId(inst);
 			rtcAttachGeometryByID(m_top, inst->m_geometry, inst->m_geomId);
+			rtcAttachGeometryByID(m_movers, inst->m_shadowGeometry, inst->m_geomId);
 		}
 	}
 
 	void dropInstance(Instance* inst)
 	{
 		rtcDetachGeometry(m_top, inst->m_geomId);
+		rtcDetachGeometry(m_movers, inst->m_geomId);
 		rtcReleaseGeometry(inst->m_geometry);
+		rtcReleaseGeometry(inst->m_shadowGeometry);
 		releaseTree(inst->m_tree);
 		m_byGeomId[inst->m_geomId] = 0;
 		m_freeGeomIds.push_back(inst->m_geomId);
 		delete inst;
 		m_topDirty = true;
+		m_moversDirty = true;
 	}
 
 	void releaseStatic()
@@ -783,10 +803,12 @@ SwarmRaycast::SwarmRaycast()
 	m_data = new Data;
 	m_data->m_top = 0;
 	m_data->m_static = 0;
+	m_data->m_movers = 0;
 	m_data->m_staticInstance = 0;
 	m_data->m_staticInstanceId = 0;
 	m_data->m_staticBuilt = false;
 	m_data->m_topDirty = false;
+	m_data->m_moversDirty = true;
 	m_data->m_shadowMap.m_built = false;
 	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
 	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
@@ -799,6 +821,9 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_top = rtcNewScene(m_data->m_device);
 	rtcSetSceneFlags(m_data->m_top, (RTCSceneFlags)(RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC));
 	rtcSetSceneBuildQuality(m_data->m_top, RTC_BUILD_QUALITY_MEDIUM);
+	m_data->m_movers = rtcNewScene(m_data->m_device);
+	rtcSetSceneFlags(m_data->m_movers, (RTCSceneFlags)(RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC));
+	rtcSetSceneBuildQuality(m_data->m_movers, RTC_BUILD_QUALITY_MEDIUM);
 	m_data->createStaticScene();
 }
 
@@ -808,6 +833,7 @@ SwarmRaycast::~SwarmRaycast()
 	if (m_data->m_top)
 	{
 		m_data->releaseStatic();
+		rtcReleaseScene(m_data->m_movers);
 		rtcReleaseScene(m_data->m_top);
 	}
 	if (m_data->m_device)
@@ -921,6 +947,11 @@ void SwarmRaycast::commit()
 	{
 		rtcCommitScene(m_data->m_top);
 		m_data->m_topDirty = false;
+	}
+	if (m_data->m_moversDirty)
+	{
+		rtcCommitScene(m_data->m_movers);
+		m_data->m_moversDirty = false;
 	}
 }
 
@@ -1138,6 +1169,8 @@ struct TileJob
 	const SwarmRaycastShading* m_shading;
 	// The light's view of the static tree when the shadow comes from the map; null for shadow rays.
 	const ShadowMap* m_shadowMap;
+	// The tree of the mover instances when a lit hit also asks them for shadow; null otherwise.
+	RTCScene m_movers;
 	unsigned m_staticId;
 	int m_width;
 	int m_height;
@@ -1235,33 +1268,35 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
 
 			float shadow = 1.0f;
-			if (shading->m_shadow && job.m_shadowMap)
+			if (shading->m_shadow)
 			{
 				float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 				normalize3(unitNormal);
 				const float point[3] = {hx, hy, hz};
-				shadow = (float)(0.8 + 0.2 * !shadowMapBlocked(*job.m_shadowMap, point, unitNormal));
-			}
-			else if (shading->m_shadow)
-			{
-				float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
-				normalize3(unitNormal);
-				RTCRay ray;
-				ray.org_x = hx + unitNormal[0] * kShadowBias;
-				ray.org_y = hy + unitNormal[1] * kShadowBias;
-				ray.org_z = hz + unitNormal[2] * kShadowBias;
-				ray.dir_x = shading->m_lightDir[0];
-				ray.dir_y = shading->m_lightDir[1];
-				ray.dir_z = shading->m_lightDir[2];
-				ray.tnear = 0.0f;
-				ray.tfar = INFINITY;
-				ray.time = 0.0f;
-				ray.mask = (unsigned)-1;
-				ray.id = 0;
-				ray.flags = 0;
-				rtcOccluded1(job.m_top, &ray, shadowArgs);
+				// The map answers for the static bodies; the ray then goes to the whole world without a
+				// map, to the movers alone with one, or nowhere when the map already says blocked.
+				bool blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+				const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
+				if (!blocked && occluders)
+				{
+					RTCRay ray;
+					ray.org_x = hx + unitNormal[0] * kShadowBias;
+					ray.org_y = hy + unitNormal[1] * kShadowBias;
+					ray.org_z = hz + unitNormal[2] * kShadowBias;
+					ray.dir_x = shading->m_lightDir[0];
+					ray.dir_y = shading->m_lightDir[1];
+					ray.dir_z = shading->m_lightDir[2];
+					ray.tnear = 0.0f;
+					ray.tfar = INFINITY;
+					ray.time = 0.0f;
+					ray.mask = (unsigned)-1;
+					ray.id = 0;
+					ray.flags = 0;
+					rtcOccluded1(occluders, &ray, shadowArgs);
+					blocked = ray.tfar < 0.0f;
+				}
 				// The same 0.8 floor TinyRenderer's shader applies where its shadow buffer says blocked.
-				shadow = (float)(0.8 + 0.2 * (ray.tfar >= 0.0f));
+				shadow = (float)(0.8 + 0.2 * !blocked);
 			}
 
 			float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
@@ -1311,10 +1346,13 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_filtered = shading && shading->m_textureFilter;
 	// The map is cast on the calling thread's schedule before the pixel loop, which then only reads it.
 	job.m_shadowMap = 0;
+	job.m_movers = 0;
 	if (shading && shading->m_shadow && shading->m_shadowMap)
 	{
 		m_data->prepareShadowMap(shading->m_lightDir, threads);
 		job.m_shadowMap = &m_data->m_shadowMap;
+		if (shading->m_moverShadow)
+			job.m_movers = m_data->m_movers;
 	}
 	if (job.m_filtered)
 	{

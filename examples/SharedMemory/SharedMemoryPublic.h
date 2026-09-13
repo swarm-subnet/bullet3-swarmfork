@@ -886,6 +886,9 @@ enum EnumRendererAuxFlags
 	// With shadow=1 on the ray-cast path: sun shadows read from a map cast once per light direction
 	// over the static bodies, instead of one shadow ray per pixel per frame.
 	ER_SWARM_SHADOW_MAP = 64,
+	// With ER_SWARM_SHADOW_MAP: bodies that moved since the world was built cast shadows too, from one
+	// occlusion ray per lit hit against a small tree that holds only those bodies.
+	ER_SWARM_MOVER_SHADOW = 128,
 };
 
 ///flags to pick the IK solver and other options

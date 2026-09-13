@@ -19,8 +19,12 @@ struct SwarmRaycastShading
 	bool m_shadow;
 	// With m_shadow: the light's view of the static bodies is cast once into a depth grid and each hit
 	// looks itself up there instead of casting a ray. The grid is rebuilt when the light direction
-	// changes; a body that moves or is hidden has only its own cells recast. Movers cast no shadow.
+	// changes; a body that moves or is hidden has only its own cells recast. Movers cast no shadow
+	// from the map itself.
 	bool m_shadowMap;
+	// With m_shadowMap: a hit the map calls lit also casts one occlusion ray against the small tree of
+	// the bodies that moved since the world was built, so movers cast shadows that follow them.
+	bool m_moverShadow;
 	bool m_textureFilter;  // bilinear and mipmapped texture reads instead of the nearest texel
 };
 
