@@ -876,6 +876,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			btVector4 color;
 			color = (m_data->m_flags & URDF_GOOGLEY_UNDEFINED_COLORS) ? sGoogleyColors[colorIndex] : btVector4(1, 1, 1, 1);
 			float rgbaColor[4] = { (float)color[0], (float)color[1], (float)color[2], (float)color[3] };
+			btVector3 specularColor = UrdfMaterialColor().m_specularColor;
 			//if (colObj->getCollisionShape()->getShapeType()==STATIC_PLANE_PROXYTYPE)
 			//{
 			//	color.setValue(1,1,1,1);
@@ -892,6 +893,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						{
 							rgbaColor[i] = (*matPtr)->m_matColor.m_rgbaColor[i];
 						}
+						specularColor = (*matPtr)->m_matColor.m_specularColor;
 						//printf("UrdfMaterial %s, rgba = %f,%f,%f,%f\n",mat->m_name.c_str(),mat->m_rgbaColor[0],mat->m_rgbaColor[1],mat->m_rgbaColor[2],mat->m_rgbaColor[3]);
 						//m_data->m_linkColors.insert(linkIndex,mat->m_rgbaColor);
 					}
@@ -904,6 +906,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 							{
 								rgbaColor[i] = vis->m_geometry.m_localMaterial.m_matColor.m_rgbaColor[i];
 							}
+							specularColor = vis->m_geometry.m_localMaterial.m_matColor.m_specularColor;
 						}
 					}
 				}
@@ -916,6 +919,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					{
 						rgbaColor[i] = vis->m_geometry.m_localMaterial.m_matColor.m_rgbaColor[i];
 					}
+					specularColor = vis->m_geometry.m_localMaterial.m_matColor.m_specularColor;
 				}
 			}
 
@@ -1027,6 +1031,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					tinyObj->m_doubleSided = doubleSided;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
 						group.m_textureImage, group.m_textureWidth, group.m_textureHeight);
+					float groupSpecular[3] = { (float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2] };
+					tinyObj->m_model->setSpecularColor(groupSpecular);
 					visuals->m_renderObjects.push_back(tinyObj);
 
 					if (group.m_textureImage)
@@ -1066,6 +1072,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					tinyObj->registerMeshShape(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size(), rgbaColor,
 						textureImage1, textureWidth, textureHeight);
 				}
+				float specular[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
+				tinyObj->m_model->setSpecularColor(specular);
 				visuals->m_renderObjects.push_back(tinyObj);
 			}
 
@@ -1274,6 +1282,27 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 						visuals->m_renderObjects[q]->m_model->setColorRGBA(rgba);
 					}
 				}
+			}
+		}
+	}
+}
+
+void TinyRendererVisualShapeConverter::changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3])
+{
+	float rgb[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
+	for (int i = 0; i < m_data->m_swRenderInstances.size(); i++)
+	{
+		TinyRendererObjectArray** ptrptr = m_data->m_swRenderInstances.getAtIndex(i);
+		if (!ptrptr || !*ptrptr)
+			continue;
+		TinyRendererObjectArray* visuals = *ptrptr;
+		if ((bodyUniqueId != visuals->m_objectUniqueId) || (linkIndex != visuals->m_linkIndex))
+			continue;
+		for (int q = 0; q < visuals->m_renderObjects.size(); q++)
+		{
+			if (shapeIndex < 0 || q == shapeIndex)
+			{
+				visuals->m_renderObjects[q]->m_model->setSpecularColor(rgb);
 			}
 		}
 	}
@@ -1709,6 +1738,18 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 
 	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
 
+	TinyRenderGlint glint;
+	glint.m_enabled = (m_data->m_flags & ER_SPECULAR_GLINT) != 0 && !depthOnly;
+	glint.m_upAxis = m_data->m_upAxis;
+	if (m_data->m_hasSky)
+	{
+		for (int i = 0; i < 3; i++)
+		{
+			glint.m_skyHorizon[i] = (float)m_data->m_skyHorizonColor[i];
+			glint.m_skyZenith[i] = (float)m_data->m_skyZenithColor[i];
+		}
+	}
+
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 		// Depth, segmentation and colour come from the ray caster, already in output row order; a
@@ -1731,6 +1772,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_specularCoeff = lightSpecularCoeff;
 		shading.m_shadow = m_data->m_hasShadow;
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
+		shading.m_glint = glint;
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;
 		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
@@ -1901,6 +1943,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			else
 			{
 				renderObj->m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
+				renderObj->m_glint = glint;
 				TinyRenderer::renderObject(*renderObj);
 			}
 		}

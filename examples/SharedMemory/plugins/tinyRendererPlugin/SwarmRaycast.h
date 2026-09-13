@@ -1,6 +1,8 @@
 #ifndef SWARM_RAYCAST_H
 #define SWARM_RAYCAST_H
 
+#include "../../../TinyRenderer/TinyRenderer.h"
+
 struct TinyRenderObjectData;
 class btTransform;
 class btVector3;
@@ -18,6 +20,7 @@ struct SwarmRaycastShading
 	// wound; a body hidden by a zero alpha lets the light through and so casts no shadow.
 	bool m_shadow;
 	bool m_textureFilter;  // bilinear and mipmapped texture reads instead of the nearest texel
+	TinyRenderGlint m_glint;
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh

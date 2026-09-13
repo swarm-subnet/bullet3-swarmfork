@@ -20,6 +20,7 @@ private:
 	TGAImage normalmap_;
 	TGAImage specularmap_;
 	Vec4f m_colorRGBA;
+	Vec3f m_specularColor;
 
 	void load_texture(std::string filename, const char* suffix, TGAImage& img);
 	void detachMesh();
@@ -36,6 +37,17 @@ public:
 	const Vec4f& getColorRGBA() const
 	{
 		return m_colorRGBA;
+	}
+	// The object's specular colour, only read by the ER_SPECULAR_GLINT term; zero until set.
+	void setSpecularColor(const float rgb[3])
+	{
+		for (int i = 0; i < 3; i++)
+			m_specularColor[i] = rgb[i];
+	}
+
+	const Vec3f& getSpecularColor() const
+	{
+		return m_specularColor;
 	}
 	void loadDiffuseTexture(const char* relativeFileName);
 	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight);

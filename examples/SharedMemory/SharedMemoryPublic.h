@@ -883,6 +883,8 @@ enum EnumRendererAuxFlags
 	ER_TEXTURE_FILTER = 16,  // bilinear + mipmapped texture sampling on the software colour path
 	// Depth, segmentation and shaded colour through the Embree ray-cast backend beside TinyRenderer.
 	ER_SWARM_RAYCAST = 32,
+	// Per-object specular colour reflects the sky with a view-angle term, on both colour paths.
+	ER_SPECULAR_GLINT = 64,
 };
 
 ///flags to pick the IK solver and other options

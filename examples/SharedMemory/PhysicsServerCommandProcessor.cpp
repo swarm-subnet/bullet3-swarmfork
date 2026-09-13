@@ -14751,6 +14751,11 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 						}
 						if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR)
 						{
+							if (m_data->m_pluginManager.getRenderInterface())
+							{
+								m_data->m_pluginManager.getRenderInterface()->changeSpecularColor(bodyUniqueId, linkIndex,
+									clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
+							}
 							m_data->m_guiHelper->changeSpecularColor(graphicsIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
 						}
 						if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
@@ -14796,6 +14801,11 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 							}
 							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR)
 							{
+								if (m_data->m_pluginManager.getRenderInterface())
+								{
+									m_data->m_pluginManager.getRenderInterface()->changeSpecularColor(bodyUniqueId, linkIndex,
+										clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
+								}
 								m_data->m_guiHelper->changeSpecularColor(graphicsIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
 							}
 							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
@@ -14836,6 +14846,11 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 					}
 					if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR)
 					{
+						if (m_data->m_pluginManager.getRenderInterface())
+						{
+							m_data->m_pluginManager.getRenderInterface()->changeSpecularColor(bodyUniqueId, linkIndex,
+								clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
+						}
 						m_data->m_guiHelper->changeSpecularColor(graphicsIndex, clientCmd.m_updateVisualShapeDataArguments.m_specularColor);
 					}
 				}
