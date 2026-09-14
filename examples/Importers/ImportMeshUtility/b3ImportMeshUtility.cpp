@@ -19,10 +19,12 @@ struct CachedTextureResult
 	int m_width;
 	int m_height;
 	unsigned char* m_pixels;
+	unsigned char* m_alpha;
 	CachedTextureResult()
 		: m_width(0),
 		  m_height(0),
-		  m_pixels(0)
+		  m_pixels(0),
+		  m_alpha(0)
 	{
 	}
 };
@@ -41,17 +43,42 @@ struct CachedTextureManager
 			if (res)
 			{
 				free(res->m_pixels);
+				free(res->m_alpha);
 			}
 		}
 	}
 };
 static CachedTextureManager sTexCacheMgr;
 
+unsigned char* b3ImportMeshUtility::loadTextureAlpha(const unsigned char* bytes, int size, int width, int height)
+{
+	int w, h, n;
+	if (!stbi_info_from_memory(bytes, size, &w, &h, &n) || (n != 2 && n != 4) || w != width || h != height)
+		return 0;
+	unsigned char* rgba = stbi_load_from_memory(bytes, size, &w, &h, &n, 4);
+	if (!rgba)
+		return 0;
+	const size_t texels = (size_t)width * height;
+	unsigned char* alpha = (unsigned char*)malloc(texels);
+	bool opaque = true;
+	for (size_t i = 0; i < texels; i++)
+	{
+		alpha[i] = rgba[i * 4 + 3];
+		opaque = opaque && alpha[i] == 255;
+	}
+	stbi_image_free(rgba);
+	if (!opaque)
+		return alpha;
+	free(alpha);
+	return 0;
+}
+
 //loads the diffuse texture named in a material, trying the mesh folder and the data folders; returns 0 when none loads
-static unsigned char* loadDiffuseTexture(const char* filename, const char* pathPrefix, CommonFileIOInterface* fileIO, int& width, int& height, bool& isCached)
+static unsigned char* loadDiffuseTexture(const char* filename, const char* pathPrefix, CommonFileIOInterface* fileIO, int& width, int& height, bool& isCached, unsigned char*& alpha)
 {
 	unsigned char* image = 0;
 	isCached = false;
+	alpha = 0;
 
 	const char* prefix[] = {pathPrefix, "./", "./data/", "../data/", "../../data/", "../../../data/", "../../../../data/"};
 	int numprefix = sizeof(prefix) / sizeof(const char*);
@@ -69,6 +96,7 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 				if (texture)
 				{
 					image = texture->m_pixels;
+					alpha = texture->m_alpha;
 					width = texture->m_width;
 					height = texture->m_height;
 					isCached = true;
@@ -105,6 +133,7 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 
 				if (image)
 				{
+					alpha = b3ImportMeshUtility::loadTextureAlpha((const unsigned char*)&buffer[0], buffer.size(), width, height);
 					if (b3IsFileCachingEnabled())
 					{
 						CachedTextureResult result;
@@ -112,6 +141,7 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 						result.m_width = width;
 						result.m_height = height;
 						result.m_pixels = image;
+						result.m_alpha = alpha;
 						isCached = true;
 						gCachedTextureResults.insert(relativeFileName, result);
 					}
@@ -183,12 +213,13 @@ static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, 
 			group.m_specularColor[2] = material.specular[2];
 			group.m_specularColor[3] = 1;
 			group.m_textureImage = 0;
+			group.m_textureAlpha = 0;
 			group.m_isCached = false;
 			group.m_textureWidth = 0;
 			group.m_textureHeight = 0;
 			if (material.diffuse_texname.length() > 0)
 			{
-				group.m_textureImage = loadDiffuseTexture(material.diffuse_texname.c_str(), pathPrefix, fileIO, group.m_textureWidth, group.m_textureHeight, group.m_isCached);
+				group.m_textureImage = loadDiffuseTexture(material.diffuse_texname.c_str(), pathPrefix, fileIO, group.m_textureWidth, group.m_textureHeight, group.m_isCached, group.m_textureAlpha);
 			}
 			groups.push_back(group);
 		}
@@ -201,6 +232,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 	B3_PROFILE("loadAndRegisterMeshFromFileInternal");
 	meshData.m_gfxShape = 0;
 	meshData.m_textureImage1 = 0;
+	meshData.m_textureAlpha = 0;
 	meshData.m_textureHeight = 0;
 	meshData.m_textureWidth = 0;
 	meshData.m_flags = 0;
@@ -255,7 +287,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 
 				if (shape.material.diffuse_texname.length() > 0)
 				{
-					meshData.m_textureImage1 = loadDiffuseTexture(shape.material.diffuse_texname.c_str(), pathPrefix, fileIO, meshData.m_textureWidth, meshData.m_textureHeight, meshData.m_isCached);
+					meshData.m_textureImage1 = loadDiffuseTexture(shape.material.diffuse_texname.c_str(), pathPrefix, fileIO, meshData.m_textureWidth, meshData.m_textureHeight, meshData.m_isCached, meshData.m_textureAlpha);
 				}
 			}
 		}

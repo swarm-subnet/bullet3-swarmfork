@@ -883,6 +883,19 @@ enum EnumRendererAuxFlags
 	ER_TEXTURE_FILTER = 16,  // bilinear + mipmapped texture sampling on the software colour path
 	// Depth, segmentation and shaded colour through the Embree ray-cast backend beside TinyRenderer.
 	ER_SWARM_RAYCAST = 32,
+	// With shadow=1 on the ray-cast path: sun shadows read from a map cast once per light direction
+	// over the static bodies, instead of one shadow ray per pixel per frame.
+	ER_SWARM_SHADOW_MAP = 64,
+	// With ER_SWARM_SHADOW_MAP: bodies that moved since the world was built cast shadows too, from one
+	// occlusion ray per lit hit against a small tree that holds only those bodies.
+	ER_SWARM_MOVER_SHADOW = 128,
+	// Exact triangle coverage on every pixel that sits on an object or depth edge, colour only, on the ray-cast path.
+	ER_EDGE_ANTIALIAS = 256,
+	// On the ray-cast path a hit on a texel whose alpha is below the cut-out threshold is a miss and
+	// the ray carries on, in colour, depth and shadow alike.
+	ER_ALPHA_CUTOUT = 512,
+	// Per-object specular colour reflects the sky with a view-angle term, on both colour paths.
+	ER_SPECULAR_GLINT = 1024,
 };
 
 ///flags to pick the IK solver and other options

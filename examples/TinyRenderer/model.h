@@ -20,6 +20,7 @@ private:
 	TGAImage normalmap_;
 	TGAImage specularmap_;
 	Vec4f m_colorRGBA;
+	Vec3f m_specularColor;
 
 	void load_texture(std::string filename, const char* suffix, TGAImage& img);
 	void detachMesh();
@@ -37,8 +38,20 @@ public:
 	{
 		return m_colorRGBA;
 	}
+	// The object's specular colour, only read by the ER_SPECULAR_GLINT term; zero until set.
+	void setSpecularColor(const float rgb[3])
+	{
+		for (int i = 0; i < 3; i++)
+			m_specularColor[i] = rgb[i];
+	}
+
+	const Vec3f& getSpecularColor() const
+	{
+		return m_specularColor;
+	}
 	void loadDiffuseTexture(const char* relativeFileName);
-	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight);
+	// textureAlpha is one byte per texel in the same row order as textureImage, or 0 for an opaque texture.
+	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha = 0);
 	// Vertex stride is 9 floats: xyz, w (ignored), normal xyz, uv.
 	void setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 	void reserveMemory(int numVertices, int numIndices);
@@ -69,6 +82,9 @@ public:
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
 	TGAColor diffuseFiltered(Vec2f uv, Vec2f duvdx, Vec2f duvdy);
+	bool hasAlpha() const;
+	// Alpha of the texel diffuse(uv) reads, 255 when the texture carries no alpha plane.
+	unsigned char alpha(Vec2f uv) const;
 	// Builds the mip chain now, so later diffuseFiltered calls only read; safe to call from many threads after this.
 	void buildMipmaps();
 	float specular(Vec2f uv);
