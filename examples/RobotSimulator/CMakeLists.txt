@@ -1,7 +1,7 @@
 INCLUDE_DIRECTORIES( 
 		${BULLET_PHYSICS_SOURCE_DIR}/src
 		${BULLET_PHYSICS_SOURCE_DIR}/examples
-		${BULLET_PHYSICS_SOURCE_DIR}/examples/SharedMemory
+		${BULLET_PHYSICS_SOURCE_DIR}/src/SharedMemory
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/enet/include
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/clsocket/src
@@ -15,18 +15,18 @@ RobotSimulatorMain.cpp
 	MinitaurSetup.cpp
 	MinitaurSetup.h
 	../../examples/ExampleBrowser/InProcessExampleBrowser.cpp
-	../SharedMemory/GraphicsServerExample.cpp
-	../SharedMemory/GraphicsClientExample.cpp
-	../SharedMemory/RemoteGUIHelper.cpp
-        ../SharedMemory/RemoteGUIHelperTCP.cpp
-	../SharedMemory/GraphicsServerExample.h
-	../SharedMemory/GraphicsClientExample.h
-	../SharedMemory/RemoteGUIHelper.h
-	../SharedMemory/GraphicsSharedMemoryCommands.h
-	../SharedMemory/GraphicsSharedMemoryPublic.h
-	../../examples/SharedMemory/PhysicsServerExample.cpp
-	../../examples/SharedMemory/PhysicsServerExampleBullet2.cpp
-	../../examples/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp		
+	../../src/SharedMemory/GraphicsServerExample.cpp
+	../../src/SharedMemory/GraphicsClientExample.cpp
+	../../src/SharedMemory/RemoteGUIHelper.cpp
+        ../../src/SharedMemory/RemoteGUIHelperTCP.cpp
+	../../src/SharedMemory/GraphicsServerExample.h
+	../../src/SharedMemory/GraphicsClientExample.h
+	../../src/SharedMemory/RemoteGUIHelper.h
+	../../src/SharedMemory/GraphicsSharedMemoryCommands.h
+	../../src/SharedMemory/GraphicsSharedMemoryPublic.h
+	../../src/SharedMemory/PhysicsServerExample.cpp
+	../../src/SharedMemory/PhysicsServerExampleBullet2.cpp
+	../../src/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp		
 )	
 
 
@@ -84,7 +84,7 @@ ENDIF(WIN32)
 INCLUDE_DIRECTORIES( 
 		${BULLET_PHYSICS_SOURCE_DIR}/src
 		${BULLET_PHYSICS_SOURCE_DIR}/examples
-		${BULLET_PHYSICS_SOURCE_DIR}/examples/SharedMemory
+		${BULLET_PHYSICS_SOURCE_DIR}/src/SharedMemory
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/enet/include
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/clsocket/src
@@ -123,7 +123,7 @@ ENDIF(WIN32)
 INCLUDE_DIRECTORIES(
                 ${BULLET_PHYSICS_SOURCE_DIR}/src
                 ${BULLET_PHYSICS_SOURCE_DIR}/examples
-		${BULLET_PHYSICS_SOURCE_DIR}/examples/SharedMemory
+		${BULLET_PHYSICS_SOURCE_DIR}/src/SharedMemory
                 ${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs
                 ${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/enet/include
                 ${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/clsocket/src

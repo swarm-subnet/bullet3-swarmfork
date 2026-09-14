@@ -361,7 +361,7 @@ void OpenGLExampleBrowser::registerFileImporter(const char* extension, CommonExa
 	fi.m_createFunc = createFunc;
 	gFileImporterByExtension.push_back(fi);
 }
-#include "../SharedMemory/SharedMemoryPublic.h"
+#include "../../src/SharedMemory/SharedMemoryPublic.h"
 
 void OpenGLExampleBrowserVisualizerFlagCallback(int flag, bool enable)
 {

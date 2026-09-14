@@ -6,6 +6,15 @@ ENDIF(BUILD_BULLET3)
 
 SUBDIRS(   BulletInverseDynamics BulletSoftBody BulletCollision BulletDynamics LinearMath Bullet3Common)
 
+IF(BUILD_BULLET2_DEMOS)
+	IF(BUILD_BULLET3)
+		SUBDIRS( SharedMemory )
+	ENDIF(BUILD_BULLET3)
+	IF(BUILD_PYBULLET)
+		SUBDIRS( pybullet )
+	ENDIF(BUILD_PYBULLET)
+ENDIF(BUILD_BULLET2_DEMOS)
+
 
 IF(INSTALL_LIBS)
 	#INSTALL of other files requires CMake 2.6

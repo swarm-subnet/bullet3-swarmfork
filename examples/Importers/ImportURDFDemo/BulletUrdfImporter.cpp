@@ -31,7 +31,7 @@ subject to the following restrictions:
 #include "../OpenGLWindow/ShapeData.h"
 
 #include "URDF2Bullet.h"  //for flags
-#include "../../SharedMemory/SharedMemoryPublic.h"  //for eVISUAL_SHAPE_MATERIALS_FROM_MTL
+#include "../../../src/SharedMemory/SharedMemoryPublic.h"  //for eVISUAL_SHAPE_MATERIALS_FROM_MTL
 #include "../ImportMeshUtility/b3ImportMeshUtility.h"
 
 static btScalar gUrdfDefaultCollisionMargin = 0.001;

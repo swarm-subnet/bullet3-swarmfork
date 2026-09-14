@@ -14,7 +14,7 @@ typedef OpenGLExampleBrowser DefaultBrowser;
 
 #include "ExampleEntries.h"
 #include "Bullet3Common/b3Scalar.h"
-#include "../SharedMemory/InProcessMemory.h"
+#include "../../src/SharedMemory/InProcessMemory.h"
 
 void ExampleBrowserThreadFunc(void* userPtr, void* lsMemory);
 void* ExampleBrowserMemoryFunc();
@@ -28,12 +28,12 @@ void ExampleBrowserMemoryReleaseFunc(void* ptr);
 #include "LinearMath/btAlignedObjectArray.h"
 #include "EmptyExample.h"
 
-#include "../SharedMemory/PhysicsServerExample.h"
-#include "../SharedMemory/PhysicsServerExampleBullet2.h"
-#include "../SharedMemory/GraphicsServerExample.h"
+#include "../../src/SharedMemory/PhysicsServerExample.h"
+#include "../../src/SharedMemory/PhysicsServerExampleBullet2.h"
+#include "../../src/SharedMemory/GraphicsServerExample.h"
 
 
-#include "../SharedMemory/PhysicsClientExample.h"
+#include "../../src/SharedMemory/PhysicsClientExample.h"
 
 #ifndef _WIN32
 #include "../MultiThreading/b3PosixThreadSupport.h"

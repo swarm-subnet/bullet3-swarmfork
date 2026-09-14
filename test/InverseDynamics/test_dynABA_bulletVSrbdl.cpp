@@ -20,7 +20,7 @@
 #include "../../examples/Importers/ImportURDFDemo/MyMultiBodyCreator.h"
 #include "../../examples/Importers/ImportURDFDemo/URDF2Bullet.h"
 #include "../../examples/Utils/b3ResourcePath.h"
-#include "../../examples/SharedMemory/SharedMemoryPublic.h"
+#include "../../src/SharedMemory/SharedMemoryPublic.h"
 #include <btMultiBodyFromURDF.hpp>
 #include <MultiBodyTreeDebugGraph.hpp>
 #include "Bullet3Common/b3CommandLineArgs.h"

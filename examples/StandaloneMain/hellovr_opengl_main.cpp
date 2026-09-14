@@ -342,7 +342,7 @@ void MyKeyboardCallback(int key, int state)
 		prevKeyboardCallback(key, state);
 }
 
-#include "../SharedMemory/SharedMemoryPublic.h"
+#include "../../src/SharedMemory/SharedMemoryPublic.h"
 extern bool useShadowMap;
 static bool gEnableVRRenderControllers = true;
 static bool gEnableVRRendering = true;

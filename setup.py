@@ -207,55 +207,55 @@ else:
     print("numpy_include_dirs = %s" % d)
   include_dirs += NP_DIRS
 
-sources = ["examples/pybullet/pybullet.c"]\
+sources = ["src/pybullet/pybullet.c"]\
 +["examples/ThirdPartyLibs/tinyxml2/tinyxml2.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/BulletConversion.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/KinTree.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/MathUtil.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/RBDModel.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/RBDUtil.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/Shape.cpp"]\
-+["examples/SharedMemory/plugins/stablePDPlugin/SpAlg.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/BulletConversion.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/KinTree.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/MathUtil.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/RBDModel.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/RBDUtil.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/Shape.cpp"]\
++["src/SharedMemory/plugins/stablePDPlugin/SpAlg.cpp"]\
 +["src/btLinearMathAll.cpp"]\
 +["src/btBulletCollisionAll.cpp"]\
 +["src/btBulletDynamicsAll.cpp"]\
 +["examples/ExampleBrowser/InProcessExampleBrowser.cpp"]\
-+["examples/TinyRenderer/geometry.cpp"]\
-+["examples/TinyRenderer/model.cpp"]\
-+["examples/TinyRenderer/tgaimage.cpp"]\
-+["examples/TinyRenderer/our_gl.cpp"]\
-+["examples/TinyRenderer/TinyRenderer.cpp"]\
-+["examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp"]\
-+["examples/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp"]\
-+["examples/SharedMemory/plugins/fileIOPlugin/fileIOPlugin.cpp"]\
-+["examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp"]\
-+["examples/SharedMemory/IKTrajectoryHelper.cpp"]\
-+["examples/SharedMemory/InProcessMemory.cpp"]\
-+["examples/SharedMemory/PhysicsClient.cpp"]\
-+["examples/SharedMemory/PhysicsServer.cpp"]\
-+["examples/SharedMemory/GraphicsClientExample.cpp"]\
-+["examples/SharedMemory/GraphicsServerExample.cpp"]\
-+["examples/SharedMemory/RemoteGUIHelper.cpp"]\
-+["examples/SharedMemory/RemoteGUIHelperTCP.cpp"]\
-+["examples/SharedMemory/PhysicsServerExample.cpp"]\
-+["examples/SharedMemory/PhysicsServerExampleBullet2.cpp"]\
-+["examples/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp"]\
-+["examples/SharedMemory/PhysicsServerSharedMemory.cpp"]\
-+["examples/SharedMemory/PhysicsDirect.cpp"]\
-+["examples/SharedMemory/PhysicsDirectC_API.cpp"]\
-+["examples/SharedMemory/PhysicsServerCommandProcessor.cpp"]\
-+["examples/SharedMemory/PhysicsClientSharedMemory.cpp"]\
-+["examples/SharedMemory/PhysicsClientSharedMemory_C_API.cpp"]\
-+["examples/SharedMemory/PhysicsClientC_API.cpp"]\
-+["examples/SharedMemory/Win32SharedMemory.cpp"]\
-+["examples/SharedMemory/PosixSharedMemory.cpp"]\
-+["examples/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp"]\
-+["examples/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp"]\
-+["examples/SharedMemory/PhysicsClientUDP.cpp"]\
-+["examples/SharedMemory/PhysicsClientUDP_C_API.cpp"]\
-+["examples/SharedMemory/PhysicsClientTCP.cpp"]\
-+["examples/SharedMemory/PhysicsClientTCP_C_API.cpp"]\
-+["examples/SharedMemory/b3PluginManager.cpp"]\
++["src/TinyRenderer/geometry.cpp"]\
++["src/TinyRenderer/model.cpp"]\
++["src/TinyRenderer/tgaimage.cpp"]\
++["src/TinyRenderer/our_gl.cpp"]\
++["src/TinyRenderer/TinyRenderer.cpp"]\
++["src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp"]\
++["src/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp"]\
++["src/SharedMemory/plugins/fileIOPlugin/fileIOPlugin.cpp"]\
++["src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp"]\
++["src/SharedMemory/IKTrajectoryHelper.cpp"]\
++["src/SharedMemory/InProcessMemory.cpp"]\
++["src/SharedMemory/PhysicsClient.cpp"]\
++["src/SharedMemory/PhysicsServer.cpp"]\
++["src/SharedMemory/GraphicsClientExample.cpp"]\
++["src/SharedMemory/GraphicsServerExample.cpp"]\
++["src/SharedMemory/RemoteGUIHelper.cpp"]\
++["src/SharedMemory/RemoteGUIHelperTCP.cpp"]\
++["src/SharedMemory/PhysicsServerExample.cpp"]\
++["src/SharedMemory/PhysicsServerExampleBullet2.cpp"]\
++["src/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp"]\
++["src/SharedMemory/PhysicsServerSharedMemory.cpp"]\
++["src/SharedMemory/PhysicsDirect.cpp"]\
++["src/SharedMemory/PhysicsDirectC_API.cpp"]\
++["src/SharedMemory/PhysicsServerCommandProcessor.cpp"]\
++["src/SharedMemory/PhysicsClientSharedMemory.cpp"]\
++["src/SharedMemory/PhysicsClientSharedMemory_C_API.cpp"]\
++["src/SharedMemory/PhysicsClientC_API.cpp"]\
++["src/SharedMemory/Win32SharedMemory.cpp"]\
++["src/SharedMemory/PosixSharedMemory.cpp"]\
++["src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp"]\
++["src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp"]\
++["src/SharedMemory/PhysicsClientUDP.cpp"]\
++["src/SharedMemory/PhysicsClientUDP_C_API.cpp"]\
++["src/SharedMemory/PhysicsClientTCP.cpp"]\
++["src/SharedMemory/PhysicsClientTCP_C_API.cpp"]\
++["src/SharedMemory/b3PluginManager.cpp"]\
 +["examples/Utils/b3ResourcePath.cpp"]\
 +["examples/Utils/RobotLoggingUtil.cpp"]\
 +["examples/Utils/ChromeTraceUtil.cpp"]\
@@ -454,17 +454,17 @@ sources = ["examples/pybullet/pybullet.c"]\
 
 
 egl_renderer_sources = \
-["examples/SharedMemory/plugins/eglPlugin/eglRendererVisualShapeConverter.cpp"]\
-+["examples/SharedMemory/plugins/eglPlugin/eglRendererPlugin.cpp"]\
+["src/SharedMemory/plugins/eglPlugin/eglRendererVisualShapeConverter.cpp"]\
++["src/SharedMemory/plugins/eglPlugin/eglRendererPlugin.cpp"]\
 +["examples/Importers/ImportColladaDemo/LoadMeshFromCollada.cpp"]\
 +["examples/Importers/ImportObjDemo/LoadMeshFromObj.cpp"]\
 +["examples/Importers/ImportMeshUtility/b3ImportMeshUtility.cpp"]\
 +["examples/Importers/ImportObjDemo/Wavefront2GLInstanceGraphicsShape.cpp"]\
-+["examples/TinyRenderer/geometry.cpp"]\
-+["examples/TinyRenderer/model.cpp"]\
-+["examples/TinyRenderer/tgaimage.cpp"]\
-+["examples/TinyRenderer/our_gl.cpp"]\
-+["examples/TinyRenderer/TinyRenderer.cpp"]\
++["src/TinyRenderer/geometry.cpp"]\
++["src/TinyRenderer/model.cpp"]\
++["src/TinyRenderer/tgaimage.cpp"]\
++["src/TinyRenderer/our_gl.cpp"]\
++["src/TinyRenderer/TinyRenderer.cpp"]\
 +["examples/ThirdPartyLibs/Wavefront/tiny_obj_loader.cpp"]\
 +["examples/ThirdPartyLibs/stb_image/stb_image.cpp"]\
 +["examples/ThirdPartyLibs/stb_image/stb_image_write.cpp"]\
@@ -518,7 +518,7 @@ if _platform == "linux" or _platform == "linux2":
     if not os.path.isfile(os.path.join(_EMBREE_PREFIX, 'lib', 'libembree4.a')):
       subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
     CXX_FLAGS += '-DSWARM_RAYCAST '
-    sources = sources + ['examples/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp']
+    sources = sources + ['src/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp']
     include_dirs += [os.path.join(_EMBREE_PREFIX, 'include')]
     LINK_FLAGS += ' ' + ' '.join(os.path.join(_EMBREE_PREFIX, 'lib', 'lib%s.a' % name)
                                  for name in ('embree4', 'embree_avx2', 'sys', 'math', 'simd', 'lexers', 'tasking'))
