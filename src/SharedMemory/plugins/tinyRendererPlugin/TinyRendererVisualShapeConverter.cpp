@@ -1850,6 +1850,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_moverShadow = (m_data->m_flags & ER_SWARM_MOVER_SHADOW) != 0;
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
+		shading.m_linearLight = (m_data->m_flags & ER_SWARM_LINEAR_LIGHT) != 0;
 		shading.m_glint = glint;
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;

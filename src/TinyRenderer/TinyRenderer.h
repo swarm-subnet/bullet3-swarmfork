@@ -9,6 +9,7 @@
 #include "LinearMath/btVector3.h"
 
 #include "tgaimage.h"
+#include "SwarmGamma.h"
 
 // ER_SPECULAR_GLINT: a hit blends towards the sky colour of its mirrored view direction, weighted by the
 // object's specular colour times a glass Fresnel curve, so a surface seen at a grazing angle reflects
@@ -46,6 +47,30 @@ struct TinyRenderGlint
 		for (int i = 0; i < 3; i++)
 		{
 			const float sky = 255.f * (m_skyHorizon[i] + (m_skyZenith[i] - m_skyHorizon[i]) * t);
+			const float w = specular[i] * fresnel;
+			lit[i] = lit[i] + (sky - lit[i]) * w;
+		}
+	}
+
+	// The same blend on linear light: lit is 0..1 linear per channel and the sky is decoded to
+	// linear from the byte the render paints for it. Ray-cast path with ER_SWARM_LINEAR_LIGHT only.
+	void applyLinear(const float normal[3], const float toCamera[3], const float specular[3], float lit[3]) const
+	{
+		float nDotV = (normal[0] * toCamera[0] + normal[1] * toCamera[1]) + normal[2] * toCamera[2];
+		float side = 1.f;
+		if (nDotV < 0.f)
+		{
+			side = -1.f;
+			nDotV = -nDotV;
+		}
+		const float up = (normal[m_upAxis] * side) * (2.f * nDotV) - toCamera[m_upAxis];
+		const float t = up < 0.f ? 0.f : up;
+		const float f = 1.f - nDotV;
+		const float f2 = f * f;
+		const float fresnel = 0.04f + 0.96f * (f2 * f2 * f);
+		for (int i = 0; i < 3; i++)
+		{
+			const float sky = swarmUnitToLinear(m_skyHorizon[i] + (m_skyZenith[i] - m_skyHorizon[i]) * t);
 			const float w = specular[i] * fresnel;
 			lit[i] = lit[i] + (sky - lit[i]) * w;
 		}

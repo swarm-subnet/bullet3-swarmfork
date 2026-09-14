@@ -37,6 +37,10 @@ struct SwarmRaycastShading
 	// for whatever share is left. Depth and segmentation keep the first ray; every other pixel keeps
 	// its bytes.
 	bool m_edgeAntialias;
+	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
+	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
+	// encoded bytes as TinyRenderer's shader does.
+	bool m_linearLight;
 	TinyRenderGlint m_glint;
 };
 
