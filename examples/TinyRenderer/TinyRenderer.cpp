@@ -189,6 +189,8 @@ struct Shader : public IShader
 	float m_ambient_coefficient;
 	float m_diffuse_coefficient;
 	float m_specular_coefficient;
+	const TinyRenderGlint* m_glint;  // set when ER_SPECULAR_GLINT is on, else null
+	Vec3f m_cameraPos;
 
 	b3AlignedObjectArray<float>* m_shadowBuffer;
 
@@ -217,6 +219,7 @@ struct Shader : public IShader
 		  m_ambient_coefficient(ambient_coefficient),
 		  m_diffuse_coefficient(diffuse_coefficient),
 		  m_specular_coefficient(specular_coefficient),
+		  m_glint(0),
 
 		  m_shadowBuffer(shadowBuffer),
 		  m_width(width),
@@ -296,6 +299,20 @@ struct Shader : public IShader
 				orgColor=int(floatColor);
 			}
 			color[i] = b3Min(orgColor, 255);
+		}
+
+		if (m_glint)
+		{
+			Vec3f toCamera = (m_cameraPos - proj<3>(world_tri * bar)).normalize();
+			float lit[3] = {(float)color[0], (float)color[1], (float)color[2]};
+			m_glint->apply(&bn[0], &toCamera[0], &m_model->getSpecularColor()[0], lit);
+			for (int i = 0; i < 3; ++i)
+			{
+				int value = 0;
+				if (lit[i] == lit[i])
+					value = int(lit[i]);
+				color[i] = b3Min(b3Max(value, 0), 255);
+			}
 		}
 
 		return false;
@@ -673,6 +690,11 @@ void TinyRenderer::renderObject(TinyRenderObjectData& renderData)
 
 		Shader shader(model, light_dir_local, light_color, modelViewMatrix, lightModelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, renderData.m_viewportMatrix, localScaling, model->getColorRGBA(), width, height, shadowBufferPtr, renderData.m_lightAmbientCoeff, renderData.m_lightDiffuseCoeff, renderData.m_lightSpecularCoeff);
 		shader.m_needUvDerivatives = renderData.m_textureFilter;
+		if (renderData.m_glint.m_enabled)
+		{
+			shader.m_glint = &renderData.m_glint;
+			shader.m_cameraPos = Vec3f(P[0], P[1], P[2]);
+		}
 
 		{
 			B3_PROFILE("face");

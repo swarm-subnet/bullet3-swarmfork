@@ -37,6 +37,9 @@ struct UrdfRenderingInterface
 	///change the RGBA color for some visual shape.
 	virtual void changeRGBAColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double rgbaColor[4]) = 0;
 
+	///change the specular color for some visual shape; renderers without a use for it keep the default
+	virtual void changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3]) {}
+
 	//change the instance flags, double-sided rendering
 	virtual void changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags) = 0;
 

@@ -139,7 +139,7 @@ static bool meshMatchesArrays(const SharedMesh& mesh, const float* vertices, int
 	return true;
 }
 
-Model::Model(const char *filename) : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap_()
+Model::Model(const char *filename) : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap_(), m_specularColor(0.f, 0.f, 0.f)
 {
 	std::ifstream in;
 	in.open(filename, std::ifstream::in);
@@ -191,7 +191,7 @@ Model::Model(const char *filename) : m_mesh(new SharedMesh), m_diffuse(0), norma
 	load_texture(filename, "_spec.tga", specularmap_);
 }
 
-Model::Model() : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap_()
+Model::Model() : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap_(), m_specularColor(0.f, 0.f, 0.f)
 {
 }
 

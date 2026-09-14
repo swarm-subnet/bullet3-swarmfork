@@ -894,6 +894,8 @@ enum EnumRendererAuxFlags
 	// On the ray-cast path a hit on a texel whose alpha is below the cut-out threshold is a miss and
 	// the ray carries on, in colour, depth and shadow alike.
 	ER_ALPHA_CUTOUT = 512,
+	// Per-object specular colour reflects the sky with a view-angle term, on both colour paths.
+	ER_SPECULAR_GLINT = 1024,
 };
 
 ///flags to pick the IK solver and other options

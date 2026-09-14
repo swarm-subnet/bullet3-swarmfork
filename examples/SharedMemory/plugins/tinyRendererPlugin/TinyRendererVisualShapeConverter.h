@@ -26,6 +26,8 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 
 	virtual void changeRGBAColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double rgbaColor[4]);
 
+	virtual void changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3]);
+
 	virtual void changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags);
 
 	virtual void changeShapeTexture(int bodyUniqueId, int linkIndex, int shapeIndex, int textureUniqueId);

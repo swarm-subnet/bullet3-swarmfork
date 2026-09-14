@@ -13520,6 +13520,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_MOVER_SHADOW", ER_SWARM_MOVER_SHADOW);
 	PyModule_AddIntConstant(m, "ER_EDGE_ANTIALIAS", ER_EDGE_ANTIALIAS);
 	PyModule_AddIntConstant(m, "ER_ALPHA_CUTOUT", ER_ALPHA_CUTOUT);
+	PyModule_AddIntConstant(m, "ER_SPECULAR_GLINT", ER_SPECULAR_GLINT);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

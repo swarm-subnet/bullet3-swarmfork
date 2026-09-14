@@ -1,6 +1,8 @@
 #ifndef SWARM_RAYCAST_H
 #define SWARM_RAYCAST_H
 
+#include "../../../TinyRenderer/TinyRenderer.h"
+
 struct TinyRenderObjectData;
 class btTransform;
 class btVector3;
@@ -31,6 +33,7 @@ struct SwarmRaycastShading
 	// for whatever share is left. Depth and segmentation keep the first ray; every other pixel keeps
 	// its bytes.
 	bool m_edgeAntialias;
+	TinyRenderGlint m_glint;
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh

@@ -1163,8 +1163,9 @@ bool planeBarycentric(const float origin[3], const float dir[3], const float cor
 // TinyRenderer's fragment shader, term for term: interpolated normal and uv, the texture times the
 // object colour, ambient plus the shadowed diffuse and specular terms, truncated to bytes. A mesh
 // without vertex normals is lit by faceNormal, the triangle's own normal turned towards the camera.
+// With the glint on, the lit colour then blends towards the sky mirrored about the normal from viewDir.
 void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
-			  float shadow, bool filtered, const float duvdx[2], const float duvdy[2], unsigned char out[3])
+			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2], unsigned char out[3])
 {
 	TinyRender::Model* model = surface.m_model;
 	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
@@ -1198,13 +1199,24 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 									 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
 									 : model->diffuse(uv);
 	const TinyRender::Vec4f& rgba = model->getColorRGBA();
+	float lit[3];
 	for (int i = 0; i < 3; i++)
 	{
 		const unsigned char base = (unsigned char)(color[i] * rgba[i]);
-		const float lit = (shading.m_ambientCoeff * base + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i]);
+		const float value = (shading.m_ambientCoeff * base + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i]);
+		// The rasteriser truncates the lit colour to a byte before anything else reads it.
+		lit[i] = (float)(int)(value == value ? (value < 0.0f ? 0.0f : (value > 255.0f ? 255.0f : value)) : 0.0f);
+	}
+	if (shading.m_glint.m_enabled)
+	{
+		const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
+		shading.m_glint.apply(normal, toCamera, &model->getSpecularColor()[0], lit);
+	}
+	for (int i = 0; i < 3; i++)
+	{
 		int value = 0;
-		if (lit == lit)
-			value = (int)lit;
+		if (lit[i] == lit[i])
+			value = (int)lit[i];
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
@@ -1406,7 +1418,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		}
 	}
 
-	shadeHit(*shading, surface, rayhit.hit, faceNormal, shadow, filtered, duvdx, duvdy, out.m_rgb);
+	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, out.m_rgb);
 	return true;
 }
 
