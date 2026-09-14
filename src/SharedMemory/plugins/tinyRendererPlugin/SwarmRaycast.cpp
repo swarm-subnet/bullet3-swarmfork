@@ -1392,7 +1392,7 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 	for (int i = 0; i < 3; i++)
 	{
 		const unsigned char base = (unsigned char)(color[i] * rgba[i]);
-		const float value = (shading.m_ambientCoeff * base + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i]);
+		const float value = (shading.m_ambientCoeff * base * shading.m_ambientColor[i] + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i]);
 		// The rasteriser truncates the lit colour to a byte before anything else reads it.
 		lit[i] = (float)(int)(value == value ? (value < 0.0f ? 0.0f : (value > 255.0f ? 255.0f : value)) : 0.0f);
 	}

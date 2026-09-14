@@ -4608,6 +4608,15 @@ B3_SHARED_API void b3RequestCameraImageSetSkyColor(b3SharedMemoryCommandHandle c
 	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SKY_COLOR;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetSkyCloudSeed(b3SharedMemoryCommandHandle commandHandle, int seed)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_REQUEST_CAMERA_IMAGE_DATA);
+	command->m_requestPixelDataArguments.m_skyCloudSeed = seed;
+	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SKY_CLOUDS;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetLightDistance(b3SharedMemoryCommandHandle commandHandle, float lightDistance)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;

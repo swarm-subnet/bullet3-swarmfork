@@ -73,6 +73,9 @@ struct UrdfRenderingInterface
 	///paint a horizon-to-zenith sky where nothing is drawn, for this render only; disabled means the plain clear colour
 	virtual void setSkyColor(bool enabled, const float horizonColor[3], const float zenithColor[3]) {}
 
+	///seed the cloud layer of the ER_SWARM_SKY_SUN sky, for this render only; disabled means a clear sky
+	virtual void setSkyClouds(bool enabled, int seed) {}
+
 	///set the light distance
 	virtual void setLightDistance(float dist) = 0;
 

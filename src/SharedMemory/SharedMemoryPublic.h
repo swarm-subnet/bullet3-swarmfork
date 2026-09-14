@@ -896,6 +896,9 @@ enum EnumRendererAuxFlags
 	ER_ALPHA_CUTOUT = 512,
 	// Per-object specular colour reflects the sky with a view-angle term, on both colour paths.
 	ER_SPECULAR_GLINT = 1024,
+	// Colour path: a daylight sky computed once from the light direction and colour is painted where
+	// nothing is drawn, and its colour tints the ambient term. skyCloudSeed adds a cloud layer to it.
+	ER_SWARM_SKY_SUN = 2048,
 };
 
 ///flags to pick the IK solver and other options

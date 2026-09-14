@@ -267,6 +267,7 @@ extern "C"
 	B3_SHARED_API void b3RequestCameraImageSetLightDirection(b3SharedMemoryCommandHandle commandHandle, const float lightDirection[/*3*/]);
 	B3_SHARED_API void b3RequestCameraImageSetLightColor(b3SharedMemoryCommandHandle commandHandle, const float lightColor[/*3*/]);
 	B3_SHARED_API void b3RequestCameraImageSetSkyColor(b3SharedMemoryCommandHandle commandHandle, const float horizonColor[/*3*/], const float zenithColor[/*3*/]);
+	B3_SHARED_API void b3RequestCameraImageSetSkyCloudSeed(b3SharedMemoryCommandHandle commandHandle, int seed);
 	B3_SHARED_API void b3RequestCameraImageSetLightDistance(b3SharedMemoryCommandHandle commandHandle, float lightDistance);
 	B3_SHARED_API void b3RequestCameraImageSetLightAmbientCoeff(b3SharedMemoryCommandHandle commandHandle, float lightAmbientCoeff);
 	B3_SHARED_API void b3RequestCameraImageSetLightDiffuseCoeff(b3SharedMemoryCommandHandle commandHandle, float lightDiffuseCoeff);

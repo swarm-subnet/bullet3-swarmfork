@@ -63,6 +63,7 @@ struct TinyRenderObjectData
 	btVector3 m_lightColor;
 	float m_lightDistance;
 	float m_lightAmbientCoeff;
+	btVector3 m_lightAmbientColor;  // tint on the ambient term, white unless a sky lends its colour
 	float m_lightDiffuseCoeff;
 	float m_lightSpecularCoeff;
 

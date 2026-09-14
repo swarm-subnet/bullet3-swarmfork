@@ -24,6 +24,7 @@ subject to the following restrictions:
 #include <string>
 #include "../../../../examples/Utils/b3ResourcePath.h"
 #include "../../../TinyRenderer/TinyRenderer.h"
+#include "SwarmSky.h"
 #include "../../../../examples/OpenGLWindow/SimpleCamera.h"
 #include "../../../../examples/Importers/ImportMeshUtility/b3ImportMeshUtility.h"
 #include <iostream>
@@ -95,6 +96,9 @@ struct TinyRendererVisualShapeConverterInternalData
 	int m_skyRayHeight;
 	float m_skyRayInvP00;
 	float m_skyRayInvP11;
+	bool m_hasSkyClouds;
+	int m_skyCloudSeed;
+	SwarmSky m_sunSky;  // built on the first ER_SWARM_SKY_SUN render and kept while the sun stays
 	float m_lightDistance;
 	bool m_hasLightDistance;
 	float m_lightAmbientCoeff;
@@ -133,6 +137,8 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_skyRayHeight(0),
 		m_skyRayInvP00(0.f),
 		m_skyRayInvP11(0.f),
+		m_hasSkyClouds(false),
+		m_skyCloudSeed(0),
 		m_lightDistance(2.0),
 		m_hasLightDistance(false),
 		m_lightAmbientCoeff(0.6),
@@ -219,6 +225,12 @@ void TinyRendererVisualShapeConverter::setSkyColor(bool enabled, const float hor
 		m_data->m_skyHorizonColor.setValue(horizonColor[0], horizonColor[1], horizonColor[2]);
 		m_data->m_skyZenithColor.setValue(zenithColor[0], zenithColor[1], zenithColor[2]);
 	}
+}
+
+void TinyRendererVisualShapeConverter::setSkyClouds(bool enabled, int seed)
+{
+	m_data->m_hasSkyClouds = enabled;
+	m_data->m_skyCloudSeed = enabled ? seed : 0;
 }
 
 void TinyRendererVisualShapeConverter::setLightDistance(float dist)
@@ -1371,23 +1383,43 @@ static unsigned char skyByte(float v)
 	return (unsigned char)(v * 255.f + 0.5f);
 }
 
-// Colour buffer only: each pixel's view ray is lifted to world space and its
-// component along the up axis blends horizon (level or below) into zenith (straight up).
-void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16])
+// Colour buffer only: each pixel's view ray is lifted to world space and either read from the
+// sun sky map, or its component along the up axis blends horizon (level or below) into zenith
+// (straight up).
+void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky)
 {
 	const int width = m_data->m_swWidth;
 	const int height = m_data->m_swHeight;
 	const int up = m_data->m_upAxis;
+	// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
+	// world space takes the rows of the inverse view rotation, the sun sky all three.
+	const float invP00 = 1.f / projMat[0];
+	const float invP11 = 1.f / projMat[5];
+	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
+	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+
+	if (sunSky)
+	{
+		for (int y = 0; y < height; ++y)
+		{
+			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
+			for (int x = 0; x < width; ++x, pixel += bytespp)
+			{
+				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
+				sunSky->lookup(viewMat[0] * dx + viewMat[1] * dy - viewMat[2],
+							   viewMat[4] * dx + viewMat[5] * dy - viewMat[6],
+							   viewMat[8] * dx + viewMat[9] * dy - viewMat[10], pixel);
+			}
+		}
+		return;
+	}
+
 	const float hr = (float)m_data->m_skyHorizonColor[0];
 	const float hg = (float)m_data->m_skyHorizonColor[1];
 	const float hb = (float)m_data->m_skyHorizonColor[2];
 	const float sr = (float)m_data->m_skyZenithColor[0] - hr;
 	const float sg = (float)m_data->m_skyZenithColor[1] - hg;
 	const float sb = (float)m_data->m_skyZenithColor[2] - hb;
-	// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
-	// world space needs only the up-axis row of the inverse view rotation.
-	const float invP00 = 1.f / projMat[0];
-	const float invP11 = 1.f / projMat[5];
 	const float rx = viewMat[up * 4 + 0];
 	const float ry = viewMat[up * 4 + 1];
 	const float rz = viewMat[up * 4 + 2];
@@ -1412,8 +1444,6 @@ void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const f
 	}
 
 	// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
-	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
-	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
 	const float* invLen = &m_data->m_skyInvRayLen[0];
 	for (int y = 0; y < height; ++y)
 	{
@@ -1687,10 +1717,6 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	m_data->m_camera.setCameraFrustumFar(far);
 
 	clearBuffers(clearColor);
-	if (m_data->m_hasSky && (m_data->m_flags & ER_DEPTH_ONLY) == 0)
-	{
-		paintSky(viewMat, projMat);
-	}
 
 	ATTRIBUTE_ALIGNED16(btScalar modelMat[16]);
 
@@ -1749,16 +1775,45 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 
 	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
 
+	// The sun sky is computed from the light once and kept while the light stays; it also tints
+	// the ambient term. Without it the tint is exactly 1, so the shading bytes are unchanged.
+	const SwarmSky* sunSky = 0;
+	btVector3 ambientColor(1.0, 1.0, 1.0);
+	if ((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 && !depthOnly)
+	{
+		float sunDir[3], sunColor[3];
+		for (int i = 0; i < 3; i++)
+		{
+			sunDir[i] = (float)lightDirWorld[i];
+			sunColor[i] = (float)lightColor[i];
+		}
+		m_data->m_sunSky.prepare(sunDir, sunColor, m_data->m_hasSkyClouds, (unsigned)m_data->m_skyCloudSeed, m_data->m_upAxis);
+		sunSky = &m_data->m_sunSky;
+		ambientColor.setValue(sunSky->ambientColor()[0], sunSky->ambientColor()[1], sunSky->ambientColor()[2]);
+	}
+
 	TinyRenderGlint glint;
 	glint.m_enabled = (m_data->m_flags & ER_SPECULAR_GLINT) != 0 && !depthOnly;
 	glint.m_upAxis = m_data->m_upAxis;
-	if (m_data->m_hasSky)
+	if (sunSky)
+	{
+		for (int i = 0; i < 3; i++)
+		{
+			glint.m_skyHorizon[i] = sunSky->horizonColor()[i];
+			glint.m_skyZenith[i] = sunSky->zenithColor()[i];
+		}
+	}
+	else if (m_data->m_hasSky)
 	{
 		for (int i = 0; i < 3; i++)
 		{
 			glint.m_skyHorizon[i] = (float)m_data->m_skyHorizonColor[i];
 			glint.m_skyZenith[i] = (float)m_data->m_skyZenithColor[i];
 		}
+	}
+	if ((sunSky || m_data->m_hasSky) && !depthOnly)
+	{
+		paintSky(viewMat, projMat, sunSky);
 	}
 
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
@@ -1770,13 +1825,14 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
 		// The sky is painted for the flip the rasterised path does once it has drawn; this path
 		// writes its rows the right way up and never flips, so the sky is turned over here.
-		if (m_data->m_hasSky && !depthOnly)
+		if ((sunSky || m_data->m_hasSky) && !depthOnly)
 			m_data->m_rgbColorBuffer.flip_vertically();
 		SwarmRaycastShading shading;
 		for (int i = 0; i < 3; i++)
 		{
 			shading.m_lightDir[i] = (float)lightDirWorld[i];
 			shading.m_lightColor[i] = (float)lightColor[i];
+			shading.m_ambientColor[i] = (float)ambientColor[i];
 		}
 		shading.m_ambientCoeff = lightAmbientCoeff;
 		shading.m_diffuseCoeff = lightDiffuseCoeff;
@@ -1832,6 +1888,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 				renderObj->m_lightColor = lightColor;
 				renderObj->m_lightDistance = lightDistance;
 				renderObj->m_lightAmbientCoeff = lightAmbientCoeff;
+				renderObj->m_lightAmbientColor = ambientColor;
 				renderObj->m_lightDiffuseCoeff = lightDiffuseCoeff;
 				renderObj->m_lightSpecularCoeff = lightSpecularCoeff;
 				TinyRenderer::renderObjectDepth(*renderObj);
@@ -1941,6 +1998,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			renderObj->m_lightColor = lightColor;
 			renderObj->m_lightDistance = lightDistance;
 			renderObj->m_lightAmbientCoeff = lightAmbientCoeff;
+			renderObj->m_lightAmbientColor = ambientColor;
 			renderObj->m_lightDiffuseCoeff = lightDiffuseCoeff;
 			renderObj->m_lightSpecularCoeff = lightSpecularCoeff;
 

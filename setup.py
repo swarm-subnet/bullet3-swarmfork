@@ -271,6 +271,7 @@ sources = ["src/pybullet/pybullet.c"]\
 +["src/SharedMemory/Win32SharedMemory.cpp"]\
 +["src/SharedMemory/PosixSharedMemory.cpp"]\
 +["src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp"]\
++["src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.cpp"]\
 +["src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp"]\
 +["src/SharedMemory/PhysicsClientUDP.cpp"]\
 +["src/SharedMemory/PhysicsClientUDP_C_API.cpp"]\

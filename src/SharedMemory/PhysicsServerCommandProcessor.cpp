@@ -4372,6 +4372,7 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 
 					// The sky is per request, unlike the light: absent means the plain clear colour.
 					m_data->m_pluginManager.getRenderInterface()->setSkyColor((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_SKY_COLOR) != 0, clientCmd.m_requestPixelDataArguments.m_skyHorizonColor, clientCmd.m_requestPixelDataArguments.m_skyZenithColor);
+					m_data->m_pluginManager.getRenderInterface()->setSkyClouds((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_SKY_CLOUDS) != 0, clientCmd.m_requestPixelDataArguments.m_skyCloudSeed);
 
 					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_LIGHT_DISTANCE) != 0)
 					{
