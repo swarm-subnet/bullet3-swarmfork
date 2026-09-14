@@ -899,6 +899,9 @@ enum EnumRendererAuxFlags
 	// Colour path: a daylight sky computed once from the light direction and colour is painted where
 	// nothing is drawn, and its colour tints the ambient term. skyCloudSeed adds a cloud layer to it.
 	ER_SWARM_SKY_SUN = 2048,
+	// On the ray-cast path the texel and body colour are decoded to linear light through a fixed table,
+	// lit, blended and glinted there, and encoded back to sRGB on the byte write.
+	ER_SWARM_LINEAR_LIGHT = 4096,
 };
 
 ///flags to pick the IK solver and other options

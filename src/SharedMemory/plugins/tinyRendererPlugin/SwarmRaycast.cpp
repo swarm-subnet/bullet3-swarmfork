@@ -1353,6 +1353,8 @@ bool planeBarycentric(const float origin[3], const float dir[3], const float cor
 // object colour, ambient plus the shadowed diffuse and specular terms, truncated to bytes. A mesh
 // without vertex normals is lit by faceNormal, the triangle's own normal turned towards the camera.
 // With the glint on, the lit colour then blends towards the sky mirrored about the normal from viewDir.
+// With linear light the same terms run on the decoded value of the texture-times-colour byte, the
+// glint blends in linear too, and the byte written is the sRGB encoding of the result.
 void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
 			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2], unsigned char out[3])
 {
@@ -1388,7 +1390,21 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 									 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
 									 : model->diffuse(uv);
 	const TinyRender::Vec4f& rgba = model->getColorRGBA();
+	const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
 	float lit[3];
+	if (shading.m_linearLight)
+	{
+		for (int i = 0; i < 3; i++)
+		{
+			const float base = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+			lit[i] = shading.m_ambientCoeff * base * shading.m_ambientColor[i] + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i];
+		}
+		if (shading.m_glint.m_enabled)
+			shading.m_glint.applyLinear(normal, toCamera, &model->getSpecularColor()[0], lit);
+		for (int i = 0; i < 3; i++)
+			out[i] = swarmLinearToSrgb(lit[i]);
+		return;
+	}
 	for (int i = 0; i < 3; i++)
 	{
 		const unsigned char base = (unsigned char)(color[i] * rgba[i]);
@@ -1397,10 +1413,7 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		lit[i] = (float)(int)(value == value ? (value < 0.0f ? 0.0f : (value > 255.0f ? 255.0f : value)) : 0.0f);
 	}
 	if (shading.m_glint.m_enabled)
-	{
-		const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
 		shading.m_glint.apply(normal, toCamera, &model->getSpecularColor()[0], lit);
-	}
 	for (int i = 0; i < 3; i++)
 	{
 		int value = 0;
@@ -1834,7 +1847,8 @@ inline bool sameTriangle(const HitId& a, const HitId& b)
 // the pixel it covers, with the colour pass one already shaded for it. A body in front of the pixel's
 // own hit is composited over it at its true width, so a thin pole or cable stops breaking into dots.
 // Whatever share is left uncovered is asked with one probe ray at its centre, which is the only ray
-// this pass casts. Depth and segmentation stay as the first ray wrote them.
+// this pass casts. Depth and segmentation stay as the first ray wrote them. With linear light every
+// byte that enters the blend is decoded first and the blend is encoded once on the write.
 void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, const EdgeScratch& scratch,
 				int row0, int row1, int col0, int col1,
 				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache)
@@ -1845,6 +1859,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const int* ids = &scratch.m_ids[0];
 	const HitId* hits = &scratch.m_hits[0];
 	const unsigned char* rgb1 = &scratch.m_rgb1[0];
+	const bool linear = job.m_shading->m_linearLight;
 	const double halfX = 1.0 / (double)width;
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
@@ -1922,7 +1937,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				if (share <= 0.0)
 					continue;
 				for (int i = 0; i < 3; i++)
-					colour[i] += share * candidates[c].m_rgb[i];
+					colour[i] += share * (linear ? kSwarmSrgbToLinear[candidates[c].m_rgb[i]] : (double)candidates[c].m_rgb[i]);
 				coveredCx += share * cx;
 				coveredCy += share * cy;
 				covered += share;
@@ -1945,7 +1960,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 									 : &scratch.m_background[offset * 3];
 				}
 				for (int i = 0; i < 3; i++)
-					colour[i] += rest * restColour[i];
+					colour[i] += rest * (linear ? kSwarmSrgbToLinear[restColour[i]] : (double)restColour[i]);
 			}
 			else if (covered < 1.0)
 				for (int i = 0; i < 3; i++)
@@ -1954,6 +1969,11 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			unsigned char* pixel = target.m_rgb + offset * 3;
 			for (int i = 0; i < 3; i++)
 			{
+				if (linear)
+				{
+					pixel[i] = swarmLinearToSrgb((float)colour[i]);
+					continue;
+				}
 				const int value = (int)(colour[i] + 0.5);
 				pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 			}
