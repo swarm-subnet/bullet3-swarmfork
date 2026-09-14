@@ -329,7 +329,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userIndex(-1),
 	  m_objectIndex(-1),
 	  m_doubleSided(false),
-	  m_textureFilter(false)
+	  m_textureFilter(false),
+	  m_renderTreeCache(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -357,7 +358,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_objectIndex(objectIndex),
 	  m_linkIndex(linkIndex),
 	  m_doubleSided(false),
-	  m_textureFilter(false)
+	  m_textureFilter(false),
+	  m_renderTreeCache(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -384,7 +386,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userIndex(-1),
 	  m_objectIndex(-1),
 	m_doubleSided(false),
-	  m_textureFilter(false)
+	  m_textureFilter(false),
+	  m_renderTreeCache(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -412,7 +415,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_userIndex(-1),
 	  m_objectIndex(objectIndex),
 	m_doubleSided(false),
-	  m_textureFilter(false)
+	  m_textureFilter(false),
+	  m_renderTreeCache(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);

@@ -1,0 +1,359 @@
+diff -ruN a/include/embree4/rtcore_scene.h b/include/embree4/rtcore_scene.h
+--- a/include/embree4/rtcore_scene.h
++++ b/include/embree4/rtcore_scene.h
+@@ -342,6 +342,15 @@
+ /*! Performs collision detection of two scenes */
+ RTC_API void rtcCollide (RTCScene scene0, RTCScene scene1, RTCCollideFunc callback, void* userPtr);
+ 
++/* Copies the committed tree of a scene into buffer as a relocatable image and returns its size in
++   bytes, or 0 when the scene holds a tree the image format does not cover. With a null buffer or a
++   capacity below the size nothing is copied and only the size is returned. */
++RTC_API size_t rtcSwarmSaveTree(RTCScene scene, void* buffer, size_t capacity);
++
++/* Hands a scene an image from rtcSwarmSaveTree: its next commit takes the tree from the image instead
++   of building it, provided the geometry matches the image; otherwise it builds as usual. */
++RTC_API void rtcSwarmLoadTree(RTCScene scene, const void* buffer, size_t bytes);
++
+ #if defined(__cplusplus)
+ 
+ /* Helper for easily combining scene flags */
+diff -ruN a/kernels/bvh/bvh_builder_sah.cpp b/kernels/bvh/bvh_builder_sah.cpp
+--- a/kernels/bvh/bvh_builder_sah.cpp
++++ b/kernels/bvh/bvh_builder_sah.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "bvh.h"
+ #include "bvh_builder.h"
++#include "bvh_swarm_tree.h"
+ #include "../builders/primrefgen.h"
+ #include "../builders/splitter.h"
+ 
+@@ -131,6 +132,19 @@
+ 
+         double t0 = bvh->preBuild(mesh ? "" : TOSTRING(isa) "::BVH" + toString(N) + "BuilderSAH");
+ 
++        /* a tree image handed to the scene replaces the build once, matching or not */
++        if (scene && !scene->swarm_tree.empty()) {
++          const bool loaded = swarmLoadTree(bvh,scene->swarm_tree,numPrimitives);
++          scene->swarm_tree.clear();
++          scene->swarm_tree.shrink_to_fit();
++          if (loaded) {
++            prims.clear();
++            bvh->cleanup();
++            bvh->postBuild(t0);
++            return;
++          }
++        }
++
+ #if PROFILE
+         profile(2,PROFILE_RUNS,numPrimitives,[&] (ProfileTimer& timer) {
+ #endif
+diff -ruN a/kernels/bvh/bvh_swarm_tree.cpp b/kernels/bvh/bvh_swarm_tree.cpp
+--- a/kernels/bvh/bvh_swarm_tree.cpp
++++ b/kernels/bvh/bvh_swarm_tree.cpp
+@@ -0,0 +1,21 @@
++// Copyright 2009-2021 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++
++#include "bvh_swarm_tree.h"
++
++namespace embree
++{
++  std::vector<char> swarmSaveTree(Scene* scene)
++  {
++    if (scene->accels.size() != 1)
++      return std::vector<char>();
++    AccelData* data = scene->accels[0]->intersectors.ptr;
++    if (!data)
++      return std::vector<char>();
++    if (data->type == AccelData::TY_BVH8)
++      return SwarmTreeWriter<8>((BVH8*) data).run();
++    if (data->type == AccelData::TY_BVH4)
++      return SwarmTreeWriter<4>((BVH4*) data).run();
++    return std::vector<char>();
++  }
++}
+diff -ruN a/kernels/bvh/bvh_swarm_tree.h b/kernels/bvh/bvh_swarm_tree.h
+--- a/kernels/bvh/bvh_swarm_tree.h
++++ b/kernels/bvh/bvh_swarm_tree.h
+@@ -0,0 +1,210 @@
++// Copyright 2009-2021 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "bvh.h"
++#include "../common/scene.h"
++
++namespace embree
++{
++  /* A built BVH written out as one relocatable image: every box node and every leaf block copied
++   * byte for byte, with each child reference turned into an offset into the image plus its type
++   * bits. Only box nodes and leaves of a fixed-size primitive are supported, which is what a static
++   * triangle build produces; any other node type makes the save fail. */
++  struct SwarmTreeHeader
++  {
++    char magic[8];
++    char primitive[16];
++    unsigned int width;
++    unsigned int primitiveBytes;
++    unsigned long long numPrimitives;
++    unsigned long long root;
++    unsigned long long bytes;
++    float lower[4];
++    float upper[4];
++  };
++
++  static const char* const swarmTreeMagic = "SWEMBR01";
++
++  template<int N>
++  struct SwarmTreeWriter
++  {
++    typedef BVHN<N> BVH;
++    typedef typename BVH::NodeRef NodeRef;
++    typedef typename BVH::AABBNode AABBNode;
++
++    BVH* bvh;
++    size_t primitiveBytes;
++    std::vector<char> image;
++    size_t cursor;
++    bool ok;
++
++    SwarmTreeWriter(BVH* bvh)
++      : bvh(bvh), primitiveBytes(0), cursor(0), ok(true) {}
++
++    static size_t aligned(size_t bytes) {
++      return (bytes + BVH::byteNodeAlignment - 1) & ~(BVH::byteNodeAlignment - 1);
++    }
++
++    /* Bytes the subtree takes in the image, so the image is sized once before anything is copied. */
++    size_t measure(NodeRef ref)
++    {
++      if (ref == BVH::emptyNode)
++        return 0;
++      if (ref.isLeaf()) {
++        size_t num; ref.leaf(num);
++        return aligned(num * primitiveBytes);
++      }
++      if (!ref.isAABBNode()) {
++        ok = false;
++        return 0;
++      }
++      size_t bytes = aligned(sizeof(AABBNode));
++      for (size_t i = 0; i < N; i++)
++        bytes += measure(ref.getAABBNode()->child(i));
++      return bytes;
++    }
++
++    size_t reserve(size_t bytes)
++    {
++      const size_t offset = cursor;
++      cursor += aligned(bytes);
++      return offset;
++    }
++
++    size_t write(NodeRef ref)
++    {
++      if (ref == BVH::emptyNode)
++        return BVH::emptyNode;
++      if (ref.isLeaf()) {
++        size_t num; const char* prims = ref.leaf(num);
++        const size_t bytes = num * primitiveBytes;
++        const size_t offset = reserve(bytes);
++        memcpy(&image[offset], prims, bytes);
++        return offset | (NodeRef::tyLeaf + num);
++      }
++      if (!ref.isAABBNode()) {
++        ok = false;
++        return BVH::emptyNode;
++      }
++      const AABBNode* node = ref.getAABBNode();
++      const size_t offset = reserve(sizeof(AABBNode));
++      memcpy(&image[offset], node, sizeof(AABBNode));
++      for (size_t i = 0; i < N; i++) {
++        const size_t child = write(node->child(i));
++        ((AABBNode*) &image[offset])->children[i] = NodeRef(child);
++      }
++      return offset | NodeRef::tyAABBNode;
++    }
++
++    /* Returns the header followed by the image, empty when the tree holds a node type the format
++     * does not cover. Offsets inside the image count from its own first byte, after the header. */
++    std::vector<char> run()
++    {
++      const BBox3fa bounds = bvh->bounds.bounds();
++      SwarmTreeHeader header;
++      memset(&header, 0, sizeof(header));
++      memcpy(header.magic, swarmTreeMagic, 8);
++      strncpy(header.primitive, bvh->primTy->name(), sizeof(header.primitive) - 1);
++      header.width = N;
++      header.numPrimitives = bvh->numPrimitives;
++      for (int i = 0; i < 3; i++) { header.lower[i] = bounds.lower[i]; header.upper[i] = bounds.upper[i]; }
++      if (bvh->root != BVH::emptyNode) {
++        size_t num;
++        NodeRef first = bvh->root;
++        while (!first.isLeaf()) {
++          if (!first.isAABBNode()) return std::vector<char>();
++          first = first.getAABBNode()->child(0);
++        }
++        primitiveBytes = bvh->primTy->getBytes(first.leaf(num));
++      }
++      header.primitiveBytes = (unsigned int) primitiveBytes;
++      image.resize(measure(bvh->root));
++      if (!ok) return std::vector<char>();
++      header.root = write(bvh->root);
++      header.bytes = image.size();
++      if (!ok || cursor != image.size()) return std::vector<char>();
++      std::vector<char> out(sizeof(header) + image.size());
++      memcpy(&out[0], &header, sizeof(header));
++      if (!image.empty()) memcpy(&out[sizeof(header)], &image[0], image.size());
++      return out;
++    }
++  };
++
++  template<int N>
++  struct SwarmTreeReader
++  {
++    typedef BVHN<N> BVH;
++    typedef typename BVH::NodeRef NodeRef;
++    typedef typename BVH::AABBNode AABBNode;
++
++    BVH* bvh;
++    const char* payload;
++    size_t bytes;
++    size_t primitiveBytes;
++    FastAllocator::CachedAllocator alloc;
++    bool ok;
++
++    SwarmTreeReader(BVH* bvh, const char* payload, size_t bytes, size_t primitiveBytes)
++      : bvh(bvh), payload(payload), bytes(bytes), primitiveBytes(primitiveBytes), alloc(bvh->alloc.getCachedAllocator()), ok(true) {}
++
++    NodeRef read(size_t ref)
++    {
++      if (!ok || ref == BVH::emptyNode)
++        return NodeRef(BVH::emptyNode);
++      const size_t offset = ref & ~(size_t) NodeRef::align_mask;
++      if (ref & NodeRef::tyLeaf) {
++        const size_t num = (ref & NodeRef::items_mask) - NodeRef::tyLeaf;
++        const size_t size = num * primitiveBytes;
++        if (num == 0 || offset + size > bytes) { ok = false; return NodeRef(BVH::emptyNode); }
++        char* prims = (char*) alloc.malloc1(size, BVH::byteAlignment);
++        memcpy(prims, payload + offset, size);
++        return BVH::encodeLeaf(prims, num);
++      }
++      if ((ref & NodeRef::align_mask) != NodeRef::tyAABBNode || offset + sizeof(AABBNode) > bytes) {
++        ok = false;
++        return NodeRef(BVH::emptyNode);
++      }
++      AABBNode* node = (AABBNode*) alloc.malloc0(sizeof(AABBNode), BVH::byteNodeAlignment);
++      memcpy(node, payload + offset, sizeof(AABBNode));
++      for (size_t i = 0; i < N; i++)
++        node->children[i] = read((size_t) ((const AABBNode*) (payload + offset))->children[i]);
++      return BVH::encodeNode(node);
++    }
++  };
++
++  /* Fills bvh from the image a scene was handed before its commit, when that image describes a tree
++   * of this width, primitive type and primitive count. Returns false, leaving bvh untouched, when the
++   * image does not fit or is damaged; the caller then builds as usual. */
++  template<int N>
++  bool swarmLoadTree(BVHN<N>* bvh, const std::vector<char>& image, size_t numPrimitives)
++  {
++    typedef BVHN<N> BVH;
++    if (image.size() < sizeof(SwarmTreeHeader))
++      return false;
++    SwarmTreeHeader header;
++    memcpy(&header, &image[0], sizeof(header));
++    if (memcmp(header.magic, swarmTreeMagic, 8) != 0 || header.width != N ||
++        strncmp(header.primitive, bvh->primTy->name(), sizeof(header.primitive)) != 0 ||
++        header.numPrimitives != numPrimitives || header.bytes != image.size() - sizeof(header) ||
++        header.primitiveBytes == 0)
++      return false;
++
++    bvh->alloc.init_estimate(header.bytes);
++    SwarmTreeReader<N> reader(bvh, &image[sizeof(header)], header.bytes, header.primitiveBytes);
++    typename BVH::NodeRef root = reader.read((size_t) header.root);
++    if (!reader.ok) {
++      bvh->alloc.reset();
++      return false;
++    }
++    const BBox3fa bounds(Vec3fa(header.lower[0], header.lower[1], header.lower[2]),
++                         Vec3fa(header.upper[0], header.upper[1], header.upper[2]));
++    bvh->set(root, LBBox3fa(bounds), numPrimitives);
++    return true;
++  }
++
++  /* The committed tree of a scene as an image, or an empty vector when the scene holds none, more than
++   * one, or one the format does not cover. */
++  std::vector<char> swarmSaveTree(Scene* scene);
++}
+diff -ruN a/kernels/CMakeLists.txt b/kernels/CMakeLists.txt
+--- a/kernels/CMakeLists.txt
++++ b/kernels/CMakeLists.txt
+@@ -72,6 +72,7 @@
+   builders/primrefgen.cpp
+ 
+   bvh/bvh.cpp
++  bvh/bvh_swarm_tree.cpp
+   bvh/bvh_statistics.cpp
+   bvh/bvh4_factory.cpp
+   bvh/bvh8_factory.cpp
+diff -ruN a/kernels/common/rtcore.cpp b/kernels/common/rtcore.cpp
+--- a/kernels/common/rtcore.cpp
++++ b/kernels/common/rtcore.cpp
+@@ -8,6 +8,7 @@
+ #include "scene.h"
+ #include "context.h"
+ #include "../geometry/filter.h"
++#include "../bvh/bvh_swarm_tree.h"
+ #include "../../include/embree4/rtcore_ray.h"
+ using namespace embree;
+ 
+@@ -445,6 +446,34 @@
+     RTC_CATCH_END2(scene);
+   }
+ 
++  RTC_API size_t rtcSwarmSaveTree(RTCScene hscene, void* buffer, size_t capacity)
++  {
++    Scene* scene = (Scene*) hscene;
++    RTC_CATCH_BEGIN;
++    RTC_TRACE(rtcSwarmSaveTree);
++    RTC_VERIFY_HANDLE(hscene);
++    if (scene->isModified()) throw_RTCError(RTC_ERROR_INVALID_OPERATION,"scene not committed");
++    const std::vector<char> image = swarmSaveTree(scene);
++    if (buffer && capacity >= image.size() && !image.empty())
++      memcpy(buffer, &image[0], image.size());
++    return image.size();
++    RTC_CATCH_END2(scene);
++    return 0;
++  }
++
++  RTC_API void rtcSwarmLoadTree(RTCScene hscene, const void* buffer, size_t bytes)
++  {
++    Scene* scene = (Scene*) hscene;
++    RTC_CATCH_BEGIN;
++    RTC_TRACE(rtcSwarmLoadTree);
++    RTC_VERIFY_HANDLE(hscene);
++    if (buffer && bytes)
++      scene->swarm_tree.assign((const char*) buffer, (const char*) buffer + bytes);
++    else
++      scene->swarm_tree.clear();
++    RTC_CATCH_END2(scene);
++  }
++
+   RTC_API void rtcCollide (RTCScene hscene0, RTCScene hscene1, RTCCollideFunc callback, void* userPtr)
+   {
+     Scene* scene0 = (Scene*) hscene0;
+diff -ruN a/kernels/common/scene.h b/kernels/common/scene.h
+--- a/kernels/common/scene.h
++++ b/kernels/common/scene.h
+@@ -384,6 +384,9 @@
+     void progressMonitor(double nprims);
+     void setProgressMonitorFunction(RTCProgressMonitorFunction func, void* ptr);
+ 
++    /* tree image handed over by rtcSwarmLoadTree; the next build takes it instead of building */
++    std::vector<char> swarm_tree;
++
+   private:
+     GeometryCounts world;               //!< counts for geometry
+ 

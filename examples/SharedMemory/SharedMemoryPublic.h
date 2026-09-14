@@ -1139,6 +1139,7 @@ enum eEnumUpdateVisualShapeFlags
 	eVISUAL_SHAPE_DOUBLE_SIDED = 4,//see B3_INSTANCE_DOUBLE_SIDED
 	eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY = 8,//double-sided render for multibody visuals, on create and update
 	eVISUAL_SHAPE_MATERIALS_FROM_MTL = 16,//one render object per OBJ material, colour and texture from the MTL
+	eVISUAL_SHAPE_RENDER_TREE_CACHE = 32,//ray-cast tree of a static body saved under SWARM_BVH_CACHE_DIR and loaded when present
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

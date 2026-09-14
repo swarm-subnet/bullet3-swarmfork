@@ -2,11 +2,20 @@
 
 #include <embree4/rtcore.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <map>
+#include <string>
 #include <vector>
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
 #endif
 
 #include "../../../TinyRenderer/TinyRenderer.h"
@@ -93,7 +102,9 @@ struct StaticMember
 	int m_segmentation;
 };
 
-// One tree per distinct mesh, shared by every mover instance drawn from that mesh.
+// One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
+// instead holds one static body's triangles in world space, drawn through an identity instance,
+// so its tree can be kept on disk under the body's mesh and pose.
 struct MeshTree
 {
 	RTCScene m_scene;
@@ -105,7 +116,26 @@ struct MeshTree
 	std::vector<float> m_uvs;
 	int m_refs;
 	bool m_dirty;
+	bool m_world;
+	// The body transform a world tree was built for; the body counts as moved once it differs.
+	float m_pose[16];
 };
+
+// A world tree on disk: <SWARM_BVH_CACHE_DIR>/<key>.rtree holds the world-space vertex, index,
+// normal and uv blocks followed by Embree's image of the built tree, keyed by the mesh content
+// hash, the body pose and scale.
+struct TreeCacheHeader
+{
+	char m_magic[8];
+	unsigned long long m_key;
+	unsigned int m_numVertices;
+	unsigned int m_numTriangles;
+	unsigned int m_hasNormals;
+	unsigned int m_reserved;
+	unsigned long long m_treeBytes;
+};
+
+const char* const kTreeCacheMagic = "SWRTREE1";
 
 struct Instance
 {
@@ -346,6 +376,107 @@ void copyRotation(const btTransform& worldTransform, float out[9])
 			out[r * 3 + c] = (float)basis[r][c];
 }
 
+unsigned long long fnv1a(const void* data, size_t len, unsigned long long hash)
+{
+	const unsigned char* bytes = (const unsigned char*)data;
+	for (size_t i = 0; i < len; i++)
+	{
+		hash ^= bytes[i];
+		hash *= 1099511628211ULL;
+	}
+	return hash;
+}
+
+// Key of a world tree: the mesh content hash and the exact floats copyWorldVertices takes.
+unsigned long long treeCacheKey(TinyRender::Model* model, const btTransform& worldTransform, const btVector3& localScaling)
+{
+	ATTRIBUTE_ALIGNED16(btScalar gl[16]);
+	worldTransform.getOpenGLMatrix(gl);
+	float pose[19];
+	for (int i = 0; i < 16; i++)
+		pose[i] = (float)gl[i];
+	for (int i = 0; i < 3; i++)
+		pose[16 + i] = (float)localScaling[i];
+	const unsigned long long meshHash = model->meshHash();
+	unsigned long long hash = fnv1a(kTreeCacheMagic, 8, 14695981039346656037ULL);
+	hash = fnv1a(&meshHash, sizeof(meshHash), hash);
+	return fnv1a(pose, sizeof(pose), hash);
+}
+
+bool readBlock(FILE* f, std::vector<float>& out, size_t count, size_t padding)
+{
+	out.assign(count + padding, 0.0f);
+	return count == 0 || fread(&out[0], sizeof(float), count, f) == count;
+}
+
+// Fills the tree's blocks and the Embree image from the cache file when it carries this key and
+// this mesh's counts; false leaves the caller to build the blocks itself.
+bool readTreeCacheFile(const char* path, unsigned long long key, TinyRender::Model* model, MeshTree& tree, std::vector<char>& image)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f)
+		return false;
+	TreeCacheHeader header;
+	bool ok = fread(&header, sizeof(header), 1, f) == 1 && memcmp(header.m_magic, kTreeCacheMagic, 8) == 0 &&
+			  header.m_key == key && header.m_numVertices == (unsigned)model->nverts() && header.m_numTriangles == (unsigned)model->nfaces() &&
+			  header.m_hasNormals == (unsigned)(model->nnormals() > 0) && header.m_treeBytes > 0;
+	if (ok)
+	{
+		const size_t numVertices = header.m_numVertices, numTriangles = header.m_numTriangles;
+		tree.m_indices.assign(numTriangles * 3, 0);
+		image.resize((size_t)header.m_treeBytes);
+		ok = readBlock(f, tree.m_vertices, numVertices * 3, kVertexPadding) &&
+			 fread(&tree.m_indices[0], sizeof(unsigned), numTriangles * 3, f) == numTriangles * 3 &&
+			 readBlock(f, tree.m_normals, header.m_hasNormals ? numVertices * 3 : 0, 0) &&
+			 readBlock(f, tree.m_uvs, numVertices * 2, 0) &&
+			 fread(&image[0], 1, image.size(), f) == image.size();
+	}
+	fclose(f);
+	if (!ok)
+		image.clear();
+	return ok;
+}
+
+// Writes the tree's blocks and Embree's image of its committed scene; a scene whose tree the image
+// format does not cover writes nothing. The file lands through a rename so a reader never sees a half.
+void writeTreeCacheFile(const char* path, unsigned long long key, const MeshTree& tree)
+{
+	// A built tree takes about 70 bytes per triangle; a roomy first guess saves a second walk.
+	std::vector<char> image((tree.m_indices.size() / 3) * 96 + 4096);
+	size_t treeBytes = rtcSwarmSaveTree(tree.m_scene, &image[0], image.size());
+	if (treeBytes > image.size())
+	{
+		image.resize(treeBytes);
+		treeBytes = rtcSwarmSaveTree(tree.m_scene, &image[0], image.size());
+	}
+	if (treeBytes == 0 || treeBytes > image.size())
+		return;
+	image.resize(treeBytes);
+	TreeCacheHeader header;
+	memset(&header, 0, sizeof(header));
+	memcpy(header.m_magic, kTreeCacheMagic, 8);
+	header.m_key = key;
+	header.m_numVertices = (unsigned)((tree.m_vertices.size() - kVertexPadding) / 3);
+	header.m_numTriangles = (unsigned)(tree.m_indices.size() / 3);
+	header.m_hasNormals = tree.m_normals.empty() ? 0 : 1;
+	header.m_treeBytes = treeBytes;
+	char tmpPath[1200];
+	snprintf(tmpPath, sizeof(tmpPath), "%s.%d.tmp", path, (int)getpid());
+	FILE* f = fopen(tmpPath, "wb");
+	if (!f)
+		return;
+	const size_t numFloats = (size_t)header.m_numVertices * 3;
+	bool ok = fwrite(&header, sizeof(header), 1, f) == 1 &&
+			  fwrite(&tree.m_vertices[0], sizeof(float), numFloats, f) == numFloats &&
+			  fwrite(&tree.m_indices[0], sizeof(unsigned), tree.m_indices.size(), f) == tree.m_indices.size() &&
+			  (tree.m_normals.empty() || fwrite(&tree.m_normals[0], sizeof(float), tree.m_normals.size(), f) == tree.m_normals.size()) &&
+			  fwrite(&tree.m_uvs[0], sizeof(float), tree.m_uvs.size(), f) == tree.m_uvs.size() &&
+			  fwrite(&image[0], 1, image.size(), f) == image.size();
+	ok = (fclose(f) == 0) && ok;
+	if (!ok || rename(tmpPath, path) != 0)
+		remove(tmpPath);
+}
+
 // 4x4 helpers in double precision: the camera setup runs once per frame, exactness matters more than speed.
 void glToRows(const float gl[16], double m[4][4])
 {
@@ -490,6 +621,8 @@ struct SwarmRaycast::Data
 	std::vector<Instance*> m_byGeomId;
 	std::vector<unsigned> m_freeGeomIds;
 	std::map<TinyRenderObjectData*, ObjectState> m_objects;
+	// SWARM_BVH_CACHE_DIR; empty when world trees are never written or read.
+	std::string m_cacheDir;
 	ShadowMap m_shadowMap;
 	// Static members whose shadow changed since the map was cast: retired, hidden or shown again.
 	std::vector<StaticMember*> m_shadowDirty;
@@ -701,17 +834,54 @@ struct SwarmRaycast::Data
 		MeshTree* tree = new MeshTree;
 		tree->m_refs = 1;
 		tree->m_dirty = false;
+		tree->m_world = false;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs);
-		tree->m_scene = rtcNewScene(m_device);
-		rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
-		rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
-		tree->m_geometry = newTriangles(m_device, tree->m_vertices, tree->m_indices);
-		rtcCommitGeometry(tree->m_geometry);
-		rtcAttachGeometry(tree->m_scene, tree->m_geometry);
-		rtcCommitScene(tree->m_scene);
+		buildTree(*tree, 0);
 		m_trees[key] = tree;
+		return tree;
+	}
+
+	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build.
+	void buildTree(MeshTree& tree, const std::vector<char>* image)
+	{
+		tree.m_scene = rtcNewScene(m_device);
+		rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST);
+		rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_MEDIUM);
+		tree.m_geometry = newTriangles(m_device, tree.m_vertices, tree.m_indices);
+		rtcCommitGeometry(tree.m_geometry);
+		rtcAttachGeometry(tree.m_scene, tree.m_geometry);
+		if (image && !image->empty())
+			rtcSwarmLoadTree(tree.m_scene, &(*image)[0], image->size());
+		rtcCommitScene(tree.m_scene);
+	}
+
+	// A tree of one static body's triangles in world space, read from the cache folder when a file
+	// carries this mesh at this pose, otherwise built here and written for the next process.
+	MeshTree* acquireWorldTree(TinyRender::Model* model, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16])
+	{
+		MeshTree* tree = new MeshTree;
+		tree->m_refs = 1;
+		tree->m_dirty = false;
+		tree->m_world = true;
+		memcpy(tree->m_pose, transform, sizeof(tree->m_pose));
+		const unsigned long long key = treeCacheKey(model, worldTransform, localScaling);
+		char path[1024];
+		snprintf(path, sizeof(path), "%s/%016llx.rtree", m_cacheDir.c_str(), key);
+		std::vector<char> image;
+		const bool loaded = readTreeCacheFile(path, key, model, *tree, image);
+		if (!loaded)
+		{
+			float rotation[9];
+			copyRotation(worldTransform, rotation);
+			copyWorldVertices(model, worldTransform, localScaling, tree->m_vertices);
+			copyIndices(model, tree->m_indices);
+			copyAttributes(model, tree->m_indices, rotation, tree->m_normals, tree->m_uvs);
+		}
+		buildTree(*tree, &image);
+		if (!loaded)
+			writeTreeCacheFile(path, key, *tree);
 		return tree;
 	}
 
@@ -743,7 +913,9 @@ struct SwarmRaycast::Data
 		tree.m_dirty = false;
 	}
 
-	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, int segmentation)
+	// worldTree asks for a fresh instance to draw its world tree from disk; the instance stays on
+	// that tree while the body keeps its pose and mesh, and carries on as a plain mover otherwise.
+	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, int segmentation, bool worldTree)
 	{
 		TinyRender::Model* model = obj->m_model;
 		Instance* inst = state.m_instance;
@@ -762,10 +934,15 @@ struct SwarmRaycast::Data
 		}
 		bool changed = fresh;
 		const void* key = model->meshKey();
+		if (inst->m_tree && inst->m_tree->m_world && (inst->m_meshKey != key || inst->m_tree->m_dirty || memcmp(transform, inst->m_tree->m_pose, sizeof(inst->m_tree->m_pose)) != 0))
+		{
+			releaseTree(inst->m_tree);
+			inst->m_tree = 0;
+		}
 		if (!inst->m_tree || inst->m_meshKey != key)
 		{
 			releaseTree(inst->m_tree);
-			inst->m_tree = acquireTree(model, key);
+			inst->m_tree = fresh && worldTree ? acquireWorldTree(model, worldTransform, localScaling, transform) : acquireTree(model, key);
 			inst->m_meshKey = key;
 			rtcSetGeometryInstancedScene(inst->m_geometry, inst->m_tree->m_scene);
 			rtcSetGeometryInstancedScene(inst->m_shadowGeometry, inst->m_tree->m_scene);
@@ -776,13 +953,20 @@ struct SwarmRaycast::Data
 			refitTree(model, *inst->m_tree);
 			changed = true;
 		}
-		if (fresh || memcmp(transform, inst->m_transform, 16 * sizeof(float)) != 0)
+		// A world tree already sits in world space, so its instance carries the identity.
+		static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+		const float* instanceTransform = inst->m_tree->m_world ? identity : transform;
+		if (fresh || memcmp(instanceTransform, inst->m_transform, 16 * sizeof(float)) != 0)
 		{
-			memcpy(inst->m_transform, transform, 16 * sizeof(float));
-			copyRotation(worldTransform, inst->m_rotation);
-			rtcSetGeometryTransform(inst->m_geometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, transform);
-			rtcSetGeometryTransform(inst->m_shadowGeometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, transform);
-			const float det = transform[0] * (transform[5] * transform[10] - transform[9] * transform[6]) - transform[4] * (transform[1] * transform[10] - transform[9] * transform[2]) + transform[8] * (transform[1] * transform[6] - transform[5] * transform[2]);
+			memcpy(inst->m_transform, instanceTransform, 16 * sizeof(float));
+			if (inst->m_tree->m_world)
+				copyRotation(btTransform::getIdentity(), inst->m_rotation);
+			else
+				copyRotation(worldTransform, inst->m_rotation);
+			rtcSetGeometryTransform(inst->m_geometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, instanceTransform);
+			rtcSetGeometryTransform(inst->m_shadowGeometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, instanceTransform);
+			const float* t = instanceTransform;
+			const float det = t[0] * (t[5] * t[10] - t[9] * t[6]) - t[4] * (t[1] * t[10] - t[9] * t[2]) + t[8] * (t[1] * t[6] - t[5] * t[2]);
 			inst->m_facingSign = (det < 0.0f) ? -1.0f : 1.0f;
 			changed = true;
 		}
@@ -865,6 +1049,8 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_topDirty = false;
 	m_data->m_moversDirty = true;
 	m_data->m_shadowMap.m_built = false;
+	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
+	m_data->m_cacheDir = cacheDir ? cacheDir : "";
 	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
 	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
 	if (!m_data->m_device)
@@ -912,6 +1098,9 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	const bool hasAlpha = model->hasAlpha();
 	const int segmentation = renderObj->m_objectIndex + ((renderObj->m_linkIndex + 1) << 24);
 
+	// A body flagged for the disk cache keeps its own world tree instead of joining the static tree.
+	const bool worldTree = renderObj->m_renderTreeCache && !m_data->m_cacheDir.empty() && model->meshHash() != 0;
+
 	ObjectState& state = m_data->m_objects[renderObj];
 	StaticMember* member = state.m_member;
 	if (member && !member->m_retired)
@@ -931,7 +1120,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		member->m_retired = true;
 		m_data->shadowChanged(member);
 	}
-	else if (!member && !m_data->m_staticBuilt)
+	else if (!member && !m_data->m_staticBuilt && !worldTree)
 	{
 		member = m_data->addMember(renderObj, worldTransform, localScaling, transform);
 		member->m_visible = visible;
@@ -944,7 +1133,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	if (!member)
 		state.m_member = 0;
-	m_data->syncInstance(state, renderObj, worldTransform, transform, visible, doubleSided, hasAlpha, segmentation);
+	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, segmentation, worldTree);
 }
 
 void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)

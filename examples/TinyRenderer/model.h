@@ -76,6 +76,8 @@ public:
 	Vec3f* readWriteNormals();
 	// Identity of the shared vertex block; two Models with the same key draw the same triangles.
 	const void* meshKey() const { return m_mesh; }
+	// Content hash of the mesh arrays, the same across processes for the same vertices and faces.
+	unsigned long long meshHash() const;
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);
