@@ -40,6 +40,8 @@ subject to the following restrictions:
 struct MyTexture2
 {
 	unsigned char* textureData1;
+	// One byte per texel, 0 for an opaque texture; owned like textureData1.
+	unsigned char* m_alpha;
 	int m_width;
 	int m_height;
 	bool m_isCached;
@@ -519,6 +521,7 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 					texData.m_width = meshData.m_textureWidth;
 					texData.m_height = meshData.m_textureHeight;
 					texData.textureData1 = meshData.m_textureImage1;
+					texData.m_alpha = meshData.m_textureAlpha;
 					texData.m_isCached = meshData.m_isCached;
 					texturesOut.push_back(texData);
 				}
@@ -995,6 +998,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					texData.m_width = texWidth;
 					texData.m_height = texHeight;
 					texData.textureData1 = &m_data->m_checkeredTexels[0];
+					texData.m_alpha = 0;
 					texData.m_isCached = true;
 					textures.push_back(texData);
 				}
@@ -1030,7 +1034,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 					tinyObj->m_doubleSided = doubleSided;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
-						group.m_textureImage, group.m_textureWidth, group.m_textureHeight);
+						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha);
 					float groupSpecular[3] = { (float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2] };
 					tinyObj->m_model->setSpecularColor(groupSpecular);
 					visuals->m_renderObjects.push_back(tinyObj);
@@ -1041,6 +1045,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						texData.m_width = group.m_textureWidth;
 						texData.m_height = group.m_textureHeight;
 						texData.textureData1 = group.m_textureImage;
+						texData.m_alpha = group.m_textureAlpha;
 						texData.m_isCached = group.m_isCached;
 						if (visualShape.m_tinyRendererTextureId < 0)
 						{
@@ -1055,12 +1060,14 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 				TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 				tinyObj->m_doubleSided = doubleSided;
 				unsigned char* textureImage1 = 0;
+				const unsigned char* textureAlpha = 0;
 				int textureWidth = 0;
 				int textureHeight = 0;
 				bool isCached = false;
 				if (textures.size())
 				{
 					textureImage1 = textures[0].textureData1;
+					textureAlpha = textures[0].m_alpha;
 					textureWidth = textures[0].m_width;
 					textureHeight = textures[0].m_height;
 					isCached = textures[0].m_isCached;
@@ -1070,7 +1077,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					B3_PROFILE("registerMeshShape");
 
 					tinyObj->registerMeshShape(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size(), rgbaColor,
-						textureImage1, textureWidth, textureHeight);
+						textureImage1, textureWidth, textureHeight, textureAlpha);
 				}
 				float specular[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
 				tinyObj->m_model->setSpecularColor(specular);
@@ -1122,7 +1129,8 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 				indices,
 				numIndices,
 				rgbaColor,
-				m_data->m_textures[textureId].textureData1, m_data->m_textures[textureId].m_width, m_data->m_textures[textureId].m_height);
+				m_data->m_textures[textureId].textureData1, m_data->m_textures[textureId].m_width, m_data->m_textures[textureId].m_height,
+				m_data->m_textures[textureId].m_alpha);
 		}
 
 		TinyRendererObjectArray** visualsPtr = m_data->m_swRenderInstances[orgGraphicsUniqueId];
@@ -1525,7 +1533,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 			targets[cam].m_seg = 0;
 			targets[cam].m_rgb = 0;
 		}
-		raycast.render(&targets[0], numCameras, projMat, width, height, 0, renderThreads);
+		raycast.render(&targets[0], numCameras, projMat, width, height, 0, renderThreads, (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif
@@ -1771,7 +1779,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_diffuseCoeff = lightDiffuseCoeff;
 		shading.m_specularCoeff = lightSpecularCoeff;
 		shading.m_shadow = m_data->m_hasShadow;
+		shading.m_shadowMap = (m_data->m_flags & ER_SWARM_SHADOW_MAP) != 0;
+		shading.m_moverShadow = (m_data->m_flags & ER_SWARM_MOVER_SHADOW) != 0;
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
+		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
 		shading.m_glint = glint;
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;
@@ -1780,7 +1791,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
 		m_data->syncRaycast().render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
-									 b3GetSwarmRenderThreads());
+									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif
@@ -2128,6 +2139,7 @@ void TinyRendererVisualShapeConverter::resetAll()
 		if (!m_data->m_textures[i].m_isCached)
 		{
 			free(m_data->m_textures[i].textureData1);
+			free(m_data->m_textures[i].m_alpha);
 		}
 	}
 	m_data->m_textures.clear();
@@ -2157,7 +2169,8 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 					{
 						if (textureUniqueId >= 0)
 						{
-							renderObj->m_model->setDiffuseTextureFromData(m_data->m_textures[textureUniqueId].textureData1, m_data->m_textures[textureUniqueId].m_width, m_data->m_textures[textureUniqueId].m_height);
+							renderObj->m_model->setDiffuseTextureFromData(m_data->m_textures[textureUniqueId].textureData1, m_data->m_textures[textureUniqueId].m_width, m_data->m_textures[textureUniqueId].m_height,
+																		  m_data->m_textures[textureUniqueId].m_alpha);
 						}
 						else
 						{
@@ -2176,6 +2189,7 @@ int TinyRendererVisualShapeConverter::registerTexture(unsigned char* texels, int
 	texData.m_width = width;
 	texData.m_height = height;
 	texData.textureData1 = texels;
+	texData.m_alpha = 0;
 	texData.m_isCached = true;
 	m_data->m_textures.push_back(texData);
 	return m_data->m_textures.size() - 1;
@@ -2186,6 +2200,7 @@ int TinyRendererVisualShapeConverter::loadTextureFile(const char* filename, stru
 	B3_PROFILE("loadTextureFile");
 	int width, height, n;
 	unsigned char* image = 0;
+	unsigned char* alpha = 0;
 	if (fileIO)
 	{
 		b3AlignedObjectArray<char> buffer;
@@ -2209,6 +2224,8 @@ int TinyRendererVisualShapeConverter::loadTextureFile(const char* filename, stru
 		if (buffer.size())
 		{
 			image = stbi_load_from_memory((const unsigned char*)&buffer[0], buffer.size(), &width, &height, &n, 3);
+			if (image)
+				alpha = b3ImportMeshUtility::loadTextureAlpha((const unsigned char*)&buffer[0], buffer.size(), width, height);
 		}
 	}
 	else
@@ -2222,6 +2239,7 @@ int TinyRendererVisualShapeConverter::loadTextureFile(const char* filename, stru
 		texData.m_width = width;
 		texData.m_height = height;
 		texData.textureData1 = image;
+		texData.m_alpha = alpha;
 		texData.m_isCached = false;
 		m_data->m_textures.push_back(texData);
 		return m_data->m_textures.size() - 1;

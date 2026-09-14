@@ -36,6 +36,8 @@ struct SharedTexture
 	// TGAImage's copy constructor does not copy pixels, so the levels live on the heap.
 	std::vector<TGAImage*> mips_;
 	bool mipsBuilt_;
+	// One byte per texel in img_'s row order, empty for an opaque texture.
+	std::vector<unsigned char> alpha_;
 
 	SharedTexture() : source_(0), refs_(1), registered_(false), mipsBuilt_(false) {}
 	~SharedTexture()
@@ -193,7 +195,7 @@ Model::Model() : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap
 {
 }
 
-void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWidth, int textureHeight)
+void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWidth, int textureHeight, const unsigned char *textureAlpha)
 {
 	releaseTexture(m_diffuse);
 	m_diffuse = 0;
@@ -207,7 +209,8 @@ void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWi
 		for (size_t i = 0; i < gSharedTextures.size(); i++)
 		{
 			SharedTexture* tex = gSharedTextures[i];
-			if (tex->source_ != textureImage || tex->img_.get_width() != textureWidth || tex->img_.get_height() != textureHeight)
+			if (tex->source_ != textureImage || tex->img_.get_width() != textureWidth || tex->img_.get_height() != textureHeight ||
+				tex->alpha_.empty() != (textureAlpha == 0))
 				continue;
 			// The stored image is flipped, so row y holds input row height-1-y.
 			bool same = true;
@@ -237,6 +240,13 @@ void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWi
 	{
 		B3_PROFILE("flip_vertically");
 		m_diffuse->img_.flip_vertically();
+	}
+	if (textureAlpha)
+	{
+		// Stored flipped like the image, so one (x, y) addresses the same texel in both.
+		m_diffuse->alpha_.resize((size_t)textureWidth * textureHeight);
+		for (int y = 0; y < textureHeight; y++)
+			memcpy(&m_diffuse->alpha_[(size_t)y * textureWidth], textureAlpha + (size_t)(textureHeight - 1 - y) * textureWidth, (size_t)textureWidth);
 	}
 	if (sharingEnabled())
 	{
@@ -491,6 +501,29 @@ TGAColor Model::diffuse(Vec2f uvf)
 	return TGAColor(255, 255, 255, 255);
 }
 
+bool Model::hasAlpha() const
+{
+	return m_diffuse && !m_diffuse->alpha_.empty();
+}
+
+// The same wrap and nearest-texel pick as diffuse(), read from the alpha plane.
+unsigned char Model::alpha(Vec2f uvf) const
+{
+	if (!hasAlpha())
+		return 255;
+	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
+	double val;
+	uvf[0] = std::modf(uvf[0], &val);
+	if (uvf[0] < 0)
+		uvf[0] = uvf[0] + 1;
+	uvf[1] = std::modf(uvf[1], &val);
+	if (uvf[1] < 0)
+		uvf[1] = uvf[1] + 1;
+	int x = (int)(uvf[0] * w), y = (int)(uvf[1] * h);
+	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
+	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
+	return m_diffuse->alpha_[(size_t)y * w + x];
+}
 
 // Each level halves the one before with an integer 2x2 box average, down to 1x1.
 // Odd sizes drop their last row or column, as a GPU would.
