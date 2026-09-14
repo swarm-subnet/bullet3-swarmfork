@@ -10150,6 +10150,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	float lightAmbientCoeff = -1;
 	float lightDiffuseCoeff = -1;
 	float lightSpecularCoeff = -1;
+	float shadowLightCoeff = -1;
 	int flags = -1;
 	int renderer = -1;
 	// inialize cmd
@@ -10157,9 +10158,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOf", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff))
 	{
 		return NULL;
 	}
@@ -10226,6 +10227,10 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (lightSpecularCoeff >= 0)
 	{
 		b3RequestCameraImageSetLightSpecularCoeff(command, lightSpecularCoeff);
+	}
+	if (shadowLightCoeff >= 0)
+	{
+		b3RequestCameraImageSetShadowLightCoeff(command, shadowLightCoeff);
 	}
 
 	if (flags >= 0)
@@ -13071,7 +13076,8 @@ static PyMethodDef SpamMethods[] = {
 	{"getCameraImage", (PyCFunction)pybullet_getCameraImage, METH_VARARGS | METH_KEYWORDS,
 	 "Render an image (given the pixel resolution width, height, camera viewMatrix "
 	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
-	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky), and return the "
+	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky, "
+	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"

@@ -4399,6 +4399,11 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 						m_data->m_pluginManager.getRenderInterface()->setLightSpecularCoeff(clientCmd.m_requestPixelDataArguments.m_lightSpecularCoeff);
 					}
 
+					if ((clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_SHADOW_LIGHT_COEFF) != 0)
+					{
+						m_data->m_pluginManager.getRenderInterface()->setShadowLightCoeff(clientCmd.m_requestPixelDataArguments.m_shadowLightCoeff);
+					}
+
 					for (int i = 0; !m_data->m_renderTransformsSynced && i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
 					{
 						const btCollisionObject* colObj = m_data->m_dynamicsWorld->getCollisionObjectArray()[i];

@@ -17,6 +17,9 @@ struct SwarmRaycastShading
 	float m_ambientColor[3];  // tint on the ambient term, white unless a sky lends its colour
 	float m_diffuseCoeff;
 	float m_specularCoeff;
+	// Share of the diffuse and specular light a shadowed hit keeps: 0.8 is the floor TinyRenderer's
+	// shader applies where its shadow buffer says blocked, 0 is a full shadow lit by ambient alone.
+	float m_shadowLightCoeff;
 	// One occlusion ray towards the light per hit. Any drawn surface stops it, whichever way it is
 	// wound; a body hidden by a zero alpha lets the light through and so casts no shadow.
 	bool m_shadow;

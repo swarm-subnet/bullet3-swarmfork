@@ -51,6 +51,7 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void setLightAmbientCoeff(float ambientCoeff);
 	virtual void setLightDiffuseCoeff(float diffuseCoeff);
 	virtual void setLightSpecularCoeff(float specularCoeff);
+	virtual void setShadowLightCoeff(float shadowLightCoeff);
 	virtual void setShadow(bool hasShadow);
 	virtual void setFlags(int flags);
 
