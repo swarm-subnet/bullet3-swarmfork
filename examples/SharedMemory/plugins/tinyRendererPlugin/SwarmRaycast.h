@@ -26,6 +26,11 @@ struct SwarmRaycastShading
 	// the bodies that moved since the world was built, so movers cast shadows that follow them.
 	bool m_moverShadow;
 	bool m_textureFilter;  // bilinear and mipmapped texture reads instead of the nearest texel
+	// After the one ray per pixel, a pixel whose object id or 1/depth breaks with a neighbour is
+	// re-composited from the exact share of the pixel each nearby triangle covers, with one probe ray
+	// for whatever share is left. Depth and segmentation keep the first ray; every other pixel keeps
+	// its bytes.
+	bool m_edgeAntialias;
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh
@@ -62,7 +67,8 @@ public:
 	// and the shaded colour into m_rgb when shading is given.
 	// Every camera shares projMat, the frame size and the light. The pixels of all cameras are cut
 	// into fixed tiles before the frame starts and tile k always goes to thread k mod threads, so the
-	// bytes never depend on the thread count or on the order threads finish.
+	// bytes never depend on the thread count or on the order threads finish. With edge anti-aliasing
+	// the same tiles are walked a second time once every first ray has landed.
 	void render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
 				const SwarmRaycastShading* shading, int threads) const;
 

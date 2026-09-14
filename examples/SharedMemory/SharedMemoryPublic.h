@@ -889,6 +889,8 @@ enum EnumRendererAuxFlags
 	// With ER_SWARM_SHADOW_MAP: bodies that moved since the world was built cast shadows too, from one
 	// occlusion ray per lit hit against a small tree that holds only those bodies.
 	ER_SWARM_MOVER_SHADOW = 128,
+	// Exact triangle coverage on every pixel that sits on an object or depth edge, colour only, on the ray-cast path.
+	ER_EDGE_ANTIALIAS = 256,
 };
 
 ///flags to pick the IK solver and other options
