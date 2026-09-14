@@ -10134,7 +10134,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	/// request an image from a simulated camera, using software or hardware renderer.
 	struct b3CameraImageData imageData;
 	PyObject *objViewMat = 0, *objProjMat = 0, *lightDirObj = 0, *lightColorObj = 0, *objProjectiveTextureView = 0, *objProjectiveTextureProj = 0;
-	PyObject *skyHorizonObj = 0, *skyZenithObj = 0;
+	PyObject *skyHorizonObj = 0, *skyZenithObj = 0, *skyCloudSeedObj = 0;
 	int width, height;
 	float viewMatrix[16];
 	float projectionMatrix[16];
@@ -10157,9 +10157,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj))
 	{
 		return NULL;
 	}
@@ -10194,6 +10194,16 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (hasSkyHorizon || hasSkyZenith)
 	{
 		b3RequestCameraImageSetSkyColor(command, hasSkyHorizon ? skyHorizon : skyZenith, hasSkyZenith ? skyZenith : skyHorizon);
+	}
+	// any integer seeds the clouds of the ER_SWARM_SKY_SUN sky; its low 32 bits are what count
+	if (skyCloudSeedObj && skyCloudSeedObj != Py_None)
+	{
+		unsigned long seed = PyLong_AsUnsignedLongMask(skyCloudSeedObj);
+		if (PyErr_Occurred())
+		{
+			return NULL;
+		}
+		b3RequestCameraImageSetSkyCloudSeed(command, (int)(unsigned int)seed);
 	}
 	if (lightDist >= 0)
 	{
@@ -13061,7 +13071,7 @@ static PyMethodDef SpamMethods[] = {
 	{"getCameraImage", (PyCFunction)pybullet_getCameraImage, METH_VARARGS | METH_KEYWORDS,
 	 "Render an image (given the pixel resolution width, height, camera viewMatrix "
 	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
-	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn), and return the "
+	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
@@ -13521,6 +13531,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_EDGE_ANTIALIAS", ER_EDGE_ANTIALIAS);
 	PyModule_AddIntConstant(m, "ER_ALPHA_CUTOUT", ER_ALPHA_CUTOUT);
 	PyModule_AddIntConstant(m, "ER_SPECULAR_GLINT", ER_SPECULAR_GLINT);
+	PyModule_AddIntConstant(m, "ER_SWARM_SKY_SUN", ER_SWARM_SKY_SUN);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

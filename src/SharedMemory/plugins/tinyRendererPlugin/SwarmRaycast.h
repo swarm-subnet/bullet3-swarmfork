@@ -14,6 +14,7 @@ struct SwarmRaycastShading
 	float m_lightDir[3];  // unit vector towards the light, world space
 	float m_lightColor[3];
 	float m_ambientCoeff;
+	float m_ambientColor[3];  // tint on the ambient term, white unless a sky lends its colour
 	float m_diffuseCoeff;
 	float m_specularCoeff;
 	// One occlusion ray towards the light per hit. Any drawn surface stops it, whichever way it is

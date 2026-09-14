@@ -281,6 +281,8 @@ struct RequestPixelDataArgs
 	// sky painted where nothing is drawn: horizon colour at eye level, zenith colour straight up
 	float m_skyHorizonColor[3];
 	float m_skyZenithColor[3];
+	// seed of the cloud layer painted into the ER_SWARM_SKY_SUN sky
+	int m_skyCloudSeed;
 };
 
 enum EnumRequestPixelDataUpdateFlags
@@ -298,6 +300,7 @@ enum EnumRequestPixelDataUpdateFlags
 	REQUEST_PIXEL_ARGS_HAS_PROJECTIVE_TEXTURE_MATRICES = 1024,
 	REQUEST_PIXEL_ARGS_HAS_BATCH_CAMERAS = 2048,
 	REQUEST_PIXEL_ARGS_SET_SKY_COLOR = 4096,
+	REQUEST_PIXEL_ARGS_SET_SKY_CLOUDS = 8192,
 
 	//don't exceed (1<<15), because this enum is shared with EnumRenderer in SharedMemoryPublic.h
 

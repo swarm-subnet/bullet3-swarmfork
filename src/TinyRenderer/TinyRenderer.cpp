@@ -189,6 +189,7 @@ struct Shader : public IShader
 	float m_ambient_coefficient;
 	float m_diffuse_coefficient;
 	float m_specular_coefficient;
+	Vec3f m_ambient_color;
 	const TinyRenderGlint* m_glint;  // set when ER_SPECULAR_GLINT is on, else null
 	Vec3f m_cameraPos;
 
@@ -205,7 +206,7 @@ struct Shader : public IShader
 	mat<3, 3, float> varying_nrm;  // normal per vertex to be interpolated by FS
 	mat<4, 3, float> world_tri;    // model triangle coordinates in the world space used for backface culling, written by VS
 
-	Shader(Model* model, Vec3f light_dir_local, Vec3f light_color, Matrix& modelView, Matrix& lightModelView, Matrix& projectionMat, Matrix& modelMat, Matrix& viewportMat, Vec3f localScaling, const Vec4f& colorRGBA, int width, int height, b3AlignedObjectArray<float>* shadowBuffer, float ambient_coefficient = 0.6, float diffuse_coefficient = 0.35, float specular_coefficient = 0.05)
+	Shader(Model* model, Vec3f light_dir_local, Vec3f light_color, Matrix& modelView, Matrix& lightModelView, Matrix& projectionMat, Matrix& modelMat, Matrix& viewportMat, Vec3f localScaling, const Vec4f& colorRGBA, int width, int height, b3AlignedObjectArray<float>* shadowBuffer, float ambient_coefficient = 0.6, float diffuse_coefficient = 0.35, float specular_coefficient = 0.05, Vec3f ambient_color = Vec3f(1.f, 1.f, 1.f))
 		: m_model(model),
 		  m_light_dir_local(light_dir_local),
 		  m_light_color(light_color),
@@ -219,6 +220,7 @@ struct Shader : public IShader
 		  m_ambient_coefficient(ambient_coefficient),
 		  m_diffuse_coefficient(diffuse_coefficient),
 		  m_specular_coefficient(specular_coefficient),
+		  m_ambient_color(ambient_color),
 		  m_glint(0),
 
 		  m_shadowBuffer(shadowBuffer),
@@ -293,7 +295,7 @@ struct Shader : public IShader
 		for (int i = 0; i < 3; ++i)
 		{
 			int orgColor = 0;
-			float floatColor = (m_ambient_coefficient * color[i] + shadow * (m_diffuse_coefficient * diffuse + m_specular_coefficient * specular) * color[i] * m_light_color[i]);
+			float floatColor = (m_ambient_coefficient * color[i] * m_ambient_color[i] + shadow * (m_diffuse_coefficient * diffuse + m_specular_coefficient * specular) * color[i] * m_light_color[i]);
 			if (floatColor==floatColor)
 			{
 				orgColor=int(floatColor);
@@ -340,6 +342,7 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_localScaling.setValue(1, 1, 1);
 	m_modelMatrix = Matrix::identity();
 	m_lightAmbientCoeff = 0.6;
+	m_lightAmbientColor.setValue(1, 1, 1);
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
 	m_hasLocalAABB = false;
@@ -369,6 +372,7 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_localScaling.setValue(1, 1, 1);
 	m_modelMatrix = Matrix::identity();
 	m_lightAmbientCoeff = 0.6;
+	m_lightAmbientColor.setValue(1, 1, 1);
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
 	m_hasLocalAABB = false;
@@ -398,6 +402,7 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_localScaling.setValue(1, 1, 1);
 	m_modelMatrix = Matrix::identity();
 	m_lightAmbientCoeff = 0.6;
+	m_lightAmbientColor.setValue(1, 1, 1);
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
 	m_hasLocalAABB = false;
@@ -426,6 +431,7 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	m_localScaling.setValue(1, 1, 1);
 	m_modelMatrix = Matrix::identity();
 	m_lightAmbientCoeff = 0.6;
+	m_lightAmbientColor.setValue(1, 1, 1);
 	m_lightDiffuseCoeff = 0.35;
 	m_lightSpecularCoeff = 0.05;
 	m_hasLocalAABB = false;
@@ -692,7 +698,8 @@ void TinyRenderer::renderObject(TinyRenderObjectData& renderData)
 		Matrix viewMatrixInv = renderData.m_viewMatrix.invert();
 		btVector3 P(viewMatrixInv[0][3], viewMatrixInv[1][3], viewMatrixInv[2][3]);
 
-		Shader shader(model, light_dir_local, light_color, modelViewMatrix, lightModelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, renderData.m_viewportMatrix, localScaling, model->getColorRGBA(), width, height, shadowBufferPtr, renderData.m_lightAmbientCoeff, renderData.m_lightDiffuseCoeff, renderData.m_lightSpecularCoeff);
+		Vec3f ambient_color = Vec3f(renderData.m_lightAmbientColor[0], renderData.m_lightAmbientColor[1], renderData.m_lightAmbientColor[2]);
+		Shader shader(model, light_dir_local, light_color, modelViewMatrix, lightModelViewMatrix, renderData.m_projectionMatrix, renderData.m_modelMatrix, renderData.m_viewportMatrix, localScaling, model->getColorRGBA(), width, height, shadowBufferPtr, renderData.m_lightAmbientCoeff, renderData.m_lightDiffuseCoeff, renderData.m_lightSpecularCoeff, ambient_color);
 		shader.m_needUvDerivatives = renderData.m_textureFilter;
 		if (renderData.m_glint.m_enabled)
 		{
