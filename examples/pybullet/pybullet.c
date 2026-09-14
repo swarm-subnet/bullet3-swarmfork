@@ -13518,6 +13518,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_RAYCAST", ER_SWARM_RAYCAST);
 	PyModule_AddIntConstant(m, "ER_SWARM_SHADOW_MAP", ER_SWARM_SHADOW_MAP);
 	PyModule_AddIntConstant(m, "ER_SWARM_MOVER_SHADOW", ER_SWARM_MOVER_SHADOW);
+	PyModule_AddIntConstant(m, "ER_EDGE_ANTIALIAS", ER_EDGE_ANTIALIAS);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

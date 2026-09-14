@@ -367,6 +367,8 @@ struct Camera
 	// plus two axis vectors; the double math runs once per frame instead of once per pixel.
 	double m_near[3][3];
 	double m_far[3][3];
+	// Projection times view, for putting a world point back onto the frame in the edge pass.
+	double m_viewProj[4][4];
 	float m_origin[3];
 	float m_viewRow2[4];
 	float m_p22;
@@ -410,6 +412,7 @@ bool setupCamera(const float viewMat[16], const float projMat[16], Camera& cam)
 	if (!invert(view, invView) || !invert(proj, invProj))
 		return false;
 	multiply(invView, invProj, invViewProj);
+	multiply(proj, view, cam.m_viewProj);
 	planeBasis(invViewProj, -1.0, cam.m_near);
 	planeBasis(invViewProj, 1.0, cam.m_far);
 	for (int i = 0; i < 3; i++)
@@ -1177,151 +1180,528 @@ struct TileJob
 	bool m_filtered;
 };
 
-// Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
-// written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
-void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target,
-				int row0, int row1, int col0, int col1,
-				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
+// The triangle a ray landed on, enough to find its corners again.
+struct HitId
+{
+	unsigned m_inst;
+	unsigned m_geom;
+	unsigned m_prim;
+};
+
+// What one ray brings back: the clip depth and its reciprocal eye depth, the segmentation id and
+// triangle of its hit, and the shaded colour when the job carries a light and the body is known.
+struct Sample
+{
+	float m_depth;
+	float m_inverseEyeDepth;
+	int m_segmentation;
+	HitId m_hit;
+	bool m_shaded;
+	unsigned char m_rgb[3];
+};
+
+// Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
+// id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
+// before any ray, which is the sky or the clear colour, and the colour buffer after pass one.
+struct EdgeScratch
+{
+	std::vector<int> m_ids;
+	std::vector<HitId> m_hits;
+	std::vector<float> m_inverseEyeDepth;
+	std::vector<unsigned char> m_background;
+	std::vector<unsigned char> m_rgb1;
+};
+
+// Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
+const float kEdgeTolerance = 1e-3f;
+// Coverage below this is left to the colour already in the pixel: it is under one colour step.
+const double kCoverageEpsilon = 1.0 / 512.0;
+
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
+			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
 	const float* stepX = setup.m_stepX;
 	const float* stepY = setup.m_stepY;
-	float* depthOut = target.m_depth;
-	int* segOut = target.m_seg;
-	const int width = job.m_width;
-	const int height = job.m_height;
 
+	float nearPoint[3], farPoint[3];
+	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
+	planePoint(cam.m_far, ndcX, ndcY, farPoint);
+	float dir[3], rawDir[3];
+	for (int i = 0; i < 3; i++)
+		dir[i] = rawDir[i] = farPoint[i] - nearPoint[i];
+	const float length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+	if (!(length > 0.0f))
+		return false;
+	const float invLength = 1.0f / length;
+	float toNear[3];
+	for (int i = 0; i < 3; i++)
+	{
+		dir[i] *= invLength;
+		toNear[i] = nearPoint[i] - cam.m_origin[i];
+	}
+	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+
+	RTCRayHit rayhit;
+	rayhit.ray.org_x = cam.m_origin[0];
+	rayhit.ray.org_y = cam.m_origin[1];
+	rayhit.ray.org_z = cam.m_origin[2];
+	rayhit.ray.dir_x = dir[0];
+	rayhit.ray.dir_y = dir[1];
+	rayhit.ray.dir_z = dir[2];
+	// Near and far are measured along the ray, so the two clip planes act exactly as TinyRenderer's.
+	rayhit.ray.tnear = tNear;
+	rayhit.ray.tfar = tNear + length;
+	rayhit.ray.time = 0.0f;
+	rayhit.ray.mask = (unsigned)-1;
+	rayhit.ray.id = 0;
+	rayhit.ray.flags = 0;
+	rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+	rtcIntersect1(job.m_top, &rayhit, args);
+	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+		return false;
+
+	const float t = rayhit.ray.tfar;
+	const float hx = cam.m_origin[0] + dir[0] * t;
+	const float hy = cam.m_origin[1] + dir[1] * t;
+	const float hz = cam.m_origin[2] + dir[2] * t;
+	const float zEye = ((cam.m_viewRow2[0] * hx + cam.m_viewRow2[1] * hy) + cam.m_viewRow2[2] * hz) + cam.m_viewRow2[3];
+	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
+	out.m_inverseEyeDepth = 1.0f / zEye;
+
+	int segmentation = -1;
+	HitSurface surface;
+	const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, shading ? &surface : 0);
+	out.m_segmentation = segmentation;
+	out.m_hit.m_inst = rayhit.hit.instID[0];
+	out.m_hit.m_geom = rayhit.hit.geomID;
+	out.m_hit.m_prim = rayhit.hit.primID;
+	out.m_shaded = shading && known;
+	if (!out.m_shaded)
+		return true;
+
+	// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
+	// towards the camera for shading and for the side the shadow ray leaves from.
+	float woundNormal[3], faceNormal[3], e1[3], e2[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+		e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+	}
+	cross3(e1, e2, woundNormal);
+	const bool awayFromCamera = dot3(woundNormal, dir) > 0.0f;
+	for (int i = 0; i < 3; i++)
+		faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
+
+	float shadow = 1.0f;
+	if (shading->m_shadow)
+	{
+		float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+		normalize3(unitNormal);
+		const float point[3] = {hx, hy, hz};
+		// The map answers for the static bodies; the ray then goes to the whole world without a
+		// map, to the movers alone with one, or nowhere when the map already says blocked.
+		bool blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+		const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
+		if (!blocked && occluders)
+		{
+			RTCRay ray;
+			ray.org_x = hx + unitNormal[0] * kShadowBias;
+			ray.org_y = hy + unitNormal[1] * kShadowBias;
+			ray.org_z = hz + unitNormal[2] * kShadowBias;
+			ray.dir_x = shading->m_lightDir[0];
+			ray.dir_y = shading->m_lightDir[1];
+			ray.dir_z = shading->m_lightDir[2];
+			ray.tnear = 0.0f;
+			ray.tfar = INFINITY;
+			ray.time = 0.0f;
+			ray.mask = (unsigned)-1;
+			ray.id = 0;
+			ray.flags = 0;
+			rtcOccluded1(occluders, &ray, shadowArgs);
+			blocked = ray.tfar < 0.0f;
+		}
+		// The same 0.8 floor TinyRenderer's shader applies where its shadow buffer says blocked.
+		shadow = (float)(0.8 + 0.2 * !blocked);
+	}
+
+	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
+	if (filtered)
+	{
+		// TinyRenderer measures the texture footprint at the pixel to the right and the one above.
+		const float weights[2] = {rayhit.hit.u, rayhit.hit.v};
+		const float* steps[2] = {stepX, stepY};
+		float* out[2] = {duvdx, duvdy};
+		const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
+		const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
+		const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+		for (int k = 0; k < 2; k++)
+		{
+			float neighbourDir[3], u, v;
+			for (int i = 0; i < 3; i++)
+				neighbourDir[i] = rawDir[i] + steps[k][i];
+			if (!planeBarycentric(cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+				continue;
+			out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
+			out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+		}
+	}
+
+	shadeHit(*shading, surface, rayhit.hit, faceNormal, shadow, filtered, duvdx, duvdy, out.m_rgb);
+	return true;
+}
+
+// Output row `row` is TinyRenderer's raster row height - 1 - row, sampled at the integer pixel corner.
+inline double pixelNdcX(int col, int width)
+{
+	return (2.0 * col) / (double)width - 1.0;
+}
+
+inline double pixelNdcY(int row, int height)
+{
+	return 1.0 - (2.0 * row + 2.0) / (double)height;
+}
+
+// 1/zEye of a pixel the first ray missed, from the clear value in the depth buffer. A plane is linear
+// in 1/zEye across the frame, so a flat surface at any angle passes the line test in isEdge and a step
+// or crease fails it.
+inline float inverseEyeDepth(const Camera& cam, float depth)
+{
+	return 1.0f / (-(depth + cam.m_p23) / cam.m_p22);
+}
+
+// Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
+// written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
+// `scratch`, when given, records the id and triangle of every hit for the edge pass.
+void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, EdgeScratch* scratch,
+				int row0, int row1, int col0, int col1,
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
+{
+	const int width = job.m_width;
 	for (int row = row0; row < row1; row++)
 	{
-		// Output row `row` is TinyRenderer's raster row height - 1 - row, sampled at the integer pixel corner.
-		const double ndcY = 1.0 - (2.0 * row + 2.0) / (double)height;
+		const double ndcY = pixelNdcY(row, job.m_height);
 		for (int col = col0; col < col1; col++)
 		{
-			const double ndcX = (2.0 * col) / (double)width - 1.0;
-			float nearPoint[3], farPoint[3];
-			planePoint(cam.m_near, ndcX, ndcY, nearPoint);
-			planePoint(cam.m_far, ndcX, ndcY, farPoint);
-			float dir[3], rawDir[3];
-			for (int i = 0; i < 3; i++)
-				dir[i] = rawDir[i] = farPoint[i] - nearPoint[i];
-			const float length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-			if (!(length > 0.0f))
-				continue;
-			const float invLength = 1.0f / length;
-			float toNear[3];
-			for (int i = 0; i < 3; i++)
-			{
-				dir[i] *= invLength;
-				toNear[i] = nearPoint[i] - cam.m_origin[i];
-			}
-			const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
-
-			RTCRayHit rayhit;
-			rayhit.ray.org_x = cam.m_origin[0];
-			rayhit.ray.org_y = cam.m_origin[1];
-			rayhit.ray.org_z = cam.m_origin[2];
-			rayhit.ray.dir_x = dir[0];
-			rayhit.ray.dir_y = dir[1];
-			rayhit.ray.dir_z = dir[2];
-			// Near and far are measured along the ray, so the two clip planes act exactly as TinyRenderer's.
-			rayhit.ray.tnear = tNear;
-			rayhit.ray.tfar = tNear + length;
-			rayhit.ray.time = 0.0f;
-			rayhit.ray.mask = (unsigned)-1;
-			rayhit.ray.id = 0;
-			rayhit.ray.flags = 0;
-			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-			rtcIntersect1(job.m_top, &rayhit, args);
-			if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
-				continue;
-
-			const float t = rayhit.ray.tfar;
-			const float hx = cam.m_origin[0] + dir[0] * t;
-			const float hy = cam.m_origin[1] + dir[1] * t;
-			const float hz = cam.m_origin[2] + dir[2] * t;
-			const float zEye = ((cam.m_viewRow2[0] * hx + cam.m_viewRow2[1] * hy) + cam.m_viewRow2[2] * hz) + cam.m_viewRow2[3];
+			Sample sample;
 			const size_t offset = (size_t)row * width + col;
-			depthOut[offset] = -(cam.m_p22 * zEye + cam.m_p23);
-
-			int segmentation = -1;
-			HitSurface surface;
-			const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, shading ? &surface : 0);
-			if (segOut)
-				segOut[offset] = segmentation;
-			if (!shading || !known)
+			if (!traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample))
+			{
+				if (scratch)
+					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
 				continue;
-
-			// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
-			// towards the camera for shading and for the side the shadow ray leaves from.
-			float woundNormal[3], faceNormal[3], e1[3], e2[3];
-			for (int i = 0; i < 3; i++)
-			{
-				e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
-				e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
 			}
-			cross3(e1, e2, woundNormal);
-			const bool awayFromCamera = dot3(woundNormal, dir) > 0.0f;
-			for (int i = 0; i < 3; i++)
-				faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
-
-			float shadow = 1.0f;
-			if (shading->m_shadow)
+			target.m_depth[offset] = sample.m_depth;
+			if (target.m_seg)
+				target.m_seg[offset] = sample.m_segmentation;
+			if (scratch)
 			{
-				float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
-				normalize3(unitNormal);
-				const float point[3] = {hx, hy, hz};
-				// The map answers for the static bodies; the ray then goes to the whole world without a
-				// map, to the movers alone with one, or nowhere when the map already says blocked.
-				bool blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
-				const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
-				if (!blocked && occluders)
-				{
-					RTCRay ray;
-					ray.org_x = hx + unitNormal[0] * kShadowBias;
-					ray.org_y = hy + unitNormal[1] * kShadowBias;
-					ray.org_z = hz + unitNormal[2] * kShadowBias;
-					ray.dir_x = shading->m_lightDir[0];
-					ray.dir_y = shading->m_lightDir[1];
-					ray.dir_z = shading->m_lightDir[2];
-					ray.tnear = 0.0f;
-					ray.tfar = INFINITY;
-					ray.time = 0.0f;
-					ray.mask = (unsigned)-1;
-					ray.id = 0;
-					ray.flags = 0;
-					rtcOccluded1(occluders, &ray, shadowArgs);
-					blocked = ray.tfar < 0.0f;
-				}
-				// The same 0.8 floor TinyRenderer's shader applies where its shadow buffer says blocked.
-				shadow = (float)(0.8 + 0.2 * !blocked);
+				scratch->m_ids[offset] = sample.m_segmentation;
+				scratch->m_hits[offset] = sample.m_hit;
+				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
+			if (sample.m_shaded)
+				for (int i = 0; i < 3; i++)
+					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
+		}
+	}
+}
 
-			float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
-			if (filtered)
+// A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
+// off the straight line through its two neighbours on either axis.
+bool isEdge(const int* ids, const float* w, int width, int height, int row, int col)
+{
+	const size_t offset = (size_t)row * width + col;
+	const int id = ids[offset];
+	const bool hasLeft = col > 0, hasRight = col + 1 < width, hasUp = row > 0, hasDown = row + 1 < height;
+	if ((hasLeft && ids[offset - 1] != id) || (hasRight && ids[offset + 1] != id) ||
+		(hasUp && ids[offset - width] != id) || (hasDown && ids[offset + width] != id))
+		return true;
+	const float limit = kEdgeTolerance * fabsf(w[offset]);
+	if (hasLeft && hasRight && fabsf((w[offset - 1] + w[offset + 1]) - 2.0f * w[offset]) > limit)
+		return true;
+	if (hasUp && hasDown && fabsf((w[offset - width] + w[offset + width]) - 2.0f * w[offset]) > limit)
+		return true;
+	return false;
+}
+
+// A convex polygon on the frame, in ndc; a pixel square clipped by three edges has at most seven corners.
+struct Polygon
+{
+	double m_x[8];
+	double m_y[8];
+	int m_n;
+};
+
+// The triangle a first ray landed on, put back onto the frame: false when it is unknown to the scene
+// or reaches behind the camera, where its projection is not a triangle.
+bool projectTriangle(const TileJob& job, const Camera& cam, const HitId& hit, double x[3], double y[3])
+{
+	RTCHit rtcHit;
+	rtcHit.instID[0] = hit.m_inst;
+	rtcHit.geomID = hit.m_geom;
+	rtcHit.primID = hit.m_prim;
+	int segmentation;
+	HitSurface surface;
+	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, &surface))
+		return false;
+	for (int j = 0; j < 3; j++)
+	{
+		const float* c = surface.m_corners[j];
+		double clip[4];
+		for (int r = 0; r < 4; r++)
+			clip[r] = ((cam.m_viewProj[r][0] * c[0] + cam.m_viewProj[r][1] * c[1]) + cam.m_viewProj[r][2] * c[2]) + cam.m_viewProj[r][3];
+		if (!(clip[3] > 1e-9))
+			return false;
+		x[j] = clip[0] / clip[3];
+		y[j] = clip[1] / clip[3];
+	}
+	return true;
+}
+
+// The last few triangles a thread put onto the frame: an edge runs through several pixels that all
+// ask for the same triangle, so each is projected once per run instead of once per pixel.
+struct ProjectionCache
+{
+	HitId m_key[8];
+	double m_x[8][3];
+	double m_y[8][3];
+	bool m_ok[8];
+	int m_next;
+	int m_count;
+};
+
+bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam, const HitId& hit, const double*& x, const double*& y)
+{
+	for (int i = 0; i < cache.m_count; i++)
+		if (cache.m_key[i].m_inst == hit.m_inst && cache.m_key[i].m_geom == hit.m_geom && cache.m_key[i].m_prim == hit.m_prim)
+		{
+			x = cache.m_x[i];
+			y = cache.m_y[i];
+			return cache.m_ok[i];
+		}
+	const int slot = cache.m_next;
+	cache.m_next = (slot + 1) % 8;
+	if (cache.m_count < 8)
+		cache.m_count++;
+	cache.m_key[slot] = hit;
+	cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
+	x = cache.m_x[slot];
+	y = cache.m_y[slot];
+	return cache.m_ok[slot];
+}
+
+// Keeps the part of `poly` on the inner side of the directed line a -> b, where inside is the side
+// `sign` says the triangle's third corner lies on.
+void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
+{
+	out.m_n = 0;
+	const double ex = bx - ax, ey = by - ay;
+	for (int i = 0; i < poly.m_n; i++)
+	{
+		const int k = (i + 1) % poly.m_n;
+		const double px = poly.m_x[i], py = poly.m_y[i], qx = poly.m_x[k], qy = poly.m_y[k];
+		const double dp = (ex * (py - ay) - ey * (px - ax)) * sign;
+		const double dq = (ex * (qy - ay) - ey * (qx - ax)) * sign;
+		if (dp >= 0.0)
+		{
+			out.m_x[out.m_n] = px;
+			out.m_y[out.m_n] = py;
+			out.m_n++;
+		}
+		if ((dp >= 0.0) != (dq >= 0.0))
+		{
+			const double t = dp / (dp - dq);
+			out.m_x[out.m_n] = px + (qx - px) * t;
+			out.m_y[out.m_n] = py + (qy - py) * t;
+			out.m_n++;
+		}
+	}
+}
+
+// Area of the polygon and its centroid; a polygon too thin to have an area reports zero and its first corner.
+double polygonArea(const Polygon& poly, double& cx, double& cy)
+{
+	double twice = 0.0, sx = 0.0, sy = 0.0;
+	for (int i = 0; i < poly.m_n; i++)
+	{
+		const int k = (i + 1) % poly.m_n;
+		const double cross = poly.m_x[i] * poly.m_y[k] - poly.m_x[k] * poly.m_y[i];
+		twice += cross;
+		sx += (poly.m_x[i] + poly.m_x[k]) * cross;
+		sy += (poly.m_y[i] + poly.m_y[k]) * cross;
+	}
+	if (fabs(twice) < 1e-300 || poly.m_n < 3)
+	{
+		cx = poly.m_n ? poly.m_x[0] : 0.0;
+		cy = poly.m_n ? poly.m_y[0] : 0.0;
+		return 0.0;
+	}
+	cx = sx / (3.0 * twice);
+	cy = sy / (3.0 * twice);
+	return fabs(twice) * 0.5;
+}
+
+// Share of the pixel square that the triangle covers, and the centroid of that part.
+double coverage(const Polygon& square, double squareArea, const double x[3], const double y[3], double& cx, double& cy)
+{
+	const double sign = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]) >= 0.0 ? 1.0 : -1.0;
+	Polygon a, b, c;
+	clipByEdge(square, x[0], y[0], x[1], y[1], sign, a);
+	clipByEdge(a, x[1], y[1], x[2], y[2], sign, b);
+	clipByEdge(b, x[2], y[2], x[0], y[0], sign, c);
+	const double part = polygonArea(c, cx, cy);
+	const double share = part / squareArea;
+	return share > 1.0 ? 1.0 : share;
+}
+
+// One surface that may cover part of a pixel: the triangle a first ray landed on, the colour that ray
+// shaded, and the depth it sits at.
+struct Candidate
+{
+	HitId m_hit;
+	const unsigned char* m_rgb;
+	float m_depth;
+};
+
+inline bool sameTriangle(const HitId& a, const HitId& b)
+{
+	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim;
+}
+
+// Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
+// the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
+// the pixel square is clipped against each, front to back, so each surface gets exactly the share of
+// the pixel it covers, with the colour pass one already shaded for it. A body in front of the pixel's
+// own hit is composited over it at its true width, so a thin pole or cable stops breaking into dots.
+// Whatever share is left uncovered is asked with one probe ray at its centre, which is the only ray
+// this pass casts. Depth and segmentation stay as the first ray wrote them.
+void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, const EdgeScratch& scratch,
+				int row0, int row1, int col0, int col1,
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache)
+{
+	const Camera& cam = setup.m_cam;
+	const int width = job.m_width;
+	const int height = job.m_height;
+	const int* ids = &scratch.m_ids[0];
+	const HitId* hits = &scratch.m_hits[0];
+	const unsigned char* rgb1 = &scratch.m_rgb1[0];
+	const double halfX = 1.0 / (double)width;
+	const double halfY = 1.0 / (double)height;
+	const double squareArea = 4.0 * halfX * halfY;
+	for (int row = row0; row < row1; row++)
+	{
+		const double ndcY = pixelNdcY(row, height);
+		for (int col = col0; col < col1; col++)
+		{
+			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col))
+				continue;
+			const size_t offset = (size_t)row * width + col;
+			const double ndcX = pixelNdcX(col, width);
+			// The square is the box filter around the sample: half a pixel each way.
+			Polygon square;
+			square.m_n = 4;
+			square.m_x[0] = ndcX - halfX; square.m_y[0] = ndcY - halfY;
+			square.m_x[1] = ndcX + halfX; square.m_y[1] = ndcY - halfY;
+			square.m_x[2] = ndcX + halfX; square.m_y[2] = ndcY + halfY;
+			square.m_x[3] = ndcX - halfX; square.m_y[3] = ndcY + halfY;
+
+			// Candidates, each triangle once: bodies in front of this pixel's hit from the four neighbours,
+			// then the pixel's own triangle, then the neighbours on the same body (a crease or a facet).
+			// A body behind is never assumed: what shows past the pixel's own surface is asked with a ray.
+			const int id = ids[offset];
+			const bool hasOwn = hits[offset].m_prim != RTC_INVALID_GEOMETRY_ID;
+			const float ownDepth = target.m_depth[offset];
+			const size_t neighbours[4] = {col > 0 ? offset - 1 : offset, col + 1 < width ? offset + 1 : offset,
+										  row > 0 ? offset - width : offset, row + 1 < height ? offset + width : offset};
+			Candidate candidates[9];
+			int numCandidates = 0;
+			for (int pass = 0; pass < 3; pass++)
 			{
-				// TinyRenderer measures the texture footprint at the pixel to the right and the one above.
-				const float weights[2] = {rayhit.hit.u, rayhit.hit.v};
-				const float* steps[2] = {stepX, stepY};
-				float* out[2] = {duvdx, duvdy};
-				const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
-				const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
-				const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
-				for (int k = 0; k < 2; k++)
+				if (pass == 1)
 				{
-					float neighbourDir[3], u, v;
-					for (int i = 0; i < 3; i++)
-						neighbourDir[i] = rawDir[i] + steps[k][i];
-					if (!planeBarycentric(cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+					if (!hasOwn)
 						continue;
-					out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
-					out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+					candidates[numCandidates].m_hit = hits[offset];
+					candidates[numCandidates].m_rgb = rgb1 + offset * 3;
+					candidates[numCandidates].m_depth = ownDepth;
+					numCandidates++;
+					continue;
+				}
+				for (int n = 0; n < 4; n++)
+				{
+					const size_t at = neighbours[n];
+					if (at == offset || hits[at].m_prim == RTC_INVALID_GEOMETRY_ID)
+						continue;
+					// Clip depth grows towards the camera, so a larger value is a body in front.
+					const bool inFront = !hasOwn || target.m_depth[at] > ownDepth;
+					const bool wanted = pass == 0 ? (ids[at] != id && inFront) : (ids[at] == id);
+					if (!wanted)
+						continue;
+					bool seen = false;
+					for (int c = 0; c < numCandidates && !seen; c++)
+						seen = sameTriangle(candidates[c].m_hit, hits[at]);
+					if (seen)
+						continue;
+					candidates[numCandidates].m_hit = hits[at];
+					candidates[numCandidates].m_rgb = rgb1 + at * 3;
+					candidates[numCandidates].m_depth = target.m_depth[at];
+					numCandidates++;
 				}
 			}
 
-			shadeHit(*shading, surface, rayhit.hit, faceNormal, shadow, filtered, duvdx, duvdy, target.m_rgb + offset * 3);
+			double covered = 0.0, colour[3] = {0.0, 0.0, 0.0}, coveredCx = 0.0, coveredCy = 0.0;
+			for (int c = 0; c < numCandidates && covered < 1.0 - kCoverageEpsilon; c++)
+			{
+				const double *x, *y;
+				double cx, cy;
+				if (!projectCached(cache, job, cam, candidates[c].m_hit, x, y))
+					continue;
+				double share = coverage(square, squareArea, x, y, cx, cy);
+				if (share > 1.0 - covered)
+					share = 1.0 - covered;
+				if (share <= 0.0)
+					continue;
+				for (int i = 0; i < 3; i++)
+					colour[i] += share * candidates[c].m_rgb[i];
+				coveredCx += share * cx;
+				coveredCy += share * cy;
+				covered += share;
+			}
+
+			const double rest = 1.0 - covered;
+			if (rest > kCoverageEpsilon)
+			{
+				const unsigned char* restColour = rgb1 + offset * 3;
+				Sample probe;
+				if (hasOwn)
+				{
+					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
+					// that part's centre, and take the sky or clear colour when the ray meets nothing.
+					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
+					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
+					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
+					restColour = (traceRay(job, setup, px, py, args, shadowArgs, probe) && probe.m_shaded)
+									 ? probe.m_rgb
+									 : &scratch.m_background[offset * 3];
+				}
+				for (int i = 0; i < 3; i++)
+					colour[i] += rest * restColour[i];
+			}
+			else if (covered < 1.0)
+				for (int i = 0; i < 3; i++)
+					colour[i] /= covered;
+
+			unsigned char* pixel = target.m_rgb + offset * 3;
+			for (int i = 0; i < 3; i++)
+			{
+				const int value = (int)(colour[i] + 0.5);
+				pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
+			}
 		}
 	}
 }
@@ -1361,6 +1741,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			it->first->m_model->buildMipmaps();
 	}
 
+	// The edge pass runs only for a camera that is both shaded and given a depth buffer to test on.
+	const size_t numPixels = (size_t)width * height;
 	std::vector<CameraSetup> setups((size_t)numTargets);
 	for (int i = 0; i < numTargets; i++)
 	{
@@ -1375,6 +1757,19 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			setup.m_stepX[k] = (float)((setup.m_cam.m_far[1][k] - setup.m_cam.m_near[1][k]) * (2.0 / (double)width));
 			setup.m_stepY[k] = (float)((setup.m_cam.m_far[2][k] - setup.m_cam.m_near[2][k]) * (2.0 / (double)height));
 		}
+	}
+
+	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias) ? (size_t)numTargets : 0);
+	for (size_t i = 0; i < scratch.size(); i++)
+	{
+		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
+			continue;
+		HitId none;
+		none.m_inst = none.m_geom = none.m_prim = RTC_INVALID_GEOMETRY_ID;
+		scratch[i].m_ids.assign(numPixels, -1);
+		scratch[i].m_hits.assign(numPixels, none);
+		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
+		scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 	}
 
 	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera
@@ -1404,17 +1799,38 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		rtcInitOccludedArguments(&shadowArgs);
 		shadowArgs.context = &ctx.m_context;
 
-		for (int tile = tid; tile < numTiles; tile += cnt)
+		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
+		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
+		const int passes = scratch.empty() ? 1 : 2;
+		ProjectionCache cache;
+		cache.m_next = 0;
+		cache.m_count = 0;
+		for (int pass = 0; pass < passes; pass++)
 		{
-			const int camIndex = tile / tilesPerCamera;
-			if (!setups[(size_t)camIndex].m_valid)
-				continue;
-			const int local = tile - camIndex * tilesPerCamera;
-			const int row0 = (local / tilesX) * kTileSize;
-			const int col0 = (local % tilesX) * kTileSize;
-			const int row1 = row0 + kTileSize < height ? row0 + kTileSize : height;
-			const int col1 = col0 + kTileSize < width ? col0 + kTileSize : width;
-			renderTile(job, setups[(size_t)camIndex], targets[camIndex], row0, row1, col0, col1, &args, &shadowArgs);
+			if (pass == 1)
+			{
+#pragma omp barrier
+#pragma omp single
+				for (size_t i = 0; i < scratch.size(); i++)
+					if (!scratch[i].m_ids.empty())
+						scratch[i].m_rgb1.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
+			}
+			for (int tile = tid; tile < numTiles; tile += cnt)
+			{
+				const int camIndex = tile / tilesPerCamera;
+				if (!setups[(size_t)camIndex].m_valid)
+					continue;
+				const int local = tile - camIndex * tilesPerCamera;
+				const int row0 = (local / tilesX) * kTileSize;
+				const int col0 = (local % tilesX) * kTileSize;
+				const int row1 = row0 + kTileSize < height ? row0 + kTileSize : height;
+				const int col1 = col0 + kTileSize < width ? col0 + kTileSize : width;
+				EdgeScratch* edge = (!scratch.empty() && !scratch[(size_t)camIndex].m_ids.empty()) ? &scratch[(size_t)camIndex] : 0;
+				if (pass == 0)
+					renderTile(job, setups[(size_t)camIndex], targets[camIndex], edge, row0, row1, col0, col1, &args, &shadowArgs);
+				else if (edge)
+					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache);
+			}
 		}
 	}
 }
