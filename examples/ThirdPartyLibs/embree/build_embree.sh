@@ -33,6 +33,7 @@ rm -rf "${SOURCE_DIR}" "${BUILD_DIR}" "${PREFIX_DIR}"
 mkdir -p "${SOURCE_DIR}"
 tar -xzf "${ARCHIVE}" --strip-components=1 -C "${SOURCE_DIR}"
 patch -d "${SOURCE_DIR}" -p1 --quiet < "${SCRIPT_DIR}/exact_division.patch"
+# Embree offers no way to save or read back a built tree, so the two calls that do it are added here.
 patch -d "${SOURCE_DIR}" -p1 --quiet < "${SCRIPT_DIR}/tree_cache.patch"
 
 # The patch must leave no approximate reciprocal or inverse square root in any code that gets compiled.
