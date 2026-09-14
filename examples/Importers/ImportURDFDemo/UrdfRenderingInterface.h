@@ -88,6 +88,9 @@ struct UrdfRenderingInterface
 	///set the light specular coefficient
 	virtual void setLightSpecularCoeff(float specularCoeff) = 0;
 
+	///share of the direct light a shadowed surface keeps on the ray-cast path: 0.8 is the rasteriser's floor, 0 a full shadow
+	virtual void setShadowLightCoeff(float shadowLightCoeff) {}
+
 	///enable or disable rendering of shadows
 	virtual void setShadow(bool hasShadow) = 0;
 

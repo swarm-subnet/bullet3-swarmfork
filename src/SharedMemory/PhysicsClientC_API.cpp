@@ -4653,6 +4653,15 @@ B3_SHARED_API void b3RequestCameraImageSetLightSpecularCoeff(b3SharedMemoryComma
 	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SPECULAR_COEFF;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetShadowLightCoeff(b3SharedMemoryCommandHandle commandHandle, float shadowLightCoeff)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_REQUEST_CAMERA_IMAGE_DATA);
+	command->m_requestPixelDataArguments.m_shadowLightCoeff = shadowLightCoeff;
+	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SHADOW_LIGHT_COEFF;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;

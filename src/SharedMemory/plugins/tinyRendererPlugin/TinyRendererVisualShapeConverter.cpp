@@ -107,6 +107,7 @@ struct TinyRendererVisualShapeConverterInternalData
 	bool m_hasLightDiffuseCoeff;
 	float m_lightSpecularCoeff;
 	bool m_hasLightSpecularCoeff;
+	float m_shadowLightCoeff;
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
@@ -147,6 +148,7 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_hasLightDiffuseCoeff(false),
 		m_lightSpecularCoeff(0.05),
 		m_hasLightSpecularCoeff(false),
+		m_shadowLightCoeff(0.8f),
 		m_hasShadow(false),
 		m_flags(0),
 		m_batchCameraCount(1),
@@ -264,6 +266,11 @@ void TinyRendererVisualShapeConverter::setLightSpecularCoeff(float specularCoeff
 {
 	m_data->m_lightSpecularCoeff = specularCoeff;
 	m_data->m_hasLightSpecularCoeff = true;
+}
+
+void TinyRendererVisualShapeConverter::setShadowLightCoeff(float shadowLightCoeff)
+{
+	m_data->m_shadowLightCoeff = shadowLightCoeff;
 }
 
 // materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
@@ -1837,6 +1844,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_ambientCoeff = lightAmbientCoeff;
 		shading.m_diffuseCoeff = lightDiffuseCoeff;
 		shading.m_specularCoeff = lightSpecularCoeff;
+		shading.m_shadowLightCoeff = m_data->m_shadowLightCoeff;
 		shading.m_shadow = m_data->m_hasShadow;
 		shading.m_shadowMap = (m_data->m_flags & ER_SWARM_SHADOW_MAP) != 0;
 		shading.m_moverShadow = (m_data->m_flags & ER_SWARM_MOVER_SHADOW) != 0;

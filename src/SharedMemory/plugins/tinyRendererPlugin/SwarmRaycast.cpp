@@ -1581,8 +1581,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			rtcOccluded1(occluders, &ray, shadowArgs);
 			blocked = ray.tfar < 0.0f;
 		}
-		// The same 0.8 floor TinyRenderer's shader applies where its shadow buffer says blocked.
-		shadow = (float)(0.8 + 0.2 * !blocked);
+		shadow = blocked ? shading->m_shadowLightCoeff : 1.0f;
 	}
 
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
