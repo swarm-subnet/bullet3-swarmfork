@@ -29,40 +29,40 @@ ENDIF()
 
 	ADD_EXECUTABLE(Test_PhysicsClientServer
 		gtestwrap.cpp
-		../../examples/SharedMemory/PhysicsClient.cpp
-		../../examples/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp
-		../../examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp
-		../../examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h
-		../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp
-		../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h
-		../../examples/SharedMemory/IKTrajectoryHelper.cpp
-		../../examples/SharedMemory/IKTrajectoryHelper.h
-		../../examples/SharedMemory/PhysicsClient.h
-		../../examples/SharedMemory/PhysicsServer.cpp
-		../../examples/SharedMemory/PhysicsServer.h
-		../../examples/SharedMemory/PhysicsServerSharedMemory.cpp
-		../../examples/SharedMemory/PhysicsServerSharedMemory.h
-		../../examples/SharedMemory/PhysicsDirect.cpp
-		../../examples/SharedMemory/PhysicsDirect.h
-		../../examples/SharedMemory/PhysicsDirectC_API.cpp
-		../../examples/SharedMemory/PhysicsDirectC_API.h
-		../../examples/SharedMemory/PhysicsServerCommandProcessor.cpp
-		../../examples/SharedMemory/PhysicsServerCommandProcessor.h
-		../../examples/SharedMemory/b3PluginManager.cpp
-		../../examples/SharedMemory/PhysicsClientSharedMemory.cpp
-		../../examples/SharedMemory/PhysicsClientSharedMemory.h
-		../../examples/SharedMemory/PhysicsClientSharedMemory_C_API.cpp
-		../../examples/SharedMemory/PhysicsClientSharedMemory_C_API.h
-		../../examples/SharedMemory/PhysicsClientC_API.cpp
-		../../examples/SharedMemory/PhysicsClientC_API.h
-		../../examples/SharedMemory/PhysicsLoopBack.cpp
-		../../examples/SharedMemory/PhysicsLoopBack.h
-		../../examples/SharedMemory/PhysicsLoopBackC_API.cpp
-		../../examples/SharedMemory/PhysicsLoopBackC_API.h
-		../../examples/SharedMemory/Win32SharedMemory.cpp
-		../../examples/SharedMemory/Win32SharedMemory.h
-		../../examples/SharedMemory/PosixSharedMemory.cpp
-		../../examples/SharedMemory/PosixSharedMemory.h
+		../../src/SharedMemory/PhysicsClient.cpp
+		../../src/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp
+		../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp
+		../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h
+		../../src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp
+		../../src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h
+		../../src/SharedMemory/IKTrajectoryHelper.cpp
+		../../src/SharedMemory/IKTrajectoryHelper.h
+		../../src/SharedMemory/PhysicsClient.h
+		../../src/SharedMemory/PhysicsServer.cpp
+		../../src/SharedMemory/PhysicsServer.h
+		../../src/SharedMemory/PhysicsServerSharedMemory.cpp
+		../../src/SharedMemory/PhysicsServerSharedMemory.h
+		../../src/SharedMemory/PhysicsDirect.cpp
+		../../src/SharedMemory/PhysicsDirect.h
+		../../src/SharedMemory/PhysicsDirectC_API.cpp
+		../../src/SharedMemory/PhysicsDirectC_API.h
+		../../src/SharedMemory/PhysicsServerCommandProcessor.cpp
+		../../src/SharedMemory/PhysicsServerCommandProcessor.h
+		../../src/SharedMemory/b3PluginManager.cpp
+		../../src/SharedMemory/PhysicsClientSharedMemory.cpp
+		../../src/SharedMemory/PhysicsClientSharedMemory.h
+		../../src/SharedMemory/PhysicsClientSharedMemory_C_API.cpp
+		../../src/SharedMemory/PhysicsClientSharedMemory_C_API.h
+		../../src/SharedMemory/PhysicsClientC_API.cpp
+		../../src/SharedMemory/PhysicsClientC_API.h
+		../../src/SharedMemory/PhysicsLoopBack.cpp
+		../../src/SharedMemory/PhysicsLoopBack.h
+		../../src/SharedMemory/PhysicsLoopBackC_API.cpp
+		../../src/SharedMemory/PhysicsLoopBackC_API.h
+		../../src/SharedMemory/Win32SharedMemory.cpp
+		../../src/SharedMemory/Win32SharedMemory.h
+		../../src/SharedMemory/PosixSharedMemory.cpp
+		../../src/SharedMemory/PosixSharedMemory.h
 		../../examples/Utils/b3ResourcePath.cpp
 		../../examples/Utils/b3ResourcePath.h
 		../../examples/Utils/b3Clock.cpp
@@ -71,15 +71,15 @@ ENDIF()
 		../../examples/Utils/ChromeTraceUtil.h
 		../../examples/Utils/RobotLoggingUtil.cpp
 		../../examples/Utils/RobotLoggingUtil.h
-		../../examples/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
-		../../examples/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+		../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
+		../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
 		../../examples/OpenGLWindow/SimpleCamera.cpp
 		../../examples/OpenGLWindow/SimpleCamera.h
-		../../examples/TinyRenderer/geometry.cpp
-		../../examples/TinyRenderer/model.cpp
-		../../examples/TinyRenderer/tgaimage.cpp
-		../../examples/TinyRenderer/our_gl.cpp
-		../../examples/TinyRenderer/TinyRenderer.cpp
+		../../src/TinyRenderer/geometry.cpp
+		../../src/TinyRenderer/model.cpp
+		../../src/TinyRenderer/tgaimage.cpp
+		../../src/TinyRenderer/our_gl.cpp
+		../../src/TinyRenderer/TinyRenderer.cpp
 		../../examples/ThirdPartyLibs/tinyxml2/tinyxml2.cpp
 		../../examples/ThirdPartyLibs/Wavefront/tiny_obj_loader.cpp
 		../../examples/ThirdPartyLibs/Wavefront/tiny_obj_loader.h

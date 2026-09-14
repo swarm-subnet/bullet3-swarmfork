@@ -22,7 +22,7 @@ subject to the following restrictions:
 #include "LinearMath/btTransform.h"
 #include "LinearMath/btHashMap.h"
 
-#include "../TinyRenderer/TinyRenderer.h"
+#include "../../src/TinyRenderer/TinyRenderer.h"
 #include "../OpenGLWindow/SimpleOpenGL3App.h"
 #include <stdio.h>
 #include "../ExampleBrowser/OpenGLGuiHelper.h"

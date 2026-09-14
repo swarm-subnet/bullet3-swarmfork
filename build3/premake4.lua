@@ -64,27 +64,27 @@
 	newoption
 	{
 		trigger = "enable_static_vr_plugin",
-		description = "Statically link vr plugin (in examples/SharedMemory/plugins/vrSyncPlugin)"
+		description = "Statically link vr plugin (in src/SharedMemory/plugins/vrSyncPlugin)"
 	}
          newoption
         {
                 trigger = "enable_static_test_plugin",
-                description = "Statically link test plugin (in examples/SharedMemory/plugins/testPlugin)"
+                description = "Statically link test plugin (in src/SharedMemory/plugins/testPlugin)"
         }
          newoption
         {
                 trigger = "enable_static_tiny_renderer__plugin",
-                description = "Statically link vr plugin (in examples/SharedMemory/plugins/tinyRendererPlugin)"
+                description = "Statically link vr plugin (in src/SharedMemory/plugins/tinyRendererPlugin)"
         }
          newoption
         {
                 trigger = "enable_static_pd_control_plugin",
-                description = "Statically link vr plugin (in examples/SharedMemory/plugins/pdControlPlugin)"
+                description = "Statically link vr plugin (in src/SharedMemory/plugins/pdControlPlugin)"
         }
          newoption
         {
                 trigger = "enable_static_collision_filter_plugin",
-                description = "Statically link vr plugin (in examples/SharedMemory/plugins/collisionFilterPlugin)"
+                description = "Statically link vr plugin (in src/SharedMemory/plugins/collisionFilterPlugin)"
         }
  
 	newoption
@@ -247,12 +247,12 @@
       
       links { "grpc","grpc++", "grpc++_reflection", "gpr", "protobuf"}
       files { 
-      projectRootDir .. "examples/SharedMemory/grpc/ConvertGRPCBullet.cpp",
-			projectRootDir .. "examples/SharedMemory/grpc/ConvertGRPCBullet.h",
-			projectRootDir .. "examples/SharedMemory/grpc/proto/pybullet.grpc.pb.cpp",
-			projectRootDir .. "examples/SharedMemory/grpc/proto/pybullet.grpc.pb.h",
-			projectRootDir .. "examples/SharedMemory/grpc/proto/pybullet.pb.cpp",
-			projectRootDir .. "examples/SharedMemory/grpc/proto/pybullet.pb.h", }
+      projectRootDir .. "src/SharedMemory/grpc/ConvertGRPCBullet.cpp",
+			projectRootDir .. "src/SharedMemory/grpc/ConvertGRPCBullet.h",
+			projectRootDir .. "src/SharedMemory/grpc/proto/pybullet.grpc.pb.cpp",
+			projectRootDir .. "src/SharedMemory/grpc/proto/pybullet.grpc.pb.h",
+			projectRootDir .. "src/SharedMemory/grpc/proto/pybullet.pb.cpp",
+			projectRootDir .. "src/SharedMemory/grpc/proto/pybullet.pb.h", }
 		end
 
 	end
@@ -607,20 +607,20 @@ end
 		include "../examples/OpenGLWindow"
 		include "../examples/ThirdPartyLibs/Gwen"
 		include "../examples/HelloWorld"
-		include "../examples/SharedMemory"
+		include "../src/SharedMemory"
 		include "../examples/ThirdPartyLibs/BussIK"
 
 		if _OPTIONS["lua"] then
 		   include "../examples/ThirdPartyLibs/lua-5.2.3"
 		end
 		if _OPTIONS["enable_pybullet"] then
-		  include "../examples/pybullet"
+		  include "../src/pybullet"
 		end
 		include "../examples/SimpleOpenGL3"
 
 		if _OPTIONS["standalone-examples"] then
 			
-			include "../examples/TinyRenderer"
+			include "../src/TinyRenderer"
 			include "../examples/BasicDemo"
 			include "../examples/InverseDynamics"
 			include "../examples/ExtendedTutorials"

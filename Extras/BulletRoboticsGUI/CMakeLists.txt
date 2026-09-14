@@ -2,7 +2,7 @@
 INCLUDE_DIRECTORIES(
 		${BULLET_PHYSICS_SOURCE_DIR}/src
 		${BULLET_PHYSICS_SOURCE_DIR}/examples
-		${BULLET_PHYSICS_SOURCE_DIR}/examples/SharedMemory
+		${BULLET_PHYSICS_SOURCE_DIR}/src/SharedMemory
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/enet/include
 		${BULLET_PHYSICS_SOURCE_DIR}/examples/ThirdPartyLibs/clsocket/src
@@ -24,33 +24,33 @@ SET(BulletRoboticsGUI_INCLUDES
 
   ../../examples/OpenGLWindow/SimpleCamera.h
 
-  ../../examples/TinyRenderer/geometry.h
-  ../../examples/TinyRenderer/model.h
-  ../../examples/TinyRenderer/tgaimage.h
-  ../../examples/TinyRenderer/our_gl.h
-  ../../examples/TinyRenderer/TinyRenderer.h
+  ../../src/TinyRenderer/geometry.h
+  ../../src/TinyRenderer/model.h
+  ../../src/TinyRenderer/tgaimage.h
+  ../../src/TinyRenderer/our_gl.h
+  ../../src/TinyRenderer/TinyRenderer.h
 
-  ../../examples/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.h
-  ../../examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h
-  ../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.h
-  ../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h
-  ../../examples/SharedMemory/IKTrajectoryHelper.h
-  ../../examples/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.h
-  ../../examples/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.h
-  ../../examples/SharedMemory/InProcessMemory.h
-  ../../examples/SharedMemory/PhysicsServer.h
-  ../../examples/SharedMemory/PhysicsClient.h
-  ../../examples/SharedMemory/PhysicsServerSharedMemory.h
-  ../../examples/SharedMemory/PhysicsDirect.h
-  ../../examples/SharedMemory/PhysicsDirectC_API.h
-  ../../examples/SharedMemory/PhysicsServerCommandProcessor.h
-  ../../examples/SharedMemory/b3PluginManager.h
-  ../../examples/SharedMemory/PhysicsClientSharedMemory.h
-  ../../examples/SharedMemory/PhysicsClientSharedMemory_C_API.h
-  ../../examples/SharedMemory/PhysicsClientC_API.h
-  ../../examples/SharedMemory/SharedMemoryPublic.h
-  ../../examples/SharedMemory/Win32SharedMemory.h
-  ../../examples/SharedMemory/PosixSharedMemory.h
+  ../../src/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.h
+  ../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h
+  ../../src/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.h
+  ../../src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h
+  ../../src/SharedMemory/IKTrajectoryHelper.h
+  ../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.h
+  ../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.h
+  ../../src/SharedMemory/InProcessMemory.h
+  ../../src/SharedMemory/PhysicsServer.h
+  ../../src/SharedMemory/PhysicsClient.h
+  ../../src/SharedMemory/PhysicsServerSharedMemory.h
+  ../../src/SharedMemory/PhysicsDirect.h
+  ../../src/SharedMemory/PhysicsDirectC_API.h
+  ../../src/SharedMemory/PhysicsServerCommandProcessor.h
+  ../../src/SharedMemory/b3PluginManager.h
+  ../../src/SharedMemory/PhysicsClientSharedMemory.h
+  ../../src/SharedMemory/PhysicsClientSharedMemory_C_API.h
+  ../../src/SharedMemory/PhysicsClientC_API.h
+  ../../src/SharedMemory/SharedMemoryPublic.h
+  ../../src/SharedMemory/Win32SharedMemory.h
+  ../../src/SharedMemory/PosixSharedMemory.h
 
   ../../examples/Utils/b3ResourcePath.h
   ../../examples/Utils/RobotLoggingUtil.h
@@ -95,18 +95,18 @@ SET(BulletRoboticsGUI_INCLUDES
 
 SET(BulletRoboticsGUI_SRCS ${BulletRoboticsGUI_INCLUDES}
 	../../examples/ExampleBrowser/InProcessExampleBrowser.cpp
-	../../examples/SharedMemory/GraphicsServerExample.cpp
-	../../examples/SharedMemory/GraphicsClientExample.cpp
-	../../examples/SharedMemory/RemoteGUIHelper.cpp
-	../../examples/SharedMemory/RemoteGUIHelperTCP.cpp
-	../../examples/SharedMemory/GraphicsServerExample.h
-	../../examples/SharedMemory/GraphicsClientExample.h
-	../../examples/SharedMemory/RemoteGUIHelper.h
-	../../examples/SharedMemory/GraphicsSharedMemoryCommands.h
-	../../examples/SharedMemory/GraphicsSharedMemoryPublic.h
-	../../examples/SharedMemory/PhysicsServerExample.cpp
-	../../examples/SharedMemory/PhysicsServerExampleBullet2.cpp
-	../../examples/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp		
+	../../src/SharedMemory/GraphicsServerExample.cpp
+	../../src/SharedMemory/GraphicsClientExample.cpp
+	../../src/SharedMemory/RemoteGUIHelper.cpp
+	../../src/SharedMemory/RemoteGUIHelperTCP.cpp
+	../../src/SharedMemory/GraphicsServerExample.h
+	../../src/SharedMemory/GraphicsClientExample.h
+	../../src/SharedMemory/RemoteGUIHelper.h
+	../../src/SharedMemory/GraphicsSharedMemoryCommands.h
+	../../src/SharedMemory/GraphicsSharedMemoryPublic.h
+	../../src/SharedMemory/PhysicsServerExample.cpp
+	../../src/SharedMemory/PhysicsServerExampleBullet2.cpp
+	../../src/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp		
 )
 
 IF(BUILD_CLSOCKET)
@@ -138,8 +138,8 @@ ENDIF(WIN32)
 
 IF(BUILD_ENET)
   set(BulletRoboticsGUI_ENET_INCLUDES 
-    ../../examples/SharedMemory/PhysicsClientUDP.h		
-    ../../examples/SharedMemory/PhysicsClientUDP_C_API.h
+    ../../src/SharedMemory/PhysicsClientUDP.h		
+    ../../src/SharedMemory/PhysicsClientUDP_C_API.h
     ../../examples/ThirdPartyLibs/enet/include/enet/win32.h
 		../../examples/ThirdPartyLibs/enet/include/enet/unix.h
 		../../examples/ThirdPartyLibs/enet/include/enet/callbacks.h

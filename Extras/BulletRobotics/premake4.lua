@@ -16,7 +16,7 @@ project ("BulletRobotics")
   	includedirs {
                 "../../src",
                 "../../examples",
-                "../../examples/SharedMemory",
+                "../../src/SharedMemory",
                 "../ThirdPartyLibs",
                 "../ThirdPartyLibs/enet/include",
                 "../ThirdPartyLibs/clsocket/src",
@@ -45,10 +45,10 @@ if not _OPTIONS["no-enet"] then
 		links {"enet"}		
 
 		files {
-			"../../examples/SharedMemory/PhysicsClientUDP.cpp",
-			"../../examples/SharedMemory/PhysicsClientUDP.h",
-			"../../examples/SharedMemory/PhysicsClientUDP_C_API.cpp",
-			"../../examples/SharedMemory/PhysicsClientUDP_C_API.h",
+			"../../src/SharedMemory/PhysicsClientUDP.cpp",
+			"../../src/SharedMemory/PhysicsClientUDP.h",
+			"../../src/SharedMemory/PhysicsClientUDP_C_API.cpp",
+			"../../src/SharedMemory/PhysicsClientUDP_C_API.h",
 		}	
 		defines {"BT_ENABLE_ENET"}
 	end
@@ -71,66 +71,66 @@ if not _OPTIONS["no-enet"] then
                 links {"clsocket"}
 
                 files {
-			"../../examples/SharedMemory/RemoteGUIHelperTCP.cpp",
-                        "../../examples/SharedMemory/PhysicsClientTCP.cpp",
-			"../../examples/SharedMemory/GraphicsServerExample.cpp",
-                        "../../examples/SharedMemory/PhysicsClientTCP.h",
-                        "../../examples/SharedMemory/PhysicsClientTCP_C_API.cpp",
-                        "../../examples/SharedMemory/PhysicsClientTCP_C_API.h",
+			"../../src/SharedMemory/RemoteGUIHelperTCP.cpp",
+                        "../../src/SharedMemory/PhysicsClientTCP.cpp",
+			"../../src/SharedMemory/GraphicsServerExample.cpp",
+                        "../../src/SharedMemory/PhysicsClientTCP.h",
+                        "../../src/SharedMemory/PhysicsClientTCP_C_API.cpp",
+                        "../../src/SharedMemory/PhysicsClientTCP_C_API.h",
                 }
                 defines {"BT_ENABLE_CLSOCKET"}
         end
 
 
 		files {
-		"../../examples/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp",
-		"../../examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp",
-		"../../examples/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h",
-		"../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.cpp",
-		"../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.h",
-		"../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp",
-		"../../examples/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h",
-		"../../examples/SharedMemory/IKTrajectoryHelper.cpp",
-		"../../examples/SharedMemory/IKTrajectoryHelper.h",
-		"../../examples/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp",
-		"../../examples/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp",
-		"../../examples/SharedMemory/RemoteGUIHelper.cpp",
+		"../../src/SharedMemory/plugins/collisionFilterPlugin/collisionFilterPlugin.cpp",
+		"../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.cpp",
+		"../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h",
+		"../../src/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.cpp",
+		"../../src/SharedMemory/b3RobotSimulatorClientAPI_NoGUI.h",
+		"../../src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.cpp",
+		"../../src/SharedMemory/b3RobotSimulatorClientAPI_NoDirect.h",
+		"../../src/SharedMemory/IKTrajectoryHelper.cpp",
+		"../../src/SharedMemory/IKTrajectoryHelper.h",
+		"../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp",
+		"../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp",
+		"../../src/SharedMemory/RemoteGUIHelper.cpp",
 		"../../examples/OpenGLWindow/SimpleCamera.cpp",
 		"../../examples/OpenGLWindow/SimpleCamera.h",
-		"../../examples/TinyRenderer/geometry.cpp",
-		"../../examples/TinyRenderer/model.cpp",
-		"../../examples/TinyRenderer/tgaimage.cpp",
-		"../../examples/TinyRenderer/our_gl.cpp",
-		"../../examples/TinyRenderer/TinyRenderer.cpp",
-		"../../examples/SharedMemory/InProcessMemory.cpp",
-		"../../examples/SharedMemory/PhysicsClient.cpp",
-		"../../examples/SharedMemory/PhysicsClient.h",
-		"../../examples/SharedMemory/PhysicsServer.cpp",
-		"../../examples/SharedMemory/PhysicsServer.h",
-		"../../examples/SharedMemory/PhysicsServerSharedMemory.cpp",
-		"../../examples/SharedMemory/PhysicsServerSharedMemory.h",
-		"../../examples/SharedMemory/PhysicsDirect.cpp",
-		"../../examples/SharedMemory/PhysicsDirect.h",
-		"../../examples/SharedMemory/PhysicsDirectC_API.cpp",
-		"../../examples/SharedMemory/PhysicsDirectC_API.h",
-		"../../examples/SharedMemory/PhysicsServerCommandProcessor.cpp",
-		"../../examples/SharedMemory/PhysicsServerCommandProcessor.h",
-		"../../examples/SharedMemory/b3PluginManager.cpp",
-		"../../examples/SharedMemory/b3PluginManager.h",
+		"../../src/TinyRenderer/geometry.cpp",
+		"../../src/TinyRenderer/model.cpp",
+		"../../src/TinyRenderer/tgaimage.cpp",
+		"../../src/TinyRenderer/our_gl.cpp",
+		"../../src/TinyRenderer/TinyRenderer.cpp",
+		"../../src/SharedMemory/InProcessMemory.cpp",
+		"../../src/SharedMemory/PhysicsClient.cpp",
+		"../../src/SharedMemory/PhysicsClient.h",
+		"../../src/SharedMemory/PhysicsServer.cpp",
+		"../../src/SharedMemory/PhysicsServer.h",
+		"../../src/SharedMemory/PhysicsServerSharedMemory.cpp",
+		"../../src/SharedMemory/PhysicsServerSharedMemory.h",
+		"../../src/SharedMemory/PhysicsDirect.cpp",
+		"../../src/SharedMemory/PhysicsDirect.h",
+		"../../src/SharedMemory/PhysicsDirectC_API.cpp",
+		"../../src/SharedMemory/PhysicsDirectC_API.h",
+		"../../src/SharedMemory/PhysicsServerCommandProcessor.cpp",
+		"../../src/SharedMemory/PhysicsServerCommandProcessor.h",
+		"../../src/SharedMemory/b3PluginManager.cpp",
+		"../../src/SharedMemory/b3PluginManager.h",
 				
-		"../../examples/SharedMemory/PhysicsClientSharedMemory.cpp",
-		"../../examples/SharedMemory/PhysicsClientSharedMemory.h",
-		"../../examples/SharedMemory/PhysicsClientSharedMemory_C_API.cpp",
-		"../../examples/SharedMemory/PhysicsClientSharedMemory_C_API.h",
-		"../../examples/SharedMemory/PhysicsClientC_API.cpp",
+		"../../src/SharedMemory/PhysicsClientSharedMemory.cpp",
+		"../../src/SharedMemory/PhysicsClientSharedMemory.h",
+		"../../src/SharedMemory/PhysicsClientSharedMemory_C_API.cpp",
+		"../../src/SharedMemory/PhysicsClientSharedMemory_C_API.h",
+		"../../src/SharedMemory/PhysicsClientC_API.cpp",
 	
-		"../../examples/SharedMemory/PhysicsClientC_API.h",
-		"../../examples/SharedMemory/SharedMemoryPublic.h",
+		"../../src/SharedMemory/PhysicsClientC_API.h",
+		"../../src/SharedMemory/SharedMemoryPublic.h",
 
-		"../../examples/SharedMemory/Win32SharedMemory.cpp",
-		"../../examples/SharedMemory/Win32SharedMemory.h",
-		"../../examples/SharedMemory/PosixSharedMemory.cpp",
-		"../../examples/SharedMemory/PosixSharedMemory.h",
+		"../../src/SharedMemory/Win32SharedMemory.cpp",
+		"../../src/SharedMemory/Win32SharedMemory.h",
+		"../../src/SharedMemory/PosixSharedMemory.cpp",
+		"../../src/SharedMemory/PosixSharedMemory.h",
 
 		"../../examples/Utils/b3ResourcePath.cpp",
 		"../../examples/Utils/b3ResourcePath.h",
@@ -176,7 +176,7 @@ if not _OPTIONS["no-enet"] then
 			}
 			
 if (_OPTIONS["enable_static_vr_plugin"]) then
-		files {"../../examples/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
+		files {"../../src/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
 end
 
 

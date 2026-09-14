@@ -7,10 +7,10 @@
 #include "../CommonInterfaces/CommonRenderInterface.h"
 #include "../CommonInterfaces/CommonExampleInterface.h"
 #include "../CommonInterfaces/CommonGUIHelperInterface.h"
-#include "../SharedMemory/PhysicsServerSharedMemory.h"
-#include "../SharedMemory/PhysicsClientC_API.h"
+#include "../../src/SharedMemory/PhysicsServerSharedMemory.h"
+#include "../../src/SharedMemory/PhysicsClientC_API.h"
 #include "../CommonInterfaces/CommonParameterInterface.h"
-#include "../SharedMemory/SharedMemoryPublic.h"
+#include "../../src/SharedMemory/SharedMemoryPublic.h"
 #include <string>
 
 #include "../RobotSimulator/b3RobotSimulatorClientAPI.h"

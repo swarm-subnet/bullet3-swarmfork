@@ -23,7 +23,7 @@ subject to the following restrictions:
 #include "LinearMath/btTransform.h"
 #include "LinearMath/btHashMap.h"
 
-#include "../TinyRenderer/TinyRenderer.h"
+#include "../../src/TinyRenderer/TinyRenderer.h"
 #include "../OpenGLWindow/SimpleCamera.h"
 
 static btVector4 sMyColors[4] =

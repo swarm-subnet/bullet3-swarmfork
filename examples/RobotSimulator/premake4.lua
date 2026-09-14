@@ -12,10 +12,10 @@ project ("App_RobotSimulator")
 		if _OPTIONS["enable_grpc"] then
 			initGRPC()
 			files {
-			"../../examples/SharedMemory/PhysicsClientGRPC.cpp",
-                        "../../examples/SharedMemory/PhysicsClientGRPC.h",
-                        "../../examples/SharedMemory/PhysicsClientGRPC_C_API.cpp",
-                        "../../examples/SharedMemory/PhysicsClientGRPC_C_API.h",
+			"../../src/SharedMemory/PhysicsClientGRPC.cpp",
+                        "../../src/SharedMemory/PhysicsClientGRPC.h",
+                        "../../src/SharedMemory/PhysicsClientGRPC_C_API.cpp",
+                        "../../src/SharedMemory/PhysicsClientGRPC_C_API.h",
 			}
 		end
 
@@ -27,7 +27,7 @@ project ("App_RobotSimulator")
   	includedirs {
                 ".",
                 "../../src",
-		"../../examples/SharedMemory",
+		"../../src/SharedMemory",
                 "../ThirdPartyLibs",
                 }
 
@@ -54,10 +54,10 @@ if not _OPTIONS["no-enet"] then
 		links {"enet"}		
 
 		files {
-			"../../examples/SharedMemory/PhysicsClientUDP.cpp",
-			"../../examples/SharedMemory/PhysicsClientUDP.h",
-			"../../examples/SharedMemory/PhysicsClientUDP_C_API.cpp",
-			"../../examples/SharedMemory/PhysicsClientUDP_C_API.h",
+			"../../src/SharedMemory/PhysicsClientUDP.cpp",
+			"../../src/SharedMemory/PhysicsClientUDP.h",
+			"../../src/SharedMemory/PhysicsClientUDP_C_API.cpp",
+			"../../src/SharedMemory/PhysicsClientUDP_C_API.h",
 		}	
 		defines {"BT_ENABLE_ENET"}
 	end
@@ -80,10 +80,10 @@ if not _OPTIONS["no-enet"] then
                 links {"clsocket"}
 
                 files {
-                        "../../examples/SharedMemory/PhysicsClientTCP.cpp",
-                        "../../examples/SharedMemory/PhysicsClientTCP.h",
-                        "../../examples/SharedMemory/PhysicsClientTCP_C_API.cpp",
-                        "../../examples/SharedMemory/PhysicsClientTCP_C_API.h",
+                        "../../src/SharedMemory/PhysicsClientTCP.cpp",
+                        "../../src/SharedMemory/PhysicsClientTCP.h",
+                        "../../src/SharedMemory/PhysicsClientTCP_C_API.cpp",
+                        "../../src/SharedMemory/PhysicsClientTCP_C_API.h",
                 }
                 defines {"BT_ENABLE_CLSOCKET"}
         end
@@ -130,13 +130,13 @@ if not _OPTIONS["no-enet"] then
 			"MinitaurSetup.cpp",
 			"MinitaurSetup.h",
 			"../../examples/ExampleBrowser/InProcessExampleBrowser.cpp",
-			"../../examples/SharedMemory/PhysicsServerExample.cpp",
-			"../../examples/SharedMemory/PhysicsServerExampleBullet2.cpp",
-			"../../examples/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp",
+			"../../src/SharedMemory/PhysicsServerExample.cpp",
+			"../../src/SharedMemory/PhysicsServerExampleBullet2.cpp",
+			"../../src/SharedMemory/SharedMemoryInProcessPhysicsC_API.cpp",
 		}
 
 if (_OPTIONS["enable_static_vr_plugin"]) then
-	files {"../../examples/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
+	files {"../../src/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
 end
 
 	if os.is("Linux") then
@@ -224,7 +224,7 @@ project ("App_VRGloveHandSimulator")
 		}
 
 if (_OPTIONS["enable_static_vr_plugin"]) then
-	files {"../../examples/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
+	files {"../../src/SharedMemory/plugins/vrSyncPlugin/vrSyncPlugin.cpp"}
 end
 
 	if os.is("Linux") then
@@ -243,7 +243,7 @@ project ("App_HelloBulletRobotics")
   includedirs {
                 ".",
                 "../../src",
-                "../../examples/SharedMemory",
+                "../../src/SharedMemory",
                 "../ThirdPartyLibs",
                 }
 
