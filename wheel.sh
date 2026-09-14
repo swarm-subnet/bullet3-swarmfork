@@ -1,12 +1,13 @@
 #!/bin/bash
 set -e -x
 
-# use this docker command
-# sudo docker run -it -v $(pwd):/io quay.io/pypa/manylinux2014_x86_64
+# use this docker command; the cache mount keeps the compiled Embree between runs
+# sudo docker run -it -v $(pwd):/io -v $HOME/.cache/swarm-bullet3:/root/.cache/swarm-bullet3 quay.io/pypa/manylinux2014_x86_64
 
 # x86-64-v3 (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE: Intel Haswell 2013+, AMD Zen) is the published floor: faster than -O2 with bit-identical output.
 export SWARM_BULLET3_OPT_LEVEL=v3
 export SWARM_BULLET3_PGO=off
+export SWARM_BULLET3_CCACHE=off
 
 # Compile wheels
 for PYBIN in /opt/python/*/bin; do

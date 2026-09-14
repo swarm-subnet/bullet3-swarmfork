@@ -1,10 +1,13 @@
+"""Build the swarm-bullet3 wheel: CPU tier, PGO, the Embree ray-cast backend and parallel compilation."""
 from setuptools import find_packages
 from sys import platform as _platform
 import sys
 import glob
 import os
 import shlex
+import shutil
 import subprocess
+import sysconfig
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +30,7 @@ def parallelCCompile(self,
                      extra_preargs=None,
                      extra_postargs=None,
                      depends=None):
+  """Compile every source in a thread pool sized by CPU count and RAM; a drop-in for CCompiler.compile."""
   # those lines are copied from distutils.ccompiler.CCompiler directly
   macros, objects, extra_postargs, pp_opts, build = self._setup_compile(
       output_dir, macros, include_dirs, sources, depends, extra_postargs)
@@ -47,6 +51,7 @@ def parallelCCompile(self,
     N = min(mem, N)
 
   def _single_compile(obj):
+    """Compile one object, adding the macOS flags for C++ sources."""
     try:
       src, ext = build[obj]
     except KeyError:
@@ -92,12 +97,14 @@ _TIER_CPU_REQS = {
 
 
 def _cc_argv():
+  """Return the C compiler command from CC as an argument list, defaulting to gcc."""
   raw = os.environ.get('CC') or 'gcc'
   parts = shlex.split(raw)
   return parts or ['gcc']
 
 
 def _cpu_flags_from_proc():
+  """Return the CPU feature flags listed in /proc/cpuinfo, or an empty set when it cannot be read."""
   try:
     with open('/proc/cpuinfo') as f:
       for line in f:
@@ -109,6 +116,7 @@ def _cpu_flags_from_proc():
 
 
 def _compiler_accepts(cc_argv, flag):
+  """Return True when the compiler builds a trivial program with the given flags."""
   with tempfile.NamedTemporaryFile(suffix='.c', delete=False) as t:
     t.write(b'int main(){return 0;}')
     src = t.name
@@ -127,10 +135,12 @@ def _compiler_accepts(cc_argv, flag):
 
 
 def _cpu_meets_tier(cpu, tier):
+  """Return True when the CPU flags satisfy every requirement of the tier."""
   return all(alts & cpu for alts in _TIER_CPU_REQS[tier])
 
 
 def _pick_cpu_tier():
+  """Return the highest tier this CPU and compiler support, or the SWARM_BULLET3_OPT_LEVEL override."""
   override = os.environ.get('SWARM_BULLET3_OPT_LEVEL', '').strip()
   if override in _TIER_FLAGS:
     return override
@@ -142,7 +152,18 @@ def _pick_cpu_tier():
   return 'safe'
 
 
-_SWARM_TIER = _pick_cpu_tier() if _IS_LINUX else 'safe'
+def _enable_ccache():
+  """Route CC and CXX through ccache when it is installed and SWARM_BULLET3_CCACHE is not off; return True if so."""
+  if os.environ.get('SWARM_BULLET3_CCACHE', 'on').strip().lower() == 'off' or not shutil.which('ccache'):
+    return False
+  for var in ('CC', 'CXX'):
+    cmd = os.environ.get(var) or sysconfig.get_config_var(var) or ''
+    if cmd and os.path.basename(shlex.split(cmd)[0]) != 'ccache':
+      os.environ[var] = 'ccache ' + cmd
+  return True
+
+
+_SWARM_TIER =_pick_cpu_tier() if _IS_LINUX else 'safe'
 _SWARM_TIER_FLAGS = _TIER_FLAGS[_SWARM_TIER] if _IS_LINUX else ''
 print("swarm-bullet3: cpu tier = %s (%s)" % (_SWARM_TIER, _SWARM_TIER_FLAGS.strip()))
 
@@ -515,13 +536,15 @@ if _platform == "linux" or _platform == "linux2":
   if os.environ.get('SWARM_RAYCAST', 'on').strip().lower() != 'off':
     _EMBREE_DIR = os.path.join('examples', 'ThirdPartyLibs', 'embree')
     _EMBREE_PREFIX = os.path.join(_EMBREE_DIR, 'prefix')
-    if not os.path.isfile(os.path.join(_EMBREE_PREFIX, 'lib', 'libembree4.a')):
-      subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
+    # The script keeps prefix/ in step with its cache key and returns at once when it already matches.
+    subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
     CXX_FLAGS += '-DSWARM_RAYCAST '
     sources = sources + ['examples/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp']
     include_dirs += [os.path.join(_EMBREE_PREFIX, 'include')]
     LINK_FLAGS += ' ' + ' '.join(os.path.join(_EMBREE_PREFIX, 'lib', 'lib%s.a' % name)
                                  for name in ('embree4', 'embree_avx2', 'sys', 'math', 'simd', 'lexers', 'tasking'))
+  # After the Embree step, so its cache key sees the plain compiler; the compiler output is unchanged either way.
+  print("swarm-bullet3: ccache = %s" % ('on' if _enable_ccache() else 'off'))
   EGL_CXX_FLAGS += '-DBT_USE_EGL '
   EGL_CXX_FLAGS += '-fPIC '  # for plugins
 
