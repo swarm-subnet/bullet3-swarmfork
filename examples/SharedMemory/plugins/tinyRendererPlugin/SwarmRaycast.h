@@ -69,8 +69,10 @@ public:
 	// into fixed tiles before the frame starts and tile k always goes to thread k mod threads, so the
 	// bytes never depend on the thread count or on the order threads finish. With edge anti-aliasing
 	// the same tiles are walked a second time once every first ray has landed.
+	// With alphaCutout a hit on a texel whose texture alpha is below the cut-out threshold is not a hit:
+	// the ray, and a shadow ray, carry on behind it, so colour, depth and shadow share the same holes.
 	void render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
-				const SwarmRaycastShading* shading, int threads) const;
+				const SwarmRaycastShading* shading, int threads, bool alphaCutout = false) const;
 
 private:
 	struct Data;
