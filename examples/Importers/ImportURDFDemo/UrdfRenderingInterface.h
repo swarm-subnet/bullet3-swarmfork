@@ -91,6 +91,18 @@ struct UrdfRenderingInterface
 	///share of the direct light a shadowed surface keeps on the ray-cast path: 0.8 is the rasteriser's floor, 0 a full shadow
 	virtual void setShadowLightCoeff(float shadowLightCoeff) {}
 
+	///ER_SWARM_DAYLIGHT: scale on the linear light before the film curve; 1 is the sky as built
+	virtual void setExposure(float exposure) {}
+
+	///ER_SWARM_DAYLIGHT: metres at which a hit is 63 % haze; 0 turns the haze off
+	virtual void setHazeDistance(float hazeDistance) {}
+
+	///ER_SWARM_DAYLIGHT: a loaded equirectangular texture as the sky, turned by yaw degrees about the up axis, for this render only
+	virtual void setSkyPhoto(bool enabled, int textureUniqueId, float yawDegrees) {}
+
+	///ER_SWARM_DAYLIGHT: half side of the fine shadow grid about the world origin; 0 keeps one grid
+	virtual void setShadowCoreRadius(float radius) {}
+
 	///enable or disable rendering of shadows
 	virtual void setShadow(bool hasShadow) = 0;
 

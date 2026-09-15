@@ -6,6 +6,7 @@
 struct TinyRenderObjectData;
 class btTransform;
 class btVector3;
+class SwarmSky;
 
 // Light and output for a colour render on the ray-cast path: the same terms TinyRenderer's shader
 // takes, so a frame lit through either backend uses one light model.
@@ -41,6 +42,12 @@ struct SwarmRaycastShading
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
 	// encoded bytes as TinyRenderer's shader does.
 	bool m_linearLight;
+	// ER_SWARM_DAYLIGHT: the daylight terms below replace TinyRenderer's formula; m_sky gives radiance, sky light and haze colour, or flat white without one.
+	bool m_daylight;
+	const SwarmSky* m_sky;
+	float m_exposure;
+	float m_hazeDistance;      // metres at which a hit is 63 % haze; 0 turns the haze off
+	float m_shadowCoreRadius;  // half side of the fine shadow grid about the world origin; 0 for one grid
 	TinyRenderGlint m_glint;
 };
 

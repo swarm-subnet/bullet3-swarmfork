@@ -596,34 +596,9 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	return c;
 }
 
-// Trilinear sample: the level comes from how many level-0 texels one pixel
-// spans, using the float's own exponent and mantissa for log2 so nothing
-// depends on the maths library. duvdx and duvdy are the uv steps to the pixel
-// to the right and the pixel below.
-TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy)
+// One trilinear read at the level a footprint radius squared of rho2 texels asks for, log2 from the float's own bits.
+static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2)
 {
-	if (!m_diffuse)
-		return TGAColor(255, 255, 255, 255);
-	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
-	if (!w || !h)
-		return TGAColor(255, 255, 255, 255);
-	if (!m_diffuse->mipsBuilt_)
-		buildMips(*m_diffuse);
-
-	double val;
-	uvf[0] = std::modf(uvf[0], &val);
-	if (uvf[0] < 0)
-		uvf[0] = uvf[0] + 1;
-	uvf[1] = std::modf(uvf[1], &val);
-	if (uvf[1] < 0)
-		uvf[1] = uvf[1] + 1;
-
-	const float sx = duvdx[0] * w, tx = duvdx[1] * h;
-	const float sy = duvdy[0] * w, ty = duvdy[1] * h;
-	const float rx2 = sx * sx + tx * tx;
-	const float ry2 = sy * sy + ty * ty;
-	const float rho2 = rx2 > ry2 ? rx2 : ry2;
-
 	float lambda = 0.f;
 	if (rho2 > 1.f)
 	{
@@ -636,7 +611,7 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy)
 		lambda = 0.5f * ((float)e + (mant - 1.f));
 	}
 
-	std::vector<TGAImage*>& mips = m_diffuse->mips_;
+	std::vector<TGAImage*>& mips = tex.mips_;
 	const int last = (int)mips.size();
 	int level = (int)lambda;
 	float frac = lambda - (float)level;
@@ -645,15 +620,79 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy)
 		level = last;
 		frac = 0.f;
 	}
-	TGAImage& imgA = level == 0 ? m_diffuse->img_ : *mips[level - 1];
-	TGAColor a = sampleBilinear(imgA, uvf[0], uvf[1]);
+	TGAImage& imgA = level == 0 ? tex.img_ : *mips[level - 1];
+	TGAColor a = sampleBilinear(imgA, u, v);
 	const int wl = (int)(frac * 256.f);
 	if (wl == 0)
 		return a;
-	TGAColor b = sampleBilinear(*mips[level], uvf[0], uvf[1]);
+	TGAColor b = sampleBilinear(*mips[level], u, v);
 	for (int i = 0; i < (int)a.bytespp; i++)
 		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
 	return a;
+}
+
+// Wraps a texture coordinate into [0, 1).
+static float wrapUnit(float value)
+{
+	double integral;
+	float f = (float)std::modf(value, &integral);
+	return f < 0.f ? f + 1.f : f;
+}
+
+// Trilinear sample at the pixel footprint; with more taps the footprint is walked along its long side and the reads averaged.
+TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps)
+{
+	if (!m_diffuse)
+		return TGAColor(255, 255, 255, 255);
+	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
+	if (!w || !h)
+		return TGAColor(255, 255, 255, 255);
+	if (!m_diffuse->mipsBuilt_)
+		buildMips(*m_diffuse);
+
+	uvf[0] = wrapUnit(uvf[0]);
+	uvf[1] = wrapUnit(uvf[1]);
+
+	const float sx = duvdx[0] * w, tx = duvdx[1] * h;
+	const float sy = duvdy[0] * w, ty = duvdy[1] * h;
+	const float rx2 = sx * sx + tx * tx;
+	const float ry2 = sy * sy + ty * ty;
+	const float rho2 = rx2 > ry2 ? rx2 : ry2;
+	if (maxTaps <= 1)
+		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+
+	const bool xMajor = rx2 >= ry2;
+	const float major2 = xMajor ? rx2 : ry2, minor2 = xMajor ? ry2 : rx2;
+	int taps = 1;
+	if (minor2 > 0.f && major2 > minor2)
+	{
+		// Enough reads that each covers about the shorter side's length along the longer side.
+		const float ratio = sqrtf(major2 / minor2);
+		taps = (int)ratio;
+		if ((float)taps < ratio)
+			taps++;
+		taps = taps > maxTaps ? maxTaps : (taps < 1 ? 1 : taps);
+	}
+	if (taps <= 1)
+		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+	const float perTap2 = major2 / ((float)taps * (float)taps);
+	const float tapRho2 = perTap2 > minor2 ? perTap2 : minor2;
+	const Vec2f along = xMajor ? duvdx : duvdy;
+	int sum[4] = {0, 0, 0, 0};
+	unsigned char bytespp = 3;
+	for (int k = 0; k < taps; k++)
+	{
+		const float f = ((float)k + 0.5f) / (float)taps - 0.5f;
+		const TGAColor c = sampleTrilinear(*m_diffuse, wrapUnit(uvf[0] + along[0] * f), wrapUnit(uvf[1] + along[1] * f), tapRho2);
+		bytespp = c.bytespp;
+		for (int i = 0; i < (int)c.bytespp; i++)
+			sum[i] += c.bgra[i];
+	}
+	TGAColor out;
+	out.bytespp = bytespp;
+	for (int i = 0; i < (int)bytespp; i++)
+		out.bgra[i] = (unsigned char)((sum[i] + taps / 2) / taps);
+	return out;
 }
 
 void Model::buildMipmaps()

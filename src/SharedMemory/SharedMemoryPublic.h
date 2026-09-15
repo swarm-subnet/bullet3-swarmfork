@@ -902,6 +902,8 @@ enum EnumRendererAuxFlags
 	// On the ray-cast path the texel and body colour are decoded to linear light through a fixed table,
 	// lit, blended and glinted there, and encoded back to sRGB on the byte write.
 	ER_SWARM_LINEAR_LIGHT = 4096,
+	// Ray-cast colour path: sky light by direction, a real sun, coated glass, soft two-grid shadows, footprint taps, haze, leaf light, a film curve; sky from ER_SWARM_SKY_SUN or a photo.
+	ER_SWARM_DAYLIGHT = 8192,
 };
 
 ///flags to pick the IK solver and other options

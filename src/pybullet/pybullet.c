@@ -10151,6 +10151,12 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	float lightDiffuseCoeff = -1;
 	float lightSpecularCoeff = -1;
 	float shadowLightCoeff = -1;
+	// ER_SWARM_DAYLIGHT arguments; a negative value, or no texture, leaves the last setting in place
+	float exposure = -1;
+	float hazeDistance = -1;
+	int skyTextureId = -1;
+	float skyYaw = 0;
+	float shadowCoreRadius = -1;
 	int flags = -1;
 	int renderer = -1;
 	// inialize cmd
@@ -10158,9 +10164,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOf", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiff", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius))
 	{
 		return NULL;
 	}
@@ -10231,6 +10237,22 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (shadowLightCoeff >= 0)
 	{
 		b3RequestCameraImageSetShadowLightCoeff(command, shadowLightCoeff);
+	}
+	if (exposure >= 0)
+	{
+		b3RequestCameraImageSetExposure(command, exposure);
+	}
+	if (hazeDistance >= 0)
+	{
+		b3RequestCameraImageSetHazeDistance(command, hazeDistance);
+	}
+	if (skyTextureId >= 0)
+	{
+		b3RequestCameraImageSetSkyPhoto(command, skyTextureId, skyYaw);
+	}
+	if (shadowCoreRadius >= 0)
+	{
+		b3RequestCameraImageSetShadowCoreRadius(command, shadowCoreRadius);
 	}
 
 	if (flags >= 0)
@@ -13077,7 +13099,8 @@ static PyMethodDef SpamMethods[] = {
 	 "Render an image (given the pixel resolution width, height, camera viewMatrix "
 	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
 	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky, "
-	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path), and return the "
+	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path, and under "
+	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
@@ -13539,6 +13562,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SPECULAR_GLINT", ER_SPECULAR_GLINT);
 	PyModule_AddIntConstant(m, "ER_SWARM_SKY_SUN", ER_SWARM_SKY_SUN);
 	PyModule_AddIntConstant(m, "ER_SWARM_LINEAR_LIGHT", ER_SWARM_LINEAR_LIGHT);
+	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);
