@@ -2226,6 +2226,47 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 	}
 }
 
+int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId, int linkIndex, const double* positions, int numVertices)
+{
+	int updated = 0;
+	if (!positions || numVertices <= 0)
+		return 0;
+	for (int i = 0; i < m_data->m_swRenderInstances.size(); i++)
+	{
+		TinyRendererObjectArray** ptrptr = m_data->m_swRenderInstances.getAtIndex(i);
+		if (!ptrptr || !*ptrptr)
+			continue;
+		TinyRendererObjectArray* visuals = *ptrptr;
+		if ((visuals->m_objectUniqueId != bodyUniqueId) || (visuals->m_linkIndex != linkIndex))
+			continue;
+		for (int q = 0; q < visuals->m_renderObjects.size(); q++)
+		{
+			TinyRenderObjectData* renderObj = visuals->m_renderObjects[q];
+			TinyRender::Model* model = renderObj->m_model;
+			if (!model || model->nverts() != numVertices)
+				continue;
+			// The first write copies a mesh shared with another body, so each body deforms alone.
+			TinyRender::Vec3f* verts = model->readWriteVertices();
+			if (!verts)
+				continue;
+			for (int v = 0; v < numVertices; v++)
+			{
+				verts[v].x = (float)positions[v * 3 + 0];
+				verts[v].y = (float)positions[v * 3 + 1];
+				verts[v].z = (float)positions[v * 3 + 2];
+			}
+			model->recomputeNormals();
+			renderObj->computeLocalAABB();
+#ifdef SWARM_RAYCAST
+			if (m_data->m_raycast)
+				m_data->m_raycast->meshChanged(renderObj);
+#endif
+			updated++;
+		}
+	}
+	return updated;
+}
+
 void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 {
 	TinyRendererObjectArray** ptrptr = m_data->m_swRenderInstances[shapeUniqueId];

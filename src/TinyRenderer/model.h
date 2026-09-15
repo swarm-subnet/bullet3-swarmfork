@@ -74,6 +74,8 @@ public:
 	Vec3f vert(int iface, int nthvert);
 	Vec3f* readWriteVertices();
 	Vec3f* readWriteNormals();
+	// Rebuilds every vertex normal from the current positions, area weighted, after the positions were rewritten.
+	void recomputeNormals();
 	// Identity of the shared vertex block; two Models with the same key draw the same triangles.
 	const void* meshKey() const { return m_mesh; }
 	// Content hash of the mesh arrays, the same across processes for the same vertices and faces.

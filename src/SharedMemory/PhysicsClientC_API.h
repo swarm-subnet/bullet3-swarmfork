@@ -552,6 +552,8 @@ extern "C"
 	B3_SHARED_API void b3GetTetraMeshData(b3PhysicsClientHandle physClient, struct b3TetraMeshData* meshData);
 
 	B3_SHARED_API b3SharedMemoryCommandHandle b3ResetMeshDataCommandInit(b3PhysicsClientHandle physClient, int bodyUniqueId, int num_vertices, const double* vertices);
+	///which link's visual mesh the upload rewrites; -1, the base, unless set
+	B3_SHARED_API void b3ResetMeshDataCommandSetLinkIndex(b3SharedMemoryCommandHandle commandHandle, int linkIndex);
 
 	B3_SHARED_API b3SharedMemoryCommandHandle b3CreateVisualShapeCommandInit(b3PhysicsClientHandle physClient);
 	B3_SHARED_API int b3CreateVisualShapeAddSphere(b3SharedMemoryCommandHandle commandHandle, double radius);

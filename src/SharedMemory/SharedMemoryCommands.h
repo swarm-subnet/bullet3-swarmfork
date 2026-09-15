@@ -1189,6 +1189,7 @@ struct b3ResetMeshDataArgs
 	int m_bodyUniqueId;
 	int m_numVertices;
 	int m_flags;
+	int m_linkIndex;
 };
 
 struct b3SendMeshDataArgs

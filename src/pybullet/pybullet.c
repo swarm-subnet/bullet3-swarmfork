@@ -9259,9 +9259,10 @@ static PyObject* pybullet_resetMeshData(PyObject* self, PyObject* args, PyObject
 	PyObject* verticesObj = 0;
 	int physicsClientId = 0;
 	int numVertices = 0;
+	int linkIndex = -1;
 
-	static char* kwlist[] = { "bodyUniqueId",  "vertices", "physicsClientId", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "iO|i", kwlist, &bodyUniqueId, &verticesObj, &physicsClientId))
+	static char* kwlist[] = { "bodyUniqueId",  "vertices", "linkIndex", "physicsClientId", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "iO|ii", kwlist, &bodyUniqueId, &verticesObj, &linkIndex, &physicsClientId))
 	{
 		return NULL;
 	}
@@ -9279,7 +9280,8 @@ static PyObject* pybullet_resetMeshData(PyObject* self, PyObject* args, PyObject
 		numVertices = extractVertices(verticesObj, vertices, B3_MAX_NUM_VERTICES);
 
 		command = b3ResetMeshDataCommandInit(sm, bodyUniqueId, numVertices, vertices);
-	
+		b3ResetMeshDataCommandSetLinkIndex(command, linkIndex);
+
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
 		statusType = b3GetStatusType(statusHandle);
 		
@@ -12881,7 +12883,7 @@ static PyMethodDef SpamMethods[] = {
 	 "Get mesh data. Returns tetra from the mesh."},
 
 	{"resetMeshData", (PyCFunction)pybullet_resetMeshData, METH_VARARGS | METH_KEYWORDS,
-	 "Reset mesh data. Only implemented for deformable bodies."},
+	 "Reset mesh data: a deformable body takes new simulation vertices, any other body takes new positions for the visual mesh of linkIndex, keeping its faces, uvs and texture."},
 
 	{"createVisualShape", (PyCFunction)pybullet_createVisualShape, METH_VARARGS | METH_KEYWORDS,
 	 "Create a visual shape. Returns a non-negative (int) unique id, if successfull, negative otherwise."},
