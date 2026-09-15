@@ -115,6 +115,7 @@ Check all that apply. If the change doesn't require doc updates, check
 
 - [ ] README.md updated
 - [ ] `docs/` updated
+- [ ] `docs/swarm_api.md` has a row for every flag, argument or switch this change adds
 - [ ] Not applicable (explain why):
 
 ### Additional Information
