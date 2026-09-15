@@ -108,6 +108,13 @@ struct TinyRendererVisualShapeConverterInternalData
 	float m_lightSpecularCoeff;
 	bool m_hasLightSpecularCoeff;
 	float m_shadowLightCoeff;
+	// ER_SWARM_DAYLIGHT arguments: the sky photo is per request, the rest keep their last value.
+	float m_exposure;
+	float m_hazeDistance;
+	bool m_hasSkyPhoto;
+	int m_skyTextureId;
+	float m_skyYaw;
+	float m_shadowCoreRadius;
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
@@ -149,6 +156,12 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_lightSpecularCoeff(0.05),
 		m_hasLightSpecularCoeff(false),
 		m_shadowLightCoeff(0.8f),
+		m_exposure(1.0f),
+		m_hazeDistance(0.0f),
+		m_hasSkyPhoto(false),
+		m_skyTextureId(-1),
+		m_skyYaw(0.0f),
+		m_shadowCoreRadius(0.0f),
 		m_hasShadow(false),
 		m_flags(0),
 		m_batchCameraCount(1),
@@ -271,6 +284,28 @@ void TinyRendererVisualShapeConverter::setLightSpecularCoeff(float specularCoeff
 void TinyRendererVisualShapeConverter::setShadowLightCoeff(float shadowLightCoeff)
 {
 	m_data->m_shadowLightCoeff = shadowLightCoeff;
+}
+
+void TinyRendererVisualShapeConverter::setExposure(float exposure)
+{
+	m_data->m_exposure = exposure > 0.0f ? exposure : 1.0f;
+}
+
+void TinyRendererVisualShapeConverter::setHazeDistance(float hazeDistance)
+{
+	m_data->m_hazeDistance = hazeDistance > 0.0f ? hazeDistance : 0.0f;
+}
+
+void TinyRendererVisualShapeConverter::setSkyPhoto(bool enabled, int textureUniqueId, float yawDegrees)
+{
+	m_data->m_hasSkyPhoto = enabled && textureUniqueId >= 0 && textureUniqueId < m_data->m_textures.size();
+	m_data->m_skyTextureId = m_data->m_hasSkyPhoto ? textureUniqueId : -1;
+	m_data->m_skyYaw = yawDegrees;
+}
+
+void TinyRendererVisualShapeConverter::setShadowCoreRadius(float radius)
+{
+	m_data->m_shadowCoreRadius = radius > 0.0f ? radius : 0.0f;
 }
 
 // materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
@@ -1393,7 +1428,7 @@ static unsigned char skyByte(float v)
 // Colour buffer only: each pixel's view ray is lifted to world space and either read from the
 // sun sky map, or its component along the up axis blends horizon (level or below) into zenith
 // (straight up).
-void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky)
+void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky, bool daylight)
 {
 	const int width = m_data->m_swWidth;
 	const int height = m_data->m_swHeight;
@@ -1413,9 +1448,13 @@ void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const f
 			for (int x = 0; x < width; ++x, pixel += bytespp)
 			{
 				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-				sunSky->lookup(viewMat[0] * dx + viewMat[1] * dy - viewMat[2],
-							   viewMat[4] * dx + viewMat[5] * dy - viewMat[6],
-							   viewMat[8] * dx + viewMat[9] * dy - viewMat[10], pixel);
+				const float wx = viewMat[0] * dx + viewMat[1] * dy - viewMat[2];
+				const float wy = viewMat[4] * dx + viewMat[5] * dy - viewMat[6];
+				const float wz = viewMat[8] * dx + viewMat[9] * dy - viewMat[10];
+				if (daylight)
+					sunSky->lookupDisplay(wx, wy, wz, pixel);
+				else
+					sunSky->lookup(wx, wy, wz, pixel);
 			}
 		}
 		return;
@@ -1781,12 +1820,16 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	}
 
 	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
+	// The daylight model lives on the ray-cast colour path; elsewhere the flag has no effect.
+	const bool daylight = (m_data->m_flags & ER_SWARM_DAYLIGHT) != 0 && (m_data->m_flags & ER_SWARM_RAYCAST) != 0 && !depthOnly;
 
 	// The sun sky is computed from the light once and kept while the light stays; it also tints
 	// the ambient term. Without it the tint is exactly 1, so the shading bytes are unchanged.
+	// Under daylight the linear sky is built beside it, from the sun or from the sky photo.
 	const SwarmSky* sunSky = 0;
 	btVector3 ambientColor(1.0, 1.0, 1.0);
-	if ((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 && !depthOnly)
+	const bool hasPhoto = daylight && m_data->m_hasSkyPhoto && m_data->m_skyTextureId >= 0 && m_data->m_skyTextureId < m_data->m_textures.size();
+	if (((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 || hasPhoto) && !depthOnly)
 	{
 		float sunDir[3], sunColor[3];
 		for (int i = 0; i < 3; i++)
@@ -1794,9 +1837,25 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			sunDir[i] = (float)lightDirWorld[i];
 			sunColor[i] = (float)lightColor[i];
 		}
-		m_data->m_sunSky.prepare(sunDir, sunColor, m_data->m_hasSkyClouds, (unsigned)m_data->m_skyCloudSeed, m_data->m_upAxis);
+		if (daylight)
+		{
+			SwarmSky::Photo photo;
+			if (hasPhoto)
+			{
+				const MyTexture2& tex = m_data->m_textures[m_data->m_skyTextureId];
+				photo.m_rgb = tex.textureData1;
+				photo.m_width = tex.m_width;
+				photo.m_height = tex.m_height;
+				photo.m_yaw = m_data->m_skyYaw;
+			}
+			m_data->m_sunSky.prepareDaylight(sunDir, sunColor, m_data->m_hasSkyClouds, (unsigned)m_data->m_skyCloudSeed, m_data->m_upAxis,
+											 hasPhoto ? &photo : 0, m_data->m_exposure);
+		}
+		else
+			m_data->m_sunSky.prepare(sunDir, sunColor, m_data->m_hasSkyClouds, (unsigned)m_data->m_skyCloudSeed, m_data->m_upAxis);
 		sunSky = &m_data->m_sunSky;
-		ambientColor.setValue(sunSky->ambientColor()[0], sunSky->ambientColor()[1], sunSky->ambientColor()[2]);
+		if (!daylight)
+			ambientColor.setValue(sunSky->ambientColor()[0], sunSky->ambientColor()[1], sunSky->ambientColor()[2]);
 	}
 
 	TinyRenderGlint glint;
@@ -1820,7 +1879,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	}
 	if ((sunSky || m_data->m_hasSky) && !depthOnly)
 	{
-		paintSky(viewMat, projMat, sunSky);
+		paintSky(viewMat, projMat, sunSky, daylight);
 	}
 
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
@@ -1851,6 +1910,11 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
 		shading.m_linearLight = (m_data->m_flags & ER_SWARM_LINEAR_LIGHT) != 0;
+		shading.m_daylight = daylight;
+		shading.m_sky = (daylight && sunSky && sunSky->daylightBuilt()) ? sunSky : 0;
+		shading.m_exposure = m_data->m_exposure;
+		shading.m_hazeDistance = m_data->m_hazeDistance;
+		shading.m_shadowCoreRadius = m_data->m_shadowCoreRadius;
 		shading.m_glint = glint;
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;
@@ -2204,6 +2268,8 @@ void TinyRendererVisualShapeConverter::resetAll()
 		}
 	}
 
+	// A photo sky reads the texture bytes freed below; a later texture may land at the same address.
+	m_data->m_sunSky.forgetPhoto();
 	for (int i = 0; i < m_data->m_textures.size(); i++)
 	{
 		if (!m_data->m_textures[i].m_isCached)

@@ -4404,6 +4404,18 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 						m_data->m_pluginManager.getRenderInterface()->setShadowLightCoeff(clientCmd.m_requestPixelDataArguments.m_shadowLightCoeff);
 					}
 
+					{
+						// The sky photo is per request, like the sky colours; the other daylight arguments stick.
+						const int fields = (clientCmd.m_updateFlags & REQUEST_PIXEL_ARGS_SET_DAYLIGHT) != 0 ? clientCmd.m_requestPixelDataArguments.m_daylightFields : 0;
+						if ((fields & REQUEST_PIXEL_DAYLIGHT_EXPOSURE) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setExposure(clientCmd.m_requestPixelDataArguments.m_exposure);
+						if ((fields & REQUEST_PIXEL_DAYLIGHT_HAZE) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setHazeDistance(clientCmd.m_requestPixelDataArguments.m_hazeDistance);
+						if ((fields & REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setShadowCoreRadius(clientCmd.m_requestPixelDataArguments.m_shadowCoreRadius);
+						m_data->m_pluginManager.getRenderInterface()->setSkyPhoto((fields & REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO) != 0, clientCmd.m_requestPixelDataArguments.m_skyTextureId, clientCmd.m_requestPixelDataArguments.m_skyYaw);
+					}
+
 					for (int i = 0; !m_data->m_renderTransformsSynced && i < m_data->m_dynamicsWorld->getNumCollisionObjects(); i++)
 					{
 						const btCollisionObject* colObj = m_data->m_dynamicsWorld->getCollisionObjectArray()[i];

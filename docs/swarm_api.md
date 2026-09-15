@@ -24,7 +24,7 @@ The distribution is `swarm-bullet3` and the module is still `import pybullet`. A
 - Validators are CPU only. Nothing here needs a GPU.
 - The bytes of an image, and so a score, must be the same on every validator: one binary, one code path, no runtime CPU dispatch, no fast-math, `-ffp-contract=off`, hardware reciprocals in Embree replaced by IEEE division, tree builds on one thread, pixels dealt to threads in fixed 16 x 16 tiles (tile k goes to thread k mod T), no maths-library transcendental in a per-pixel path (the sky and the gamma table use polynomials and literal tables).
 - Every switch is off by default and every existing challenge family renders the same bytes as before. The proof is `validator/scripts/verify_render_identity.py` in the swarm repository (7 scenes, orbit and episode hashes) run on the wheel before and after a change.
-- A new render flag takes the next free power of two; the next free value is 8192.
+- A new render flag takes the next free power of two; the next free value is 16384.
 
 ## 1. Render flags
 
@@ -45,20 +45,25 @@ Passed in `flags=` of `getCameraImage` and `getDepthImagesBatch`, combined with 
 | `ER_SPECULAR_GLINT` | 1024 | both, colour | A hit blends towards the sky colour of its mirrored view direction, weighted by the object's specular colour times a glass Fresnel curve (`0.04 + 0.96 (1 - cos)^5`); `createVisualShape` sends specular white when none is given, so matte pieces need `specularColor=[0, 0, 0]` | under 2 ms | [#18](https://github.com/swarm-subnet/bullet3-swarmfork/pull/18) |
 | `ER_SWARM_SKY_SUN` | 2048 | both, colour | A daylight sky (Preetham model, turbidity 2.5) computed from `lightDirection` and `lightColor` into six 256 x 256 cube faces, rebuilt only when the light, the cloud seed or the up axis change; a 1 degree sun disc; the sky's average tints the ambient term; with the flag on, the computed sky is painted whether or not `skyHorizonColor` and `skyZenithColor` are given; `skyCloudSeed` adds clouds | about 2 ms per frame (one cube lookup per empty pixel); map build 56 to 61 ms clear, 79 to 86 ms with clouds | [#22](https://github.com/swarm-subnet/bullet3-swarmfork/pull/22) |
 | `ER_SWARM_LINEAR_LIGHT` | 4096 | ray cast, colour | The texel-times-colour byte is decoded to linear light through a 256-entry table, lit, blended and glinted there, and encoded back to sRGB on the write, so half light is byte 188 rather than 127 | +0.2 to 0.35 ms per frame | [#24](https://github.com/swarm-subnet/bullet3-swarmfork/pull/24) |
+| `ER_SWARM_DAYLIGHT` | 8192 | ray cast, colour, needs `ER_SWARM_RAYCAST` | The daylight model: a hit is lit by the sky in the direction it faces (a nine-coefficient table built with the sky) plus the sun, so `lightAmbientCoeff` scales the sky and `lightDiffuseCoeff` may be several times it; the glint reflects the sky cube itself through a coated-glass curve (flat 5.5 % until the view grazes, a full mirror below cos 0.2); the shadow map is read from nine cells (a soft edge one cell wide) and, inside `shadowCoreRadius`, from a second 4096-cell grid about the origin; filtered textures take up to four reads along the long side of the pixel footprint; hits fade to the horizon colour with `hazeDistance`; a double-sided cut-out face seen from behind keeps its front light plus 35 % of the sun through it; the linear result times `exposure` goes through the AgX film curve (public polynomial form) to the byte. The sky is `ER_SWARM_SKY_SUN`'s Preetham sky built at 512 px per face with a bright sun disc, or the photograph of `skyTextureId`, which needs no sky flag; with neither the light is flat white | solar-park slice, 256 px, 4 threads: 18 ms to 25 ms; 960 x 540: about +40 % | [#27](https://github.com/swarm-subnet/bullet3-swarmfork/pull/27) |
 
-Dependencies between flags: `ER_SWARM_SHADOW_MAP` acts only with `shadow=1` and `ER_SWARM_RAYCAST`; `ER_SWARM_MOVER_SHADOW` only with `ER_SWARM_SHADOW_MAP`; `ER_EDGE_ANTIALIAS`, `ER_ALPHA_CUTOUT` and `ER_SWARM_LINEAR_LIGHT` only with `ER_SWARM_RAYCAST`; `ER_TEXTURE_FILTER`, `ER_SPECULAR_GLINT` and `ER_SWARM_SKY_SUN` work on both colour paths. `ER_DEPTH_ONLY` switches all colour work off whatever else is set.
+Dependencies between flags: `ER_SWARM_DAYLIGHT` acts only with `ER_SWARM_RAYCAST` and takes its sky from `ER_SWARM_SKY_SUN` or from `skyTextureId`; `ER_SWARM_SHADOW_MAP` acts only with `shadow=1` and `ER_SWARM_RAYCAST`; `ER_SWARM_MOVER_SHADOW` only with `ER_SWARM_SHADOW_MAP`; `ER_EDGE_ANTIALIAS`, `ER_ALPHA_CUTOUT` and `ER_SWARM_LINEAR_LIGHT` only with `ER_SWARM_RAYCAST`; `ER_TEXTURE_FILTER`, `ER_SPECULAR_GLINT` and `ER_SWARM_SKY_SUN` work on both colour paths. `ER_DEPTH_ONLY` switches all colour work off whatever else is set.
 
 The full picture on the ray-cast path, as measured on the solar-park slice at 256 px and 2 threads: `ER_SWARM_RAYCAST | ER_SWARM_SHADOW_MAP | ER_SWARM_MOVER_SHADOW | ER_EDGE_ANTIALIAS | ER_ALPHA_CUTOUT | ER_TEXTURE_FILTER | ER_SPECULAR_GLINT | ER_SWARM_SKY_SUN | ER_SWARM_LINEAR_LIGHT` with `shadow=1` is about 29 to 34 ms per frame, against 100 to 112 ms for the plain rasterised frame.
 
 ## 2. Camera call arguments
 
-`getCameraImage(width, height, viewMatrix, projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, flags, projectiveTextureView, projectiveTextureProj, physicsClientId, skyHorizonColor, skyZenithColor, skyCloudSeed, shadowLightCoeff)`. The last four are the fork's. They sit at the end so positional callers are unaffected.
+`getCameraImage(width, height, viewMatrix, projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, flags, projectiveTextureView, projectiveTextureProj, physicsClientId, skyHorizonColor, skyZenithColor, skyCloudSeed, shadowLightCoeff, exposure, hazeDistance, skyTextureId, skyYaw, shadowCoreRadius)`. The last nine are the fork's. They sit at the end so positional callers are unaffected.
 
 | Argument | Type, default | What it does | Sticky? | Added |
 |---|---|---|---|---|
 | `skyHorizonColor`, `skyZenithColor` | RGB in 0..1, none | Where nothing is drawn, a sky blended per pixel by how far above the horizon the view ray points; one of the two alone is a flat sky; neither means the white clear as upstream; depth and mask are never touched | per call | [#10](https://github.com/swarm-subnet/bullet3-swarmfork/pull/10) |
 | `skyCloudSeed` | int, none | Seeded value-noise cloud layer in the `ER_SWARM_SKY_SUN` sky, lit in the sun colour, faded at the horizon; the same seed gives the same clouds | per call | [#22](https://github.com/swarm-subnet/bullet3-swarmfork/pull/22) |
 | `shadowLightCoeff` | float, 0.8 | Share of the direct light a shadowed hit keeps on the ray-cast path, from the shadow ray, the shadow map and the mover tree alike; 0.0 is a full shadow lit by the ambient term alone; the rasteriser keeps its own fixed 0.8 | sticky per client, like `lightAmbientCoeff` | [#23](https://github.com/swarm-subnet/bullet3-swarmfork/pull/23) |
+| `exposure` | float, 1.0 | `ER_SWARM_DAYLIGHT`: scale on the linear light before the film curve; the sky's mean radiance is 1, so 0.45 puts a clear sky near display 0.65 | sticky | [#27](https://github.com/swarm-subnet/bullet3-swarmfork/pull/27) |
+| `hazeDistance` | float, 0 | `ER_SWARM_DAYLIGHT`: metres at which a hit is 63 % the sky's colour just above the horizon in its direction; 0 is no haze | sticky | [#27](https://github.com/swarm-subnet/bullet3-swarmfork/pull/27) |
+| `skyTextureId`, `skyYaw` | int from `loadTexture`, float degrees | `ER_SWARM_DAYLIGHT`: an equirectangular RGB photograph (top row the zenith, column 0 the +x heading) becomes the sky, turned by `skyYaw` about the up axis; scaled to a mean luminance of 1 under a sun 30 degrees up or higher, down to 0.2 with the sun at the horizon; texels clipped to white within 5 degrees of the light direction counted eight times brighter as the sun; absent means the Preetham sky | per call | [#27](https://github.com/swarm-subnet/bullet3-swarmfork/pull/27) |
+| `shadowCoreRadius` | float, 0 | `ER_SWARM_DAYLIGHT` with `ER_SWARM_SHADOW_MAP`: half side of a second, finer shadow grid over the square about the world origin, read first for the points it covers; 0 keeps the one grid | sticky | [#27](https://github.com/swarm-subnet/bullet3-swarmfork/pull/27) |
 | `shadow` | int, 0 | Upstream argument, different meaning per path: the rasteriser's shadow pass aims at the world origin from `lightDistance` (default 2 m) and does nothing useful on a map; on the ray-cast path `shadow=1` gives real shadows, from a ray or, with the flag, the map | sticky | upstream |
 | `lightDirection`, `lightColor`, `lightAmbientCoeff`, `lightDiffuseCoeff`, `lightSpecularCoeff` | upstream | The light model both paths share; the swarm daylight module fills them from the seed | sticky | upstream |
 
@@ -169,6 +174,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `skySunTest.py` | `ER_SWARM_SKY_SUN`, `skyCloudSeed`, both paths paint the same sky |
 | `shadowLightCoeffTest.py` | `shadowLightCoeff` |
 | `linearLightTest.py` | `ER_SWARM_LINEAR_LIGHT` |
+| `daylightTest.py` | `ER_SWARM_DAYLIGHT`: flag off unchanged, sun to sky ratio, sky light by direction, exposure, photo sky and yaw, haze, soft shadow, leaf light, thread counts |
 
 The cross-repository proof that existing families are untouched is the swarm repository's `validator/scripts/verify_render_identity.py`, run on the wheel before and after a change, and its `validator/tests/test_render_backend.py` and `validator/tests/test_sky_sun.py`, which pin ray-cast and sun-sky frames to committed hashes.
 
@@ -190,7 +196,7 @@ The rest of PyBullet is upstream and documented in the PyBullet Quickstart Guide
 
 ## 9. Adding a switch
 
-1. Take the next free bit of the enum it belongs to (render flags: 8192) and export the constant in `pybullet.c`.
+1. Take the next free bit of the enum it belongs to (render flags: 16384) and export the constant in `pybullet.c`.
 2. Off by default, and the flag-off path shares no new arithmetic with the flag-on path; run the identity script on the wheel before and after.
 3. A test under `examples/pybullet/unittests/` that proves the effect, that depth and mask are untouched where they should be, and that 1, 2 and 4 threads give the same bytes.
 4. A row in this file, with the value from the source and the cost you measured; the pull request template asks for it.

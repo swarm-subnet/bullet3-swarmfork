@@ -285,6 +285,21 @@ struct RequestPixelDataArgs
 	int m_skyCloudSeed;
 	// share of the direct light a shadowed surface keeps on the ray-cast path
 	float m_shadowLightCoeff;
+	// ER_SWARM_DAYLIGHT arguments, each present when its bit of m_daylightFields is set
+	int m_daylightFields;
+	float m_exposure;
+	float m_hazeDistance;
+	int m_skyTextureId;
+	float m_skyYaw;
+	float m_shadowCoreRadius;
+};
+
+enum EnumRequestPixelDaylightFields
+{
+	REQUEST_PIXEL_DAYLIGHT_EXPOSURE = 1,
+	REQUEST_PIXEL_DAYLIGHT_HAZE = 2,
+	REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO = 4,
+	REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE = 8,
 };
 
 enum EnumRequestPixelDataUpdateFlags
@@ -304,6 +319,7 @@ enum EnumRequestPixelDataUpdateFlags
 	REQUEST_PIXEL_ARGS_SET_SKY_COLOR = 4096,
 	REQUEST_PIXEL_ARGS_SET_SKY_CLOUDS = 8192,
 	REQUEST_PIXEL_ARGS_SET_SHADOW_LIGHT_COEFF = 16384,
+	REQUEST_PIXEL_ARGS_SET_DAYLIGHT = 32768,
 
 	//don't exceed (1<<15), because this enum is shared with EnumRenderer in SharedMemoryPublic.h
 
