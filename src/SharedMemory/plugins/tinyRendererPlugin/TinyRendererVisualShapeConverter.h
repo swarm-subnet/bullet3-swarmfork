@@ -18,6 +18,8 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 
 	virtual void updateShape(int shapeUniqueId, const btVector3* vertices, int numVertices, const btVector3* normals, int numNormals);
 
+	virtual int updateVisualShapeVertices(int bodyUniqueId, int linkIndex, const double* positions, int numVertices);
+
 	virtual void removeVisualShape(int shapeUniqueId);
 
 	virtual int getNumVisualShapes(int bodyUniqueId);

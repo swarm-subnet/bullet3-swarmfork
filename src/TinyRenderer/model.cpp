@@ -460,6 +460,39 @@ Vec3f* Model::readWriteVertices()
 	return &m_mesh->verts_[0];
 }
 
+void Model::recomputeNormals()
+{
+	detachMesh();
+	if (m_mesh->norms_.empty())
+		return;
+	for (size_t i = 0; i < m_mesh->norms_.size(); i++)
+		m_mesh->norms_[i] = Vec3f(0.f, 0.f, 0.f);
+	const int numVerts = (int)m_mesh->verts_.size();
+	const int numNorms = (int)m_mesh->norms_.size();
+	for (size_t f = 0; f < m_mesh->faces_.size(); f++)
+	{
+		const std::vector<Vec3i>& face = m_mesh->faces_[f];
+		if (face.size() < 3)
+			continue;
+		if (face[0][0] < 0 || face[0][0] >= numVerts || face[1][0] < 0 || face[1][0] >= numVerts || face[2][0] < 0 || face[2][0] >= numVerts)
+			continue;
+		// The cross product carries twice the triangle's area, so a big face pulls the corner normal harder.
+		const Vec3f weighted = cross(m_mesh->verts_[face[1][0]] - m_mesh->verts_[face[0][0]], m_mesh->verts_[face[2][0]] - m_mesh->verts_[face[0][0]]);
+		for (size_t k = 0; k < face.size(); k++)
+		{
+			const int ni = face[k][2];
+			if (ni >= 0 && ni < numNorms)
+				m_mesh->norms_[ni] = m_mesh->norms_[ni] + weighted;
+		}
+	}
+	for (size_t i = 0; i < m_mesh->norms_.size(); i++)
+	{
+		const float length = m_mesh->norms_[i].norm();
+		if (length > 0.f)
+			m_mesh->norms_[i] = m_mesh->norms_[i] * (1.f / length);
+	}
+}
+
 Vec3f* Model::readWriteNormals()
 {
 	detachMesh();
