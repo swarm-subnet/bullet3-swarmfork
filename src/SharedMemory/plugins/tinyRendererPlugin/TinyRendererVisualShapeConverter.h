@@ -37,7 +37,7 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void resetCamera(float camDist, float yaw, float pitch, float camPosX, float camPosY, float camPosZ);
 
 	virtual void clearBuffers(struct TGAColor& clearColor);
-	void paintSky(const float viewMat[16], const float projMat[16], const class SwarmSky* sunSky);
+	void paintSky(const float viewMat[16], const float projMat[16], const class SwarmSky* sunSky, bool daylight);
 
 	virtual void resetAll();
 
@@ -52,6 +52,10 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void setLightDiffuseCoeff(float diffuseCoeff);
 	virtual void setLightSpecularCoeff(float specularCoeff);
 	virtual void setShadowLightCoeff(float shadowLightCoeff);
+	virtual void setExposure(float exposure);
+	virtual void setHazeDistance(float hazeDistance);
+	virtual void setSkyPhoto(bool enabled, int textureUniqueId, float yawDegrees);
+	virtual void setShadowCoreRadius(float radius);
 	virtual void setShadow(bool hasShadow);
 	virtual void setFlags(int flags);
 

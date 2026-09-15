@@ -4662,6 +4662,46 @@ B3_SHARED_API void b3RequestCameraImageSetShadowLightCoeff(b3SharedMemoryCommand
 	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_SHADOW_LIGHT_COEFF;
 }
 
+// The daylight arguments share one update flag; each setter marks its own field.
+static void b3RequestCameraImageMarkDaylight(struct SharedMemoryCommand* command, int field)
+{
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_REQUEST_CAMERA_IMAGE_DATA);
+	if ((command->m_updateFlags & REQUEST_PIXEL_ARGS_SET_DAYLIGHT) == 0)
+		command->m_requestPixelDataArguments.m_daylightFields = 0;
+	command->m_requestPixelDataArguments.m_daylightFields |= field;
+	command->m_updateFlags |= REQUEST_PIXEL_ARGS_SET_DAYLIGHT;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetExposure(b3SharedMemoryCommandHandle commandHandle, float exposure)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_DAYLIGHT_EXPOSURE);
+	command->m_requestPixelDataArguments.m_exposure = exposure;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetHazeDistance(b3SharedMemoryCommandHandle commandHandle, float hazeDistance)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_DAYLIGHT_HAZE);
+	command->m_requestPixelDataArguments.m_hazeDistance = hazeDistance;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSkyPhoto(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, float yawDegrees)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO);
+	command->m_requestPixelDataArguments.m_skyTextureId = textureUniqueId;
+	command->m_requestPixelDataArguments.m_skyYaw = yawDegrees;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetShadowCoreRadius(b3SharedMemoryCommandHandle commandHandle, float radius)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE);
+	command->m_requestPixelDataArguments.m_shadowCoreRadius = radius;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;

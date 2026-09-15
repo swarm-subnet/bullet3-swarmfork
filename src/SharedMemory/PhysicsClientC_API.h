@@ -273,6 +273,10 @@ extern "C"
 	B3_SHARED_API void b3RequestCameraImageSetLightDiffuseCoeff(b3SharedMemoryCommandHandle commandHandle, float lightDiffuseCoeff);
 	B3_SHARED_API void b3RequestCameraImageSetLightSpecularCoeff(b3SharedMemoryCommandHandle commandHandle, float lightSpecularCoeff);
 	B3_SHARED_API void b3RequestCameraImageSetShadowLightCoeff(b3SharedMemoryCommandHandle commandHandle, float shadowLightCoeff);
+	B3_SHARED_API void b3RequestCameraImageSetExposure(b3SharedMemoryCommandHandle commandHandle, float exposure);
+	B3_SHARED_API void b3RequestCameraImageSetHazeDistance(b3SharedMemoryCommandHandle commandHandle, float hazeDistance);
+	B3_SHARED_API void b3RequestCameraImageSetSkyPhoto(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, float yawDegrees);
+	B3_SHARED_API void b3RequestCameraImageSetShadowCoreRadius(b3SharedMemoryCommandHandle commandHandle, float radius);
 	B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow);
 	B3_SHARED_API void b3RequestCameraImageSelectRenderer(b3SharedMemoryCommandHandle commandHandle, int renderer);
 	B3_SHARED_API void b3RequestCameraImageSetFlags(b3SharedMemoryCommandHandle commandHandle, int flags);
