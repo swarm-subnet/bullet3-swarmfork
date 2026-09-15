@@ -9,6 +9,9 @@ The fork is maintained for Swarm benchmark and validator workloads that depend h
 - per-triangle far-plane culling for depth-only rendering
 - OpenMP acceleration for the TinyRenderer depth-only face loop
 - simulator loading improvements in the shared-memory path
+- a ray-cast render backend on Embree beside TinyRenderer (`ER_SWARM_RAYCAST`), with shadows, sky, anti-aliasing, cut-out textures and disk caches behind their own flags
+
+Every fork-only flag, camera argument, environment variable and build switch, with its value, what it does and what it costs, is listed in [docs/swarm_api.md](docs/swarm_api.md).
 
 The Python import surface remains `import pybullet`, but the published distribution name for this fork is `swarm-bullet3`.
 
