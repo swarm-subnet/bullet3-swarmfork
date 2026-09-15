@@ -40,6 +40,10 @@ const float kLeafTransmit = 0.35f;
 const float kGlassFlat = 0.055f;
 const float kGlassFlatUntilCos = 0.35f;
 const float kGlassMirrorFromCos = 0.20f;
+// A thin pane: plain glass Fresnel at each of its two faces, how far behind a pane the next ray starts, how many panes a ray passes.
+const float kPaneF0 = 0.04f;
+const float kPaneBias = 2e-3f;
+const int kPaneDepth = 3;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
 
@@ -105,6 +109,8 @@ struct StaticMember
 	bool m_doubleSided;
 	bool m_visible;
 	bool m_retired;
+	// VISUAL_SHAPE_GLASS: under daylight a hit reads the sky by Fresnel and the surface behind through the tint.
+	bool m_glass;
 	// The texture carries an alpha plane, so hits may be cut out.
 	bool m_hasAlpha;
 	int m_segmentation;
@@ -159,6 +165,7 @@ struct Instance
 	bool m_enabled;
 	bool m_doubleSided;
 	bool m_hasAlpha;
+	bool m_glass;
 	// Sign of the instance determinant: a mirroring scale flips which side of a face is the front.
 	float m_facingSign;
 	int m_segmentation;
@@ -955,7 +962,7 @@ struct SwarmRaycast::Data
 
 	// worldTree asks for a fresh instance to draw its world tree from disk; the instance stays on
 	// that tree while the body keeps its pose and mesh, and carries on as a plain mover otherwise.
-	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, int segmentation, bool worldTree)
+	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, bool glass, int segmentation, bool worldTree)
 	{
 		TinyRender::Model* model = obj->m_model;
 		Instance* inst = state.m_instance;
@@ -1027,6 +1034,7 @@ struct SwarmRaycast::Data
 		}
 		inst->m_doubleSided = doubleSided;
 		inst->m_hasAlpha = hasAlpha;
+		inst->m_glass = glass;
 		inst->m_segmentation = segmentation;
 		if (changed)
 		{
@@ -1143,6 +1151,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	const bool visible = model->getColorRGBA()[3] != 0.0f;
 	const bool doubleSided = renderObj->m_doubleSided;
 	const bool hasAlpha = model->hasAlpha();
+	const bool glass = renderObj->m_glass;
 	const int segmentation = renderObj->m_objectIndex + ((renderObj->m_linkIndex + 1) << 24);
 
 	// A body flagged for the disk cache keeps its own world tree instead of joining the static tree.
@@ -1160,6 +1169,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 			member->m_visible = visible;
 			member->m_doubleSided = doubleSided;
 			member->m_hasAlpha = hasAlpha;
+			member->m_glass = glass;
 			member->m_segmentation = segmentation;
 			return;
 		}
@@ -1173,6 +1183,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		member->m_visible = visible;
 		member->m_doubleSided = doubleSided;
 		member->m_hasAlpha = hasAlpha;
+		member->m_glass = glass;
 		member->m_segmentation = segmentation;
 		state.m_member = member;
 		state.m_instance = 0;
@@ -1180,7 +1191,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	if (!member)
 		state.m_member = 0;
-	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, segmentation, worldTree);
+	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree);
 }
 
 void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
@@ -1264,6 +1275,7 @@ struct HitSurface
 	float m_corners[3][3];
 	bool m_doubleSided;
 	bool m_hasAlpha;
+	bool m_glass;
 };
 
 // Shadow rays start this far off the surface, along the face normal, so a surface never shades itself.
@@ -1383,6 +1395,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_model = member->m_obj->m_model;
 		surface->m_doubleSided = member->m_doubleSided;
 		surface->m_hasAlpha = member->m_hasAlpha;
+		surface->m_glass = member->m_glass;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
 		surface->m_uvs = &member->m_uvs[0];
@@ -1400,6 +1413,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_model = inst->m_obj->m_model;
 		surface->m_doubleSided = inst->m_doubleSided;
 		surface->m_hasAlpha = inst->m_hasAlpha;
+		surface->m_glass = inst->m_glass;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
 		surface->m_uvs = &inst->m_tree->m_uvs[0];
@@ -1530,15 +1544,15 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
-// Daylight shading of one hit, in linear light: sky by direction plus sun, glass reflecting the sky, haze by distance, the film curve on the write.
-void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
-				   const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
-				   float distance, unsigned char out[3])
+// The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
+void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
+			   float normal[3], float base[3])
 {
 	TinyRender::Model* model = surface.m_model;
 	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
-	float normal[3] = {0.0f, 0.0f, 0.0f};
 	TinyRender::Vec2f uv(0.0f, 0.0f);
+	for (int i = 0; i < 3; i++)
+		normal[i] = 0.0f;
 	for (int j = 0; j < 3; j++)
 	{
 		const float* uvj = surface.m_uvs + (size_t)surface.m_vertexIds[j] * 2;
@@ -1559,30 +1573,34 @@ void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface
 		for (int i = 0; i < 3; i++)
 			normal[i] = -normal[i];
 
+	TGAColor color = filtered
+						 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
+						 : model->diffuse(uv);
+	const TinyRender::Vec4f& rgba = model->getColorRGBA();
+	for (int i = 0; i < 3; i++)
+		base[i] = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+}
+
+// Daylight on a surface, in linear light: the sky in the direction it faces plus the sun, and the glint of the sky on glass.
+void daylightLight(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3], const float base[3],
+				   const float viewDir[3], float shadow, float lit[3])
+{
 	const float nDotL = dot3(normal, shading.m_lightDir);
 	float direct = nDotL > 0.0f ? nDotL : 0.0f;
 	if (surface.m_doubleSided && surface.m_hasAlpha && nDotL < 0.0f)
 		direct = -nDotL * kLeafTransmit;
 
-	TGAColor color = filtered
-						 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
-						 : model->diffuse(uv);
-	const TinyRender::Vec4f& rgba = model->getColorRGBA();
 	float skyLight[3];
 	if (shading.m_sky)
 		shading.m_sky->irradiance(normal, skyLight);
 	else
 		for (int i = 0; i < 3; i++)
 			skyLight[i] = shading.m_ambientColor[i];
-	float lit[3];
 	for (int i = 0; i < 3; i++)
-	{
-		const float base = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
-		lit[i] = base * (shading.m_ambientCoeff * skyLight[i] + shadow * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
-	}
+		lit[i] = base[i] * (shading.m_ambientCoeff * skyLight[i] + shadow * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
 
 	const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
-	const float* specular = &model->getSpecularColor()[0];
+	const float* specular = &surface.m_model->getSpecularColor()[0];
 	if (shading.m_glint.m_enabled && (specular[0] > 0.0f || specular[1] > 0.0f || specular[2] > 0.0f))
 	{
 		float nDotV = dot3(normal, toCamera);
@@ -1607,7 +1625,36 @@ void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface
 			lit[i] = lit[i] + (sky[i] - lit[i]) * w;
 		}
 	}
+}
 
+// A thin pane: the sky mirrored about it, and the share that passes through by the Fresnel of its two faces (about 8 % mirror head-on, all mirror when grazing).
+float paneLight(const SwarmRaycastShading& shading, const float normal[3], const float viewDir[3], float sky[3])
+{
+	const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
+	float nDotV = dot3(normal, toCamera);
+	nDotV = nDotV < 0.0f ? 0.0f : (nDotV > 1.0f ? 1.0f : nDotV);
+	const float away = 1.0f - nDotV;
+	const float away2 = away * away;
+	const float face = kPaneF0 + (1.0f - kPaneF0) * away2 * away2 * away;
+	const float reflect = (2.0f * face) / (1.0f + face);
+	float mirror[3];
+	for (int i = 0; i < 3; i++)
+		mirror[i] = normal[i] * (2.0f * nDotV) - toCamera[i];
+	if (shading.m_sky)
+		shading.m_sky->radiance(mirror[0], mirror[1], mirror[2], sky);
+	else
+	{
+		const float up = mirror[shading.m_glint.m_upAxis] > 0.0f ? mirror[shading.m_glint.m_upAxis] : 0.0f;
+		for (int i = 0; i < 3; i++)
+			sky[i] = swarmUnitToLinear(shading.m_glint.m_skyHorizon[i] + (shading.m_glint.m_skyZenith[i] - shading.m_glint.m_skyHorizon[i]) * up);
+	}
+	return 1.0f - reflect;
+}
+
+// Linear light to the byte: haze by distance towards the horizon colour, exposure, the film curve.
+void daylightWrite(const SwarmRaycastShading& shading, const float litIn[3], const float viewDir[3], float distance, unsigned char out[3])
+{
+	float lit[3] = {litIn[0], litIn[1], litIn[2]};
 	if (shading.m_hazeDistance > 0.0f)
 	{
 		const float haze = 1.0f - (float)swarmExp(-(double)distance / (double)shading.m_hazeDistance);
@@ -1632,6 +1679,17 @@ void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface
 	SwarmAgx::apply(exposed, display);
 	for (int i = 0; i < 3; i++)
 		out[i] = SwarmAgx::toByte(display[i]);
+}
+
+// Daylight shading of one hit, in linear light: sky by direction plus sun, glass reflecting the sky, haze by distance, the film curve on the write.
+void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
+				   const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
+				   float distance, unsigned char out[3])
+{
+	float normal[3], base[3], lit[3];
+	surfaceAt(surface, hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+	daylightLight(shading, surface, normal, base, viewDir, shadow, lit);
+	daylightWrite(shading, lit, viewDir, distance, out);
 }
 
 // One camera resolved for the frame: its rays, plus the constant step to the pixel to the right and
@@ -1701,14 +1759,74 @@ const float kEdgeTolerance = 1e-3f;
 const double kCoverageEpsilon = 1.0 / 512.0;
 
 // One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
+float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], RTCOccludedArguments* shadowArgs)
+{
+	const SwarmRaycastShading* shading = job.m_shading;
+	float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+	normalize3(unitNormal);
+	float litShare = 1.0f;
+	bool blocked = false;
+	if (job.m_shadowMap && shading->m_daylight)
+	{
+		const ShadowMap* map = (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
+		litShare = shadowMapLit(*map, point, unitNormal);
+		blocked = litShare <= 0.0f;
+	}
+	else
+		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+	const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
+	if (!blocked && occluders)
+	{
+		RTCRay ray;
+		ray.org_x = point[0] + unitNormal[0] * kShadowBias;
+		ray.org_y = point[1] + unitNormal[1] * kShadowBias;
+		ray.org_z = point[2] + unitNormal[2] * kShadowBias;
+		ray.dir_x = shading->m_lightDir[0];
+		ray.dir_y = shading->m_lightDir[1];
+		ray.dir_z = shading->m_lightDir[2];
+		ray.tnear = 0.0f;
+		ray.tfar = INFINITY;
+		ray.time = 0.0f;
+		ray.mask = (unsigned)-1;
+		ray.id = 0;
+		ray.flags = 0;
+		rtcOccluded1(occluders, &ray, shadowArgs);
+		blocked = ray.tfar < 0.0f;
+	}
+	if (shading->m_daylight)
+		return blocked ? shading->m_shadowLightCoeff : shading->m_shadowLightCoeff + (1.0f - shading->m_shadowLightCoeff) * litShare;
+	return blocked ? shading->m_shadowLightCoeff : 1.0f;
+}
+
+// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above.
+void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurface& surface, const float woundNormal[3], const RTCHit& hit,
+				 float duvdx[2], float duvdy[2])
+{
+	const float weights[2] = {hit.u, hit.v};
+	const float* steps[2] = {setup.m_stepX, setup.m_stepY};
+	float* out[2] = {duvdx, duvdy};
+	const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
+	const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
+	const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+	for (int k = 0; k < 2; k++)
+	{
+		float neighbourDir[3], u, v;
+		for (int i = 0; i < 3; i++)
+			neighbourDir[i] = rawDir[i] + steps[k][i];
+		if (!planeBarycentric(setup.m_cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+			continue;
+		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
+		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+	}
+}
+
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
-	const float* stepX = setup.m_stepX;
-	const float* stepY = setup.m_stepY;
 
 	float nearPoint[3], farPoint[3];
 	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
@@ -1783,65 +1901,90 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	float shadow = 1.0f;
 	if (shading->m_shadow)
 	{
-		float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
-		normalize3(unitNormal);
 		const float point[3] = {hx, hy, hz};
-		// The map answers for the static bodies, the ray for the rest; under daylight the map answers softly, from the core grid where it covers the point.
-		float litShare = 1.0f;
-		bool blocked = false;
-		if (job.m_shadowMap && shading->m_daylight)
-		{
-			const ShadowMap* map = (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
-			litShare = shadowMapLit(*map, point, unitNormal);
-			blocked = litShare <= 0.0f;
-		}
-		else
-			blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
-		const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
-		if (!blocked && occluders)
-		{
-			RTCRay ray;
-			ray.org_x = hx + unitNormal[0] * kShadowBias;
-			ray.org_y = hy + unitNormal[1] * kShadowBias;
-			ray.org_z = hz + unitNormal[2] * kShadowBias;
-			ray.dir_x = shading->m_lightDir[0];
-			ray.dir_y = shading->m_lightDir[1];
-			ray.dir_z = shading->m_lightDir[2];
-			ray.tnear = 0.0f;
-			ray.tfar = INFINITY;
-			ray.time = 0.0f;
-			ray.mask = (unsigned)-1;
-			ray.id = 0;
-			ray.flags = 0;
-			rtcOccluded1(occluders, &ray, shadowArgs);
-			blocked = ray.tfar < 0.0f;
-		}
-		if (shading->m_daylight)
-			shadow = blocked ? shading->m_shadowLightCoeff : shading->m_shadowLightCoeff + (1.0f - shading->m_shadowLightCoeff) * litShare;
-		else
-			shadow = blocked ? shading->m_shadowLightCoeff : 1.0f;
+		shadow = shadowAt(job, point, faceNormal, shadowArgs);
 	}
 
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
 	if (filtered)
+		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
+
+	if (shading->m_daylight && surface.m_glass)
 	{
-		// TinyRenderer measures the texture footprint at the pixel to the right and the one above.
-		const float weights[2] = {rayhit.hit.u, rayhit.hit.v};
-		const float* steps[2] = {stepX, stepY};
-		float* out[2] = {duvdx, duvdy};
-		const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
-		const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
-		const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
-		for (int k = 0; k < 2; k++)
+		// A pane: the ray carries on through up to kPaneDepth panes, each adding its share of the sky and dimming what follows by its tint.
+		float weight[3] = {1.0f, 1.0f, 1.0f};
+		float lit[3] = {0.0f, 0.0f, 0.0f};
+		RTCRayHit current = rayhit;
+		HitSurface pane = surface;
+		float paneFace[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
+		for (int depth = 0; depth < kPaneDepth; depth++)
 		{
-			float neighbourDir[3], u, v;
+			float normal[3], base[3], sky[3];
+			surfaceAt(pane, current.hit, paneFace, filtered, paneDuvdx, paneDuvdy, normal, base);
+			const float through = paneLight(*shading, normal, dir, sky);
 			for (int i = 0; i < 3; i++)
-				neighbourDir[i] = rawDir[i] + steps[k][i];
-			if (!planeBarycentric(cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+			{
+				lit[i] += weight[i] * (1.0f - through) * sky[i];
+				weight[i] *= through * base[i];
+			}
+			RTCRayHit next = current;
+			next.ray.tnear = current.ray.tfar + kPaneBias;
+			next.ray.tfar = tNear + length;
+			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+			rtcIntersect1(job.m_top, &next, args);
+			int backSegmentation = -1;
+			HitSurface back;
+			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, backSegmentation, &back))
+			{
+				float behind[3];
+				if (shading->m_sky)
+					shading->m_sky->radiance(dir[0], dir[1], dir[2], behind);
+				else
+					for (int i = 0; i < 3; i++)
+						behind[i] = shading->m_ambientColor[i];
+				for (int i = 0; i < 3; i++)
+					lit[i] += weight[i] * behind[i];
+				break;
+			}
+			float backWound[3], backFace[3], f1[3], f2[3];
+			for (int i = 0; i < 3; i++)
+			{
+				f1[i] = back.m_corners[1][i] - back.m_corners[0][i];
+				f2[i] = back.m_corners[2][i] - back.m_corners[0][i];
+			}
+			cross3(f1, f2, backWound);
+			const bool backAway = dot3(backWound, dir) > 0.0f;
+			for (int i = 0; i < 3; i++)
+				backFace[i] = backAway ? -backWound[i] : backWound[i];
+			float duv2x[2] = {0.0f, 0.0f}, duv2y[2] = {0.0f, 0.0f};
+			if (filtered)
+				footprintAt(setup, rawDir, back, backWound, next.hit, duv2x, duv2y);
+			if (back.m_glass && depth + 1 < kPaneDepth)
+			{
+				current = next;
+				pane = back;
+				for (int i = 0; i < 3; i++)
+					paneFace[i] = backFace[i];
+				paneDuvdx[0] = duv2x[0];
+				paneDuvdx[1] = duv2x[1];
+				paneDuvdy[0] = duv2y[0];
+				paneDuvdy[1] = duv2y[1];
 				continue;
-			out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
-			out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+			}
+			const float t2 = next.ray.tfar;
+			const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
+			const float shadow2 = shading->m_shadow ? shadowAt(job, point2, backFace, shadowArgs) : 1.0f;
+			float backNormal[3], backBase[3], behind[3];
+			surfaceAt(back, next.hit, backFace, filtered, duv2x, duv2y, backNormal, backBase);
+			daylightLight(*shading, back, backNormal, backBase, dir, shadow2, behind);
+			for (int i = 0; i < 3; i++)
+				lit[i] += weight[i] * behind[i];
+			break;
 		}
+		daylightWrite(*shading, lit, dir, t, out.m_rgb);
+		return true;
 	}
 
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, out.m_rgb);
