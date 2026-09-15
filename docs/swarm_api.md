@@ -85,7 +85,7 @@ The `loadURDF` flag enum in full. Only the last row is the fork's; the rest is u
 | `URDF_USE_SELF_COLLISION` | 8 | upstream |
 | `URDF_USE_SELF_COLLISION_EXCLUDE_PARENT` | 16 | upstream |
 | `URDF_USE_SELF_COLLISION_EXCLUDE_ALL_PARENTS` | 32 | upstream |
-| `URDF_RESERVED` | 64 | upstream |
+| `URDF_RESERVED` | 64 | upstream, not exported to Python |
 | `URDF_USE_IMPLICIT_CYLINDER` | 128 | upstream |
 | `URDF_GLOBAL_VELOCITIES_MB` | 256 | upstream |
 | `MJCF_COLORS_FROM_FILE` | 512 | upstream |
@@ -93,7 +93,7 @@ The `loadURDF` flag enum in full. Only the last row is the fork's; the rest is u
 | `URDF_ENABLE_SLEEPING` | 2048 | upstream |
 | `URDF_INITIALIZE_SAT_FEATURES` | 4096 | upstream |
 | `URDF_USE_SELF_COLLISION_INCLUDE_PARENT` | 8192 | upstream |
-| `URDF_PARSE_SENSORS` | 16384 | upstream |
+| `URDF_PARSE_SENSORS` | 16384 | upstream, not exported to Python |
 | `URDF_USE_MATERIAL_COLORS_FROM_MTL` | 32768 | upstream |
 | `URDF_USE_MATERIAL_TRANSPARANCY_FROM_MTL` | 65536 | upstream |
 | `URDF_MAINTAIN_LINK_ORDER` | 131072 | upstream |
@@ -116,7 +116,7 @@ Two related behaviours without a flag:
 |---|---|---|---|---|---|
 | `GEOM_CONCAVE_BVH_CACHE` | 4 | `createCollisionShape`, with `GEOM_FORCE_CONCAVE_TRIMESH` | The concave mesh's bounding volume tree is read from `<SWARM_BVH_CACHE_DIR>/<key>.bvh` when present and written there after the first build; the key hashes every scaled triangle, the margin, the triangle count and the tree's byte layout, so a different scale or wheel never reads the wrong file; written through a temporary file and a rename; a damaged file is rebuilt over | mountain seed: collision shapes 2.7 s to 0.9 s, world build 5.2 s to 3.4 s; office 0.25 s to 0.09 s; six mountain and office seeds leave 334 files, 137 MB | [#7](https://github.com/swarm-subnet/bullet3-swarmfork/pull/7) |
 
-`GEOM_FORCE_CONCAVE_TRIMESH` (1) and `GEOM_CONCAVE_INTERNAL_EDGE` (2) in the same enum are upstream. Without the flag, or without the folder, every shape builds as upstream does.
+`GEOM_FORCE_CONCAVE_TRIMESH` (1), `GEOM_CONCAVE_INTERNAL_EDGE` (2) and `GEOM_INITIALIZE_SAT_FEATURES` (the `URDF_INITIALIZE_SAT_FEATURES` value, 4096) in the same enum are upstream. Without the flag, or without the folder, every shape builds as upstream does.
 
 ## 5. Environment variables the engine reads at run time
 
