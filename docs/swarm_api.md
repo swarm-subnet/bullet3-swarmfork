@@ -81,6 +81,7 @@ Passed in `flags=` of `createVisualShape` and `changeVisualShape`; `loadURDF` ha
 | `VISUAL_SHAPE_MATERIALS_FROM_MTL` | 16 | create | An OBJ with several `usemtl` groups becomes one render object per material inside the same body and link, each with its `Kd` colour and `map_Kd` texture; alpha from `d` only together with `URDF_USE_MATERIAL_TRANSPARANCY_FROM_MTL`; `changeVisualShape(shapeIndex=-1)` then overrides every group | load about 30 % slower for the file, frame time unchanged | [#6](https://github.com/swarm-subnet/bullet3-swarmfork/pull/6) |
 | `URDF_USE_MATERIALS_FROM_MTL` | 1 << 24 | `loadURDF` | Sets the flag above on every visual of the loaded URDF | same | [#6](https://github.com/swarm-subnet/bullet3-swarmfork/pull/6) |
 | `VISUAL_SHAPE_RENDER_TREE_CACHE` | 32 | create | A static body gets its own world-space ray-cast tree, saved as `<SWARM_BVH_CACHE_DIR>/<key>.rtree` (key: mesh content hash, body transform, scale) and loaded on the next process; needs the folder to be set; a body that moves later drops the tree and carries on as a mover | first ray-cast frame on the solar park 489 ms unflagged, 813 ms cold write, 222 ms warm load; 80 MB of files for its seven pieces | [#19](https://github.com/swarm-subnet/bullet3-swarmfork/pull/19) |
+| `VISUAL_SHAPE_GLASS` | 64 | create, change | A thin pane on the ray-cast path under `ER_SWARM_DAYLIGHT`: the pixel is the sky mirrored in the pane by the Fresnel of its two faces (plain glass, about 8 % head-on, all mirror when the view grazes) plus, for the rest, what the same ray meets behind the pane shaded as any hit and tinted by the pane's colour and texture; the ray passes up to three panes, so a cab is seen through both its windows; depth, mask and shadows keep the first pane as a surface; without the daylight model the bit does nothing | one more ray and one more shade on the pixels that land on glass; nothing elsewhere | [#28](https://github.com/swarm-subnet/bullet3-swarmfork/pull/28) |
 
 The `loadURDF` flag enum in full. Only the last row is the fork's; the rest is upstream and listed so a new bit is never taken twice:
 
@@ -175,6 +176,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `shadowLightCoeffTest.py` | `shadowLightCoeff` |
 | `linearLightTest.py` | `ER_SWARM_LINEAR_LIGHT` |
 | `daylightTest.py` | `ER_SWARM_DAYLIGHT`: flag off unchanged, sun to sky ratio, sky light by direction, exposure, photo sky and yaw, haze, soft shadow, leaf light, thread counts |
+| `glassTest.py` | `VISUAL_SHAPE_GLASS`: the wall behind shows through, no change without daylight, depth and mask keep the pane, tint, grazing reflection, sky through an empty pane, two panes in a row, the bit on `changeVisualShape`, a moved pane, thread counts |
 
 The cross-repository proof that existing families are untouched is the swarm repository's `validator/scripts/verify_render_identity.py`, run on the wheel before and after a change, and its `validator/tests/test_render_backend.py` and `validator/tests/test_sky_sun.py`, which pin ray-cast and sun-sky frames to committed hashes.
 
