@@ -1484,6 +1484,14 @@ B3_SHARED_API int b3CreateCollisionShapeAddSphere(b3SharedMemoryCommandHandle co
 	return -1;
 }
 
+B3_SHARED_API void b3ResetMeshDataCommandSetLinkIndex(b3SharedMemoryCommandHandle commandHandle, int linkIndex)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	if (command && command->m_type == CMD_RESET_MESH_DATA)
+		command->m_resetMeshDataArgs.m_linkIndex = linkIndex;
+}
+
 B3_SHARED_API b3SharedMemoryCommandHandle b3ResetMeshDataCommandInit(b3PhysicsClientHandle physClient, int bodyUniqueId, int numVertices, const double* vertices)
 {
 	PhysicsClient* cl = (PhysicsClient*)physClient;
@@ -1498,6 +1506,7 @@ B3_SHARED_API b3SharedMemoryCommandHandle b3ResetMeshDataCommandInit(b3PhysicsCl
 		command->m_resetMeshDataArgs.m_numVertices = numVertices;
 		command->m_resetMeshDataArgs.m_bodyUniqueId = bodyUniqueId;
 		command->m_resetMeshDataArgs.m_flags = 0;
+		command->m_resetMeshDataArgs.m_linkIndex = -1;
 		int totalUploadSizeInBytes = numVertices * sizeof(double) *3;
 		cl->uploadBulletFileToSharedMemory((const char*)vertices, totalUploadSizeInBytes);
 		return (b3SharedMemoryCommandHandle)command;

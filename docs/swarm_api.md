@@ -113,6 +113,7 @@ The `loadURDF` flag enum in full. Only the last row is the fork's; the rest is u
 
 Two related behaviours without a flag:
 
+- `resetMeshData(bodyUniqueId, vertices, linkIndex=-1)` rewrites the vertex positions of a body's **visual** mesh in place, keeping its faces, uvs, texture and colour, rebuilding its normals from the new shape and refitting its ray-cast tree; upstream it only served deformable bodies, and a body with no soft body used to fail. The vertex count must match the mesh or the call raises, and a body whose mesh is shared with another gets its own copy on the first write. This is how an animated actor stays one surface: one body per animal, its baked frame uploaded before each picture, rather than one rigid body per bone ([#30](https://github.com/swarm-subnet/bullet3-swarmfork/pull/30)).
 - `specularColor` on `createVisualShape` and `changeVisualShape`, and `Ks` in an MTL, now reach the software renderer; they are read only by `ER_SPECULAR_GLINT`. Without a value `createVisualShape` sends white ([#18](https://github.com/swarm-subnet/bullet3-swarmfork/pull/18)).
 - A PNG or TGA texture with an alpha channel keeps its alpha plane at decode, in `loadTexture` and in `map_Kd`; a texture without alpha, or with alpha 255 everywhere, stores none. Only `ER_ALPHA_CUTOUT` reads it ([#17](https://github.com/swarm-subnet/bullet3-swarmfork/pull/17)).
 
@@ -176,6 +177,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `shadowLightCoeffTest.py` | `shadowLightCoeff` |
 | `linearLightTest.py` | `ER_SWARM_LINEAR_LIGHT` |
 | `daylightTest.py` | `ER_SWARM_DAYLIGHT`: flag off unchanged, sun to sky ratio, sky light by direction, exposure, photo sky and yaw, haze, soft shadow, leaf light, thread counts |
+| `visualMeshTest.py` | `resetMeshData` on a visual mesh: the picture and depth follow the new positions on both colour paths, a wrong vertex count or a body without a mesh raises, two bodies from one mesh move apart, texture and uvs survive, normals are rebuilt, a mover keeps up, the same upload twice is the same bytes, thread counts |
 | `glassTest.py` | `VISUAL_SHAPE_GLASS`: the wall behind shows through, no change without daylight, depth and mask keep the pane, tint, grazing reflection, sky through an empty pane, two panes in a row, the bit on `changeVisualShape`, a moved pane, thread counts |
 
 The cross-repository proof that existing families are untouched is the swarm repository's `validator/scripts/verify_render_identity.py`, run on the wheel before and after a change, and its `validator/tests/test_render_backend.py` and `validator/tests/test_sky_sun.py`, which pin ray-cast and sun-sky frames to committed hashes.

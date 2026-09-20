@@ -22,6 +22,10 @@ struct UrdfRenderingInterface
 
 	virtual void updateShape(int shapeUniqueId, const btVector3* vertices, int numVertices, const btVector3* normals, int numNormals) = 0;
 
+	///rewrite the vertex positions of a body's visual mesh in place, keeping its faces, uvs and texture; normals are
+	///rebuilt from the new positions. Returns how many meshes were rewritten, so a caller can tell a miss from a hit.
+	virtual int updateVisualShapeVertices(int bodyUniqueId, int linkIndex, const double* positions, int numVertices) { return 0; }
+
 	///remove a visual shapes, based on the shape unique id (shapeUid)
 	virtual void removeVisualShape(int collisionObjectUid) = 0;
 

@@ -5822,6 +5822,18 @@ bool PhysicsServerCommandProcessor::processResetMeshDataCommand(const struct Sha
 			}
 		}
 #endif  //SKIP_SOFT_BODY_MULTI_BODY_DYNAMICS_WORLD
+
+		// A body with no soft body takes the upload as new positions for its visual mesh, so a skinned actor stays
+		// one surface instead of a set of rigid pieces. A mesh of another size is left alone and the command fails.
+		const int numVertices = clientCmd.m_resetMeshDataArgs.m_numVertices;
+		if (serverStatusOut.m_type != CMD_RESET_MESH_DATA_COMPLETED && m_data->m_pluginManager.getRenderInterface() &&
+			numVertices > 0 && numVertices <= B3_MAX_NUM_VERTICES)
+		{
+			const int updated = m_data->m_pluginManager.getRenderInterface()->updateVisualShapeVertices(
+				clientCmd.m_resetMeshDataArgs.m_bodyUniqueId, clientCmd.m_resetMeshDataArgs.m_linkIndex, vertexUpload, numVertices);
+			if (updated > 0)
+				serverStatusOut.m_type = CMD_RESET_MESH_DATA_COMPLETED;
+		}
 	}
 	serverStatusOut.m_numDataStreamBytes = 0;
 
