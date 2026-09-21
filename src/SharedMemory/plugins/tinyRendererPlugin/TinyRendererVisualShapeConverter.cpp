@@ -46,7 +46,33 @@ struct MyTexture2
 	int m_width;
 	int m_height;
 	bool m_isCached;
+	// The file the texels came from: the renderer then holds the one copy and both pointers above are 0.
+	std::string m_name;
 };
+
+// Hands a file-backed texture to the renderer for good: a reference by name replaces the texels, which
+// no later reader needs, because the name finds the one copy the renderer keeps from here on.
+static void handOverTexture(MyTexture2& texData)
+{
+	if (texData.m_name.empty())
+		return;
+	if (!TinyRender::retainSharedTexture(texData.m_name.c_str()))
+	{
+		// Nothing was registered under the name, so our own texels stay the only copy.
+		texData.m_name.clear();
+		return;
+	}
+	if (texData.m_isCached)
+		b3ImportMeshUtility::releaseCachedTexture(texData.m_name.c_str());
+	else
+	{
+		free(texData.textureData1);
+		free(texData.m_alpha);
+	}
+	texData.textureData1 = 0;
+	texData.m_alpha = 0;
+	texData.m_isCached = true;
+}
 
 struct TinyRendererObjectArray
 {
@@ -536,7 +562,7 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 			//glmesh = LoadMeshFromObj(fullPath,visualPathPrefix);
 			b3ImportMeshData meshData;
 
-			if (b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO, materialGroupsOut != 0))
+			if (b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO, materialGroupsOut != 0, true))
 			{
 				if (materialGroupsOut)
 				{
@@ -569,7 +595,7 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 						}
 					}
 				}
-				if (meshData.m_textureImage1)
+				if (meshData.m_textureImage1 || !meshData.m_textureName.empty())
 				{
 					MyTexture2 texData;
 					texData.m_width = meshData.m_textureWidth;
@@ -577,6 +603,7 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 					texData.textureData1 = meshData.m_textureImage1;
 					texData.m_alpha = meshData.m_textureAlpha;
 					texData.m_isCached = meshData.m_isCached;
+					texData.m_name = meshData.m_textureName;
 					texturesOut.push_back(texData);
 				}
 				glmesh = meshData.m_gfxShape;
@@ -1092,12 +1119,12 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					tinyObj->m_renderTreeCache = renderTreeCache;
 					tinyObj->m_glass = glass;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
-						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha);
+						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
 					float groupSpecular[3] = { (float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2] };
 					tinyObj->m_model->setSpecularColor(groupSpecular);
 					visuals->m_renderObjects.push_back(tinyObj);
 
-					if (group.m_textureImage)
+					if (group.m_textureImage || !group.m_textureName.empty())
 					{
 						MyTexture2 texData;
 						texData.m_width = group.m_textureWidth;
@@ -1105,6 +1132,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						texData.textureData1 = group.m_textureImage;
 						texData.m_alpha = group.m_textureAlpha;
 						texData.m_isCached = group.m_isCached;
+						texData.m_name = group.m_textureName;
+						handOverTexture(texData);
 						if (visualShape.m_tinyRendererTextureId < 0)
 						{
 							visualShape.m_tinyRendererTextureId = m_data->m_textures.size();
@@ -1124,6 +1153,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 				int textureWidth = 0;
 				int textureHeight = 0;
 				bool isCached = false;
+				std::string textureName;
 				if (textures.size())
 				{
 					textureImage1 = textures[0].textureData1;
@@ -1131,13 +1161,18 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					textureWidth = textures[0].m_width;
 					textureHeight = textures[0].m_height;
 					isCached = textures[0].m_isCached;
+					textureName = textures[0].m_name;
 				}
 
 				{
 					B3_PROFILE("registerMeshShape");
 
 					tinyObj->registerMeshShape(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size(), rgbaColor,
-						textureImage1, textureWidth, textureHeight, textureAlpha);
+						textureImage1, textureWidth, textureHeight, textureAlpha, textureName.c_str());
+				}
+				if (textures.size())
+				{
+					handOverTexture(textures[0]);
 				}
 				float specular[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
 				tinyObj->m_model->setSpecularColor(specular);
@@ -1190,7 +1225,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 				numIndices,
 				rgbaColor,
 				m_data->m_textures[textureId].textureData1, m_data->m_textures[textureId].m_width, m_data->m_textures[textureId].m_height,
-				m_data->m_textures[textureId].m_alpha);
+				m_data->m_textures[textureId].m_alpha, m_data->m_textures[textureId].m_name.c_str());
 		}
 
 		TinyRendererObjectArray** visualsPtr = m_data->m_swRenderInstances[orgGraphicsUniqueId];
@@ -1833,7 +1868,9 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	// Under daylight the linear sky is built beside it, from the sun or from the sky photo.
 	const SwarmSky* sunSky = 0;
 	btVector3 ambientColor(1.0, 1.0, 1.0);
-	const bool hasPhoto = daylight && m_data->m_hasSkyPhoto && m_data->m_skyTextureId >= 0 && m_data->m_skyTextureId < m_data->m_textures.size();
+	// A sky photo needs its own texels, so only a texture the plugin still holds can serve as one.
+	const bool hasPhoto = daylight && m_data->m_hasSkyPhoto && m_data->m_skyTextureId >= 0 && m_data->m_skyTextureId < m_data->m_textures.size() &&
+						  m_data->m_textures[m_data->m_skyTextureId].textureData1 != 0;
 	if (((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 || hasPhoto) && !depthOnly)
 	{
 		float sunDir[3], sunColor[3];
@@ -2318,6 +2355,11 @@ void TinyRendererVisualShapeConverter::resetAll()
 	m_data->m_sunSky.forgetPhoto();
 	for (int i = 0; i < m_data->m_textures.size(); i++)
 	{
+		if (!m_data->m_textures[i].m_name.empty())
+		{
+			TinyRender::releaseSharedTexture(m_data->m_textures[i].m_name.c_str());
+			b3ImportMeshUtility::forgetCachedTexture(m_data->m_textures[i].m_name.c_str());
+		}
 		if (!m_data->m_textures[i].m_isCached)
 		{
 			free(m_data->m_textures[i].textureData1);
@@ -2351,8 +2393,8 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 					{
 						if (textureUniqueId >= 0)
 						{
-							renderObj->m_model->setDiffuseTextureFromData(m_data->m_textures[textureUniqueId].textureData1, m_data->m_textures[textureUniqueId].m_width, m_data->m_textures[textureUniqueId].m_height,
-																		  m_data->m_textures[textureUniqueId].m_alpha);
+							const MyTexture2& tex = m_data->m_textures[textureUniqueId];
+							renderObj->m_model->setDiffuseTextureFromData(tex.textureData1, tex.m_width, tex.m_height, tex.m_alpha, tex.m_name.c_str());
 						}
 						else
 						{

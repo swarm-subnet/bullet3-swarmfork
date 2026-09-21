@@ -22,6 +22,8 @@ struct b3ImportMeshMaterialGroup
 	bool m_isCached;
 	int m_textureWidth;
 	int m_textureHeight;
+	//the resolved texture file; identity of the texels, and set even when the renderer already holds them
+	std::string m_textureName;
 };
 
 struct b3ImportMeshData
@@ -36,6 +38,8 @@ struct b3ImportMeshData
 	double m_rgbaColor[4];
 	double m_specularColor[4];
 	int m_flags;
+	//the resolved texture file; identity of the texels, and set even when the renderer already holds them
+	std::string m_textureName;
 	//filled only when loading with splitOnMaterial; m_textureImage1 stays 0 then
 	b3AlignedObjectArray<b3ImportMeshMaterialGroup> m_materialGroups;
 
@@ -55,10 +59,16 @@ struct b3ImportMeshData
 class b3ImportMeshUtility
 {
 public:
-	static bool loadAndRegisterMeshFromFileInternal(const std::string& fileName, b3ImportMeshData& meshData, struct CommonFileIOInterface* fileIO, bool splitOnMaterial = false);
+	// With textureHandover a texture the renderer already holds comes back as its file name alone, with no
+	// texels: the caller looks it up by that name instead of the loader reading and decoding the file again.
+	static bool loadAndRegisterMeshFromFileInternal(const std::string& fileName, b3ImportMeshData& meshData, struct CommonFileIOInterface* fileIO, bool splitOnMaterial = false, bool textureHandover = false);
 	// The alpha channel of an image file held in memory, one malloc'd byte per texel, or 0 when the
 	// file has no alpha channel or every texel is opaque. width and height must be the file's own.
 	static unsigned char* loadTextureAlpha(const unsigned char* bytes, int size, int width, int height);
+	// Drops the texels cached under this file name once the renderer has taken them over.
+	static void releaseCachedTexture(const char* textureName);
+	// Undoes that, so the next load of this file reads it again.
+	static void forgetCachedTexture(const char* textureName);
 };
 
 #endif  //B3_IMPORT_MESH_UTILITY_H

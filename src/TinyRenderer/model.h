@@ -51,7 +51,11 @@ public:
 	}
 	void loadDiffuseTexture(const char* relativeFileName);
 	// textureAlpha is one byte per texel in the same row order as textureImage, or 0 for an opaque texture.
-	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha = 0);
+	// textureName is the file the texels came from: the renderer keeps one copy per name and the caller
+	// is free to drop its own as soon as this returns.
+	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha = 0, const char* textureName = 0);
+	// Takes the texture already held under this file name; false when no owner is left to take it from.
+	bool shareDiffuseTextureByName(const char* textureName);
 	// Vertex stride is 9 floats: xyz, w (ignored), normal xyz, uv.
 	void setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 	void reserveMemory(int numVertices, int numIndices);
@@ -78,6 +82,10 @@ public:
 	void recomputeNormals();
 	// Identity of the shared vertex block; two Models with the same key draw the same triangles.
 	const void* meshKey() const { return m_mesh; }
+	// True when every corner names the same index for its position and its uv, so uvArray() reads by vertex index.
+	bool uvIndexedByVertex() const;
+	// The uv pairs in vertex order, valid only while this Model holds the mesh; 0 when the mesh carries none.
+	const float* uvArray() const;
 	// Content hash of the mesh arrays, the same across processes for the same vertices and faces.
 	unsigned long long meshHash() const;
 
@@ -92,7 +100,14 @@ public:
 	void buildMipmaps();
 	float specular(Vec2f uv);
 	std::vector<int> face(int idx);
+	// The three corner vertex indices of a face, without building a vector for them.
+	void faceVertices(int idx, int out[3]) const;
 };
+
+// The renderer is the one owner of a texture loaded from a file: the caller that handed over the texels
+// holds a reference by name for as long as it still lists that texture, and frees its own copy at once.
+bool retainSharedTexture(const char* textureName);
+void releaseSharedTexture(const char* textureName);
 }
 
 #endif  //__MODEL_H__

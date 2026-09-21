@@ -20,16 +20,39 @@ struct CachedTextureResult
 	int m_height;
 	unsigned char* m_pixels;
 	unsigned char* m_alpha;
+	//the renderer took these texels over and keeps them under this file name; the size above is all that is left here
+	bool m_handedOver;
 	CachedTextureResult()
 		: m_width(0),
 		  m_height(0),
 		  m_pixels(0),
-		  m_alpha(0)
+		  m_alpha(0),
+		  m_handedOver(false)
 	{
 	}
 };
 
 static b3HashMap<b3HashString, CachedTextureResult> gCachedTextureResults;
+
+void b3ImportMeshUtility::releaseCachedTexture(const char* textureName)
+{
+	CachedTextureResult* texture = textureName ? gCachedTextureResults[textureName] : 0;
+	if (!texture)
+		return;
+	free(texture->m_pixels);
+	free(texture->m_alpha);
+	texture->m_pixels = 0;
+	texture->m_alpha = 0;
+	texture->m_handedOver = true;
+}
+
+void b3ImportMeshUtility::forgetCachedTexture(const char* textureName)
+{
+	CachedTextureResult* texture = textureName ? gCachedTextureResults[textureName] : 0;
+	if (texture)
+		texture->m_handedOver = false;
+}
+
 struct CachedTextureManager
 {
 	CachedTextureManager()
@@ -74,7 +97,7 @@ unsigned char* b3ImportMeshUtility::loadTextureAlpha(const unsigned char* bytes,
 }
 
 //loads the diffuse texture named in a material, trying the mesh folder and the data folders; returns 0 when none loads
-static unsigned char* loadDiffuseTexture(const char* filename, const char* pathPrefix, CommonFileIOInterface* fileIO, int& width, int& height, bool& isCached, unsigned char*& alpha)
+static unsigned char* loadDiffuseTexture(const char* filename, const char* pathPrefix, CommonFileIOInterface* fileIO, int& width, int& height, bool& isCached, unsigned char*& alpha, std::string& textureName, bool handover)
 {
 	unsigned char* image = 0;
 	isCached = false;
@@ -90,17 +113,24 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 		char relativeFileName2[1024];
 		if (fileIO->findResourcePath(relativeFileName, relativeFileName2, 1024))
 		{
-			if (b3IsFileCachingEnabled())
+			const CachedTextureResult* texture = gCachedTextureResults[relativeFileName];
+			if (texture && texture->m_pixels && b3IsFileCachingEnabled())
 			{
-				CachedTextureResult* texture = gCachedTextureResults[relativeFileName];
-				if (texture)
-				{
-					image = texture->m_pixels;
-					alpha = texture->m_alpha;
-					width = texture->m_width;
-					height = texture->m_height;
-					isCached = true;
-				}
+				image = texture->m_pixels;
+				alpha = texture->m_alpha;
+				width = texture->m_width;
+				height = texture->m_height;
+				textureName = relativeFileName;
+				isCached = true;
+			}
+			else if (texture && texture->m_handedOver && handover)
+			{
+				// The renderer holds these texels under this name, so nothing has to be read or decoded.
+				width = texture->m_width;
+				height = texture->m_height;
+				textureName = relativeFileName;
+				isCached = true;
+				return 0;
 			}
 
 			if (image == 0)
@@ -134,6 +164,7 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 				if (image)
 				{
 					alpha = b3ImportMeshUtility::loadTextureAlpha((const unsigned char*)&buffer[0], buffer.size(), width, height);
+					textureName = relativeFileName;
 					if (b3IsFileCachingEnabled())
 					{
 						CachedTextureResult result;
@@ -188,7 +219,7 @@ static void groupShapesByMaterial(std::vector<bt_tinyobj::shape_t>& shapes)
 }
 
 //one group per material, covering the index range its shapes occupy in the flattened mesh
-static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, const char* pathPrefix, CommonFileIOInterface* fileIO, b3AlignedObjectArray<b3ImportMeshMaterialGroup>& groups)
+static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, const char* pathPrefix, CommonFileIOInterface* fileIO, b3AlignedObjectArray<b3ImportMeshMaterialGroup>& groups, bool textureHandover)
 {
 	int indexStart = 0;
 	for (size_t i = 0; i < shapes.size(); i++)
@@ -219,7 +250,7 @@ static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, 
 			group.m_textureHeight = 0;
 			if (material.diffuse_texname.length() > 0)
 			{
-				group.m_textureImage = loadDiffuseTexture(material.diffuse_texname.c_str(), pathPrefix, fileIO, group.m_textureWidth, group.m_textureHeight, group.m_isCached, group.m_textureAlpha);
+				group.m_textureImage = loadDiffuseTexture(material.diffuse_texname.c_str(), pathPrefix, fileIO, group.m_textureWidth, group.m_textureHeight, group.m_isCached, group.m_textureAlpha, group.m_textureName, textureHandover);
 			}
 			groups.push_back(group);
 		}
@@ -227,7 +258,7 @@ static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, 
 	}
 }
 
-bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string& fileName, b3ImportMeshData& meshData, struct CommonFileIOInterface* fileIO, bool splitOnMaterial)
+bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string& fileName, b3ImportMeshData& meshData, struct CommonFileIOInterface* fileIO, bool splitOnMaterial, bool textureHandover)
 {
 	B3_PROFILE("loadAndRegisterMeshFromFileInternal");
 	meshData.m_gfxShape = 0;
@@ -237,6 +268,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 	meshData.m_textureWidth = 0;
 	meshData.m_flags = 0;
 	meshData.m_isCached = false;
+	meshData.m_textureName.clear();
 	meshData.m_materialGroups.clear();
 
 	char relativeFileName[1024];
@@ -263,14 +295,14 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 		if (splitOnMaterial)
 		{
 			B3_PROFILE("Load Textures");
-			buildMaterialGroups(shapes, pathPrefix, fileIO, meshData.m_materialGroups);
+			buildMaterialGroups(shapes, pathPrefix, fileIO, meshData.m_materialGroups, textureHandover);
 		}
 		else
 		{
 			B3_PROFILE("Load Texture");
 			//int textureIndex = -1;
 			//try to load some texture
-			for (int i = 0; meshData.m_textureImage1 == 0 && i < shapes.size(); i++)
+			for (int i = 0; meshData.m_textureImage1 == 0 && meshData.m_textureName.empty() && i < shapes.size(); i++)
 			{
 				const bt_tinyobj::shape_t& shape = shapes[i];
 				meshData.m_rgbaColor[0] = shape.material.diffuse[0];
@@ -287,7 +319,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 
 				if (shape.material.diffuse_texname.length() > 0)
 				{
-					meshData.m_textureImage1 = loadDiffuseTexture(shape.material.diffuse_texname.c_str(), pathPrefix, fileIO, meshData.m_textureWidth, meshData.m_textureHeight, meshData.m_isCached, meshData.m_textureAlpha);
+					meshData.m_textureImage1 = loadDiffuseTexture(shape.material.diffuse_texname.c_str(), pathPrefix, fileIO, meshData.m_textureWidth, meshData.m_textureHeight, meshData.m_isCached, meshData.m_textureAlpha, meshData.m_textureName, textureHandover);
 				}
 			}
 		}

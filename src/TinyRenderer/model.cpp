@@ -13,23 +13,28 @@ namespace TinyRender
 struct SharedMesh
 {
 	std::vector<Vec3f> verts_;
-	std::vector<std::vector<Vec3i> > faces_;  // attention, this Vec3i means vertex/uv/normal
+	// Three corners per face, one after the other; this Vec3i means vertex/uv/normal.
+	std::vector<Vec3i> faces_;
 	std::vector<Vec3f> norms_;
 	std::vector<Vec2f> uv_;
 	unsigned long long hash_;
 	int refs_;
 	bool registered_;
 	bool hasAABB_;
+	// -1 until asked: whether every corner's uv index is its vertex index.
+	int uvByVertex_;
 	Vec3f aabbMin_;
 	Vec3f aabbMax_;
 
-	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false) {}
+	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false), uvByVertex_(-1) {}
 };
 
 struct SharedTexture
 {
 	TGAImage img_;
 	const unsigned char* source_;  // texels the image was built from; a lookup key, never dereferenced blindly
+	// The file the texels came from, empty for a texture handed over as raw bytes; the dedup key when set.
+	std::string name_;
 	int refs_;
 	bool registered_;
 	// Halved copies of img_ down to 1x1, built on the first filtered sample and shared like the image.
@@ -115,10 +120,37 @@ static void releaseTexture(SharedTexture* tex)
 	delete tex;
 }
 
+// The texture registered under this file name, or 0.
+static SharedTexture* findTextureByName(const char* name)
+{
+	if (!name || !name[0])
+		return 0;
+	for (size_t i = 0; i < gSharedTextures.size(); i++)
+	{
+		if (gSharedTextures[i]->name_ == name)
+			return gSharedTextures[i];
+	}
+	return 0;
+}
+
+bool retainSharedTexture(const char* textureName)
+{
+	SharedTexture* tex = findTextureByName(textureName);
+	if (!tex)
+		return false;
+	tex->refs_++;
+	return true;
+}
+
+void releaseSharedTexture(const char* textureName)
+{
+	releaseTexture(findTextureByName(textureName));
+}
+
 // Bitwise comparison of the stored arrays against the raw input, so a hash match alone never selects a block.
 static bool meshMatchesArrays(const SharedMesh& mesh, const float* vertices, int numVertices, const int* indices, int numIndices)
 {
-	if ((int)mesh.verts_.size() != numVertices || (int)mesh.faces_.size() != numIndices / 3)
+	if ((int)mesh.verts_.size() != numVertices || (int)mesh.faces_.size() != numIndices)
 		return false;
 	for (int i = 0; i < numVertices; i++)
 	{
@@ -128,13 +160,10 @@ static bool meshMatchesArrays(const SharedMesh& mesh, const float* vertices, int
 			memcmp(&mesh.uv_[i][0], v + 7, 2 * sizeof(float)) != 0)
 			return false;
 	}
-	for (int f = 0; f < numIndices / 3; f++)
+	for (int i = 0; i < numIndices; i++)
 	{
-		for (int j = 0; j < 3; j++)
-		{
-			if (mesh.faces_[f][j][0] != indices[f * 3 + j])
-				return false;
-		}
+		if (mesh.faces_[i][0] != indices[i])
+			return false;
 	}
 	return true;
 }
@@ -173,18 +202,24 @@ Model::Model(const char *filename) : m_mesh(new SharedMesh), m_diffuse(0), norma
 		}
 		else if (!line.compare(0, 2, "f "))
 		{
-			std::vector<Vec3i> f;
+			// Only the first three corners are kept: every reader of a face has always drawn a triangle.
+			Vec3i corners[3];
+			int count = 0;
 			Vec3i tmp;
 			iss >> trash;
 			while (iss >> tmp[0] >> trash >> tmp[1] >> trash >> tmp[2])
 			{
 				for (int i = 0; i < 3; i++) tmp[i]--;  // in wavefront obj all indices start at 1, not zero
-				f.push_back(tmp);
+				if (count < 3) corners[count] = tmp;
+				count++;
 			}
-			m_mesh->faces_.push_back(f);
+			if (count >= 3)
+			{
+				for (int i = 0; i < 3; i++) m_mesh->faces_.push_back(corners[i]);
+			}
 		}
 	}
-	std::cerr << "# v# " << m_mesh->verts_.size() << " f# " << m_mesh->faces_.size() << " vt# " << m_mesh->uv_.size() << " vn# " << m_mesh->norms_.size() << std::endl;
+	std::cerr << "# v# " << m_mesh->verts_.size() << " f# " << m_mesh->faces_.size() / 3 << " vt# " << m_mesh->uv_.size() << " vn# " << m_mesh->norms_.size() << std::endl;
 	m_diffuse = new SharedTexture;
 	load_texture(filename, "_diffuse.tga", m_diffuse->img_);
 	load_texture(filename, "_nm_tangent.tga", normalmap_);
@@ -195,15 +230,29 @@ Model::Model() : m_mesh(new SharedMesh), m_diffuse(0), normalmap_(), specularmap
 {
 }
 
-void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWidth, int textureHeight, const unsigned char *textureAlpha)
+bool Model::shareDiffuseTextureByName(const char *textureName)
 {
+	SharedTexture* tex = findTextureByName(textureName);
+	if (!tex)
+		return false;
+	releaseTexture(m_diffuse);
+	tex->refs_++;
+	m_diffuse = tex;
+	return true;
+}
+
+void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWidth, int textureHeight, const unsigned char *textureAlpha, const char *textureName)
+{
+	// A file name is the whole identity of a texture, so the texels never have to be compared.
+	if (sharingEnabled() && textureName && textureName[0] && shareDiffuseTextureByName(textureName))
+		return;
 	releaseTexture(m_diffuse);
 	m_diffuse = 0;
 	if (!textureImage)
 		return;
 
 	const int rowBytes = textureWidth * 3;
-	if (sharingEnabled())
+	if (sharingEnabled() && !(textureName && textureName[0]))
 	{
 		// Same source texels and size is the candidate; the row compare below makes it certain.
 		for (size_t i = 0; i < gSharedTextures.size(); i++)
@@ -229,6 +278,8 @@ void Model::setDiffuseTextureFromData(unsigned char *textureImage, int textureWi
 
 	m_diffuse = new SharedTexture;
 	m_diffuse->source_ = textureImage;
+	if (textureName)
+		m_diffuse->name_ = textureName;
 	{
 		B3_PROFILE("new TGAImage");
 		m_diffuse->img_ = TGAImage(textureWidth, textureHeight, TGAImage::RGB);
@@ -328,6 +379,7 @@ void Model::setMeshFromArrays(const float* vertices, int numVertices, const int*
 void Model::detachMesh()
 {
 	m_mesh->hasAABB_ = false;
+	m_mesh->uvByVertex_ = -1;
 	if (m_mesh->refs_ > 1)
 	{
 		SharedMesh* copy = new SharedMesh;
@@ -360,6 +412,7 @@ void Model::reserveMemory(int numVertices, int numIndices)
 	m_mesh->norms_.reserve(numVertices);
 	m_mesh->uv_.reserve(numVertices);
 	m_mesh->faces_.reserve(numIndices);
+	m_mesh->uvByVertex_ = -1;
 }
 
 void Model::addVertex(float x, float y, float z, float normalX, float normalY, float normalZ, float u, float v)
@@ -374,11 +427,9 @@ void Model::addTriangle(int vertexposIndex0, int normalIndex0, int uvIndex0,
 						int vertexposIndex2, int normalIndex2, int uvIndex2)
 {
 	detachMesh();
-	std::vector<Vec3i> f;
-	f.push_back(Vec3i(vertexposIndex0, normalIndex0, uvIndex0));
-	f.push_back(Vec3i(vertexposIndex1, normalIndex1, uvIndex1));
-	f.push_back(Vec3i(vertexposIndex2, normalIndex2, uvIndex2));
-	m_mesh->faces_.push_back(f);
+	m_mesh->faces_.push_back(Vec3i(vertexposIndex0, normalIndex0, uvIndex0));
+	m_mesh->faces_.push_back(Vec3i(vertexposIndex1, normalIndex1, uvIndex1));
+	m_mesh->faces_.push_back(Vec3i(vertexposIndex2, normalIndex2, uvIndex2));
 }
 
 bool Model::getLocalAABB(Vec3f& aabbMin, Vec3f& aabbMax)
@@ -425,7 +476,24 @@ int Model::nnormals()
 
 int Model::nfaces()
 {
-	return (int)m_mesh->faces_.size();
+	return (int)m_mesh->faces_.size() / 3;
+}
+
+bool Model::uvIndexedByVertex() const
+{
+	if (m_mesh->uvByVertex_ < 0)
+	{
+		int same = 1;
+		for (size_t i = 0; same && i < m_mesh->faces_.size(); i++)
+			same = m_mesh->faces_[i][1] == m_mesh->faces_[i][0];
+		m_mesh->uvByVertex_ = same;
+	}
+	return m_mesh->uvByVertex_ != 0;
+}
+
+const float* Model::uvArray() const
+{
+	return m_mesh->uv_.empty() ? 0 : &m_mesh->uv_[0][0];
 }
 
 unsigned long long Model::meshHash() const
@@ -436,10 +504,16 @@ unsigned long long Model::meshHash() const
 std::vector<int> Model::face(int idx)
 {
 	std::vector<int> face;
-	face.reserve((int)m_mesh->faces_[idx].size());
-	for (int i = 0; i < (int)m_mesh->faces_[idx].size(); i++)
-		face.push_back(m_mesh->faces_[idx][i][0]);
+	face.reserve(3);
+	for (int i = 0; i < 3; i++)
+		face.push_back(m_mesh->faces_[(size_t)idx * 3 + i][0]);
 	return face;
+}
+
+void Model::faceVertices(int idx, int out[3]) const
+{
+	for (int i = 0; i < 3; i++)
+		out[i] = m_mesh->faces_[(size_t)idx * 3 + i][0];
 }
 
 Vec3f Model::vert(int i)
@@ -449,7 +523,7 @@ Vec3f Model::vert(int i)
 
 Vec3f Model::vert(int iface, int nthvert)
 {
-	return m_mesh->verts_[m_mesh->faces_[iface][nthvert][0]];
+	return m_mesh->verts_[m_mesh->faces_[(size_t)iface * 3 + nthvert][0]];
 }
 
 Vec3f* Model::readWriteVertices()
@@ -469,16 +543,14 @@ void Model::recomputeNormals()
 		m_mesh->norms_[i] = Vec3f(0.f, 0.f, 0.f);
 	const int numVerts = (int)m_mesh->verts_.size();
 	const int numNorms = (int)m_mesh->norms_.size();
-	for (size_t f = 0; f < m_mesh->faces_.size(); f++)
+	for (size_t f = 0; f + 2 < m_mesh->faces_.size(); f += 3)
 	{
-		const std::vector<Vec3i>& face = m_mesh->faces_[f];
-		if (face.size() < 3)
-			continue;
+		const Vec3i* face = &m_mesh->faces_[f];
 		if (face[0][0] < 0 || face[0][0] >= numVerts || face[1][0] < 0 || face[1][0] >= numVerts || face[2][0] < 0 || face[2][0] >= numVerts)
 			continue;
 		// The cross product carries twice the triangle's area, so a big face pulls the corner normal harder.
 		const Vec3f weighted = cross(m_mesh->verts_[face[1][0]] - m_mesh->verts_[face[0][0]], m_mesh->verts_[face[2][0]] - m_mesh->verts_[face[0][0]]);
-		for (size_t k = 0; k < face.size(); k++)
+		for (int k = 0; k < 3; k++)
 		{
 			const int ni = face[k][2];
 			if (ni >= 0 && ni < numNorms)
@@ -736,7 +808,7 @@ void Model::buildMipmaps()
 
 Vec3f Model::storedNormal(int iface, int nthvert) const
 {
-	return m_mesh->norms_[m_mesh->faces_[iface][nthvert][2]];
+	return m_mesh->norms_[m_mesh->faces_[(size_t)iface * 3 + nthvert][2]];
 }
 
 Vec3f Model::normal(Vec2f uvf)
@@ -751,7 +823,7 @@ Vec3f Model::normal(Vec2f uvf)
 
 Vec2f Model::uv(int iface, int nthvert)
 {
-	return m_mesh->uv_[m_mesh->faces_[iface][nthvert][1]];
+	return m_mesh->uv_[m_mesh->faces_[(size_t)iface * 3 + nthvert][1]];
 }
 
 float Model::specular(Vec2f uvf)
@@ -766,7 +838,7 @@ float Model::specular(Vec2f uvf)
 
 Vec3f Model::normal(int iface, int nthvert)
 {
-	int idx = m_mesh->faces_[iface][nthvert][2];
+	int idx = m_mesh->faces_[(size_t)iface * 3 + nthvert][2];
 	return m_mesh->norms_[idx].normalize();
 }
 }

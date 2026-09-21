@@ -15,8 +15,20 @@ struct CachedObjResult
 	bt_tinyobj::attrib_t m_attribute;
 };
 
-static b3HashMap<b3HashString, CachedObjResult> gCachedObjResults;
+// Held by pointer: growing the table must not deep copy every mesh it already carries.
+static b3HashMap<b3HashString, CachedObjResult*> gCachedObjResults;
 static int gEnableFileCaching = 1;
+
+static void clearCachedObjResults()
+{
+	for (int i = 0; i < gCachedObjResults.size(); i++)
+	{
+		CachedObjResult** entry = gCachedObjResults.getAtIndex(i);
+		if (entry)
+			delete *entry;
+	}
+	gCachedObjResults.clear();
+}
 
 int b3IsFileCachingEnabled()
 {
@@ -27,7 +39,7 @@ void b3EnableFileCaching(int enable)
 	gEnableFileCaching = enable;
 	if (enable == 0)
 	{
-		gCachedObjResults.clear();
+		clearCachedObjResults();
 	}
 }
 
@@ -41,22 +53,22 @@ std::string LoadFromCachedOrFromObj(
 {
 	// the two shape groupings of one file must not share a cache entry
 	std::string cacheKey = splitOnMaterial ? std::string(filename) + "|mtl" : std::string(filename);
-	CachedObjResult* resultPtr = gCachedObjResults[cacheKey.c_str()];
-	if (resultPtr)
+	CachedObjResult** resultPtr = gCachedObjResults[cacheKey.c_str()];
+	if (resultPtr && *resultPtr)
 	{
-		const CachedObjResult& result = *resultPtr;
+		const CachedObjResult& result = **resultPtr;
 		shapes = result.m_shapes;
 		attribute = result.m_attribute;
 		return result.m_msg;
 	}
 
 	std::string err = bt_tinyobj::LoadObj(attribute, shapes, filename, mtl_basepath, fileIO, splitOnMaterial);
-	CachedObjResult result;
-	result.m_msg = err;
-	result.m_shapes = shapes;
-	result.m_attribute = attribute;
 	if (gEnableFileCaching)
 	{
+		CachedObjResult* result = new CachedObjResult;
+		result->m_msg = err;
+		result->m_shapes = shapes;
+		result->m_attribute = attribute;
 		gCachedObjResults.insert(cacheKey.c_str(), result);
 	}
 	return err;
