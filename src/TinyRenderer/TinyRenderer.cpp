@@ -584,7 +584,37 @@ void TinyRenderObjectData::computeLocalAABB()
 		return;
 	m_localAABBMin.setValue(aabbMin[0], aabbMin[1], aabbMin[2]);
 	m_localAABBMax.setValue(aabbMax[0], aabbMax[1], aabbMax[2]);
+	// A batch spans every placement of its mesh: the union of the mesh box's corners carried by each one.
+	if (!m_placements.empty())
+	{
+		btVector3 low(BT_LARGE_FLOAT, BT_LARGE_FLOAT, BT_LARGE_FLOAT), high(-BT_LARGE_FLOAT, -BT_LARGE_FLOAT, -BT_LARGE_FLOAT);
+		for (size_t p = 0; p + 12 <= m_placements.size(); p += 12)
+		{
+			const float* t = &m_placements[p];
+			for (int corner = 0; corner < 8; corner++)
+			{
+				const float c[3] = {(corner & 1) ? aabbMax[0] : aabbMin[0], (corner & 2) ? aabbMax[1] : aabbMin[1], (corner & 4) ? aabbMax[2] : aabbMin[2]};
+				btVector3 world;
+				for (int r = 0; r < 3; r++)
+					world[r] = t[r] * c[0] + t[3 + r] * c[1] + t[6 + r] * c[2] + t[9 + r];
+				low.setMin(world);
+				high.setMax(world);
+			}
+		}
+		m_localAABBMin = low;
+		m_localAABBMax = high;
+	}
 	m_hasLocalAABB = true;
+}
+
+TinyRender::Matrix TinyRenderObjectData::placementMatrix(size_t index) const
+{
+	TinyRender::Matrix m = TinyRender::Matrix::identity();
+	const float* t = &m_placements[index * 12];
+	for (int r = 0; r < 3; r++)
+		for (int c = 0; c < 4; c++)
+			m[r][c] = t[c * 3 + r];
+	return m;
 }
 
 TinyRenderObjectData::~TinyRenderObjectData()

@@ -920,6 +920,166 @@ static btVector4 sGoogleyColors[4] =
 	//btVector4(1,1,0,1),
 };
 
+// Draws a render object on the raster path: a forest batch once per placement, anything else once.
+static void drawPlacements(TinyRenderObjectData& obj, void (*draw)(TinyRenderObjectData&))
+{
+	if (obj.m_placements.empty())
+	{
+		draw(obj);
+		return;
+	}
+	const TinyRender::Matrix base = obj.m_modelMatrix;
+	for (size_t p = 0; p * 12 < obj.m_placements.size(); p++)
+	{
+		obj.m_modelMatrix = base * obj.placementMatrix(p);
+		draw(obj);
+	}
+	obj.m_modelMatrix = base;
+}
+
+// The render models of one instanced mesh, converted once: every body and forest placement that draws it
+// borrows them. The models are built exactly as a plain body's would be, so a borrowed copy draws the same.
+static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConverterInternalData* data, const std::string& key,
+												   const UrdfShape& canonical, const char* pathPrefix, const float rgbaColor[4],
+												   const btVector3& specularColor, bool materialsFromMtl, CommonFileIOInterface* fileIO)
+{
+	std::map<std::string, InstancedPrototype>::iterator found = data->m_instancedPrototypes.find(key);
+	if (found != data->m_instancedPrototypes.end())
+		return found->second;
+	InstancedPrototype& prototype = data->m_instancedPrototypes[key];
+	b3VisualShapeData& shape = prototype.m_shape;
+	memset(&shape, 0, sizeof(shape));
+	for (int i = 0; i < 4; i++)
+		shape.m_rgbaColor[i] = rgbaColor[i];
+	shape.m_localVisualFrame[6] = 1;
+	shape.m_openglTextureId = -1;
+	shape.m_tinyRendererTextureId = -1;
+	shape.m_textureUniqueId = -1;
+	btAlignedObjectArray<MyTexture2> textures;
+	btAlignedObjectArray<GLInstanceVertex> vertices;
+	btAlignedObjectArray<int> indices;
+	btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
+	btTransform identity;
+	identity.setIdentity();
+	convertURDFToVisualShape(&canonical, pathPrefix, identity, vertices, indices, textures, shape, fileIO, data->m_flags, materialsFromMtl ? &materialGroups : 0);
+	const float color[4] = {(float)shape.m_rgbaColor[0], (float)shape.m_rgbaColor[1], (float)shape.m_rgbaColor[2], (float)shape.m_rgbaColor[3]};
+	if (vertices.size() && indices.size() && materialGroups.size())
+	{
+		for (int g = 0; g < materialGroups.size(); g++)
+		{
+			const b3ImportMeshMaterialGroup& group = materialGroups[g];
+			int firstVertex = indices[group.m_indexStart];
+			int lastVertex = firstVertex;
+			for (int i = 1; i < group.m_indexCount; i++)
+			{
+				firstVertex = btMin(firstVertex, indices[group.m_indexStart + i]);
+				lastVertex = btMax(lastVertex, indices[group.m_indexStart + i]);
+			}
+			btAlignedObjectArray<int> groupIndices;
+			groupIndices.resize(group.m_indexCount);
+			for (int i = 0; i < group.m_indexCount; i++)
+				groupIndices[i] = indices[group.m_indexStart + i] - firstVertex;
+			const float groupColor[4] = {(float)group.m_rgbaColor[0], (float)group.m_rgbaColor[1], (float)group.m_rgbaColor[2], (float)group.m_rgbaColor[3]};
+			TinyRender::Model* model = new TinyRender::Model();
+			model->setColorRGBA(groupColor);
+			if (group.m_textureImage || !group.m_textureName.empty())
+				model->setDiffuseTextureFromData(group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
+			model->setMeshFromArrays(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size());
+			const float groupSpecular[3] = {(float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2]};
+			model->setSpecularColor(groupSpecular);
+			prototype.m_models.push_back(model);
+			if (group.m_textureImage || !group.m_textureName.empty())
+			{
+				MyTexture2 texData;
+				texData.m_width = group.m_textureWidth;
+				texData.m_height = group.m_textureHeight;
+				texData.textureData1 = group.m_textureImage;
+				texData.m_alpha = group.m_textureAlpha;
+				texData.m_isCached = group.m_isCached;
+				texData.m_name = group.m_textureName;
+				handOverTexture(texData);
+				if (shape.m_tinyRendererTextureId < 0)
+					shape.m_tinyRendererTextureId = data->m_textures.size();
+				data->m_textures.push_back(texData);
+			}
+		}
+	}
+	else if (vertices.size() && indices.size())
+	{
+		TinyRender::Model* model = new TinyRender::Model();
+		model->setColorRGBA(color);
+		if (textures.size() && (textures[0].textureData1 || !textures[0].m_name.empty()))
+			model->setDiffuseTextureFromData(textures[0].textureData1, textures[0].m_width, textures[0].m_height, textures[0].m_alpha, textures[0].m_name.c_str());
+		model->setMeshFromArrays(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size());
+		if (textures.size())
+			handOverTexture(textures[0]);
+		const float specular[3] = {(float)specularColor[0], (float)specularColor[1], (float)specularColor[2]};
+		model->setSpecularColor(specular);
+		prototype.m_models.push_back(model);
+	}
+	for (int i = 0; i < textures.size(); i++)
+	{
+		shape.m_tinyRendererTextureId = data->m_textures.size();
+		data->m_textures.push_back(textures[i]);
+	}
+	return prototype;
+}
+
+// A .fst forest file: the OBJ meshes it names, and for each mesh 12 floats per placement (3x4 column-major).
+struct ForestFile
+{
+	std::vector<std::string> m_meshes;
+	std::vector<std::vector<float> > m_placements;
+};
+
+// Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines;
+// '#' starts a comment. False when the file cannot be read or names no mesh.
+static bool readForestFile(const std::string& fileName, CommonFileIOInterface* fileIO, ForestFile& out)
+{
+	char found[1024];
+	std::string path = fileName;
+	if (fileIO && fileIO->findResourcePath(fileName.c_str(), found, sizeof(found)))
+		path = found;
+	std::ifstream in(path.c_str());
+	if (!in)
+		return false;
+	const size_t slash = path.find_last_of("/\\");
+	const std::string folder = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+	std::string line;
+	while (std::getline(in, line))
+	{
+		if (line.empty() || line[0] == '#')
+			continue;
+		if (line.compare(0, 5, "mesh ") == 0)
+		{
+			std::string mesh = line.substr(5);
+			while (!mesh.empty() && (mesh[mesh.size() - 1] == '\r' || mesh[mesh.size() - 1] == ' '))
+				mesh.erase(mesh.size() - 1);
+			out.m_meshes.push_back(mesh.size() && mesh[0] == '/' ? mesh : folder + mesh);
+			out.m_placements.push_back(std::vector<float>());
+			continue;
+		}
+		int index = -1;
+		double x, y, z, qx, qy, qz, qw, sx, sy, sz;
+		if (sscanf(line.c_str(), "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &index, &x, &y, &z, &qx, &qy, &qz, &qw, &sx, &sy, &sz) != 11 ||
+			index < 0 || index >= (int)out.m_meshes.size())
+			continue;
+		// Rotation from the unit quaternion, each column scaled by its axis: the placement's 3x4, column-major.
+		const double r[3][3] = {{1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)},
+								{2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)},
+								{2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)}};
+		const double scale[3] = {sx, sy, sz};
+		const double origin[3] = {x, y, z};
+		std::vector<float>& placements = out.m_placements[index];
+		for (int c = 0; c < 3; c++)
+			for (int row = 0; row < 3; row++)
+				placements.push_back((float)(r[row][c] * scale[c]));
+		for (int row = 0; row < 3; row++)
+			placements.push_back((float)origin[row]);
+	}
+	return !out.m_meshes.empty();
+}
+
 int  TinyRendererVisualShapeConverter::convertVisualShapes(
 	int linkIndex, const char* pathPrefix, const btTransform& localInertiaFrame,
 	const UrdfLink* linkPtr, const UrdfModel* model, int orgGraphicsUniqueId,
@@ -1066,21 +1226,40 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 							((c < 3 && vis->m_geometry.m_type == URDF_GEOM_MESH) ? (float)vis->m_geometry.m_meshScale[c] : 1.0f);
 			}
 
-			// An instanced mesh converts to the same canonical render objects whatever its pose and scale, so the
-			// file, the flags and the look are the whole key.
-			const bool shareable = renderInstanced && vis->m_geometry.m_type == URDF_GEOM_MESH;
-			std::string prototypeKey;
-			if (shareable)
+			// An instanced mesh converts to the same canonical render models whatever its pose and scale, so the file,
+			// the flags and the look are the whole key; a forest file draws each of its meshes as one batch.
+			if (renderInstanced && vis->m_geometry.m_type == URDF_GEOM_MESH)
 			{
 				char look[320];
 				snprintf(look, sizeof(look), "|%d|%d|%a|%a|%a|%a|%a|%a|%a", linkPtr->m_visualArray[v1].m_flags, m_data->m_flags,
 						 rgbaColor[0], rgbaColor[1], rgbaColor[2], rgbaColor[3],
 						 (double)specularColor[0], (double)specularColor[1], (double)specularColor[2]);
-				prototypeKey = std::string(pathPrefix ? pathPrefix : "") + "|" + vis->m_geometry.m_meshFileName + look;
-				std::map<std::string, InstancedPrototype>::iterator found = m_data->m_instancedPrototypes.find(prototypeKey);
-				if (found != m_data->m_instancedPrototypes.end())
+				const std::string prefix(pathPrefix ? pathPrefix : "");
+				ForestFile forest;
+				const bool isForest = vis->m_geometry.m_meshFileType == UrdfGeometry::FILE_FOREST;
+				if (isForest && !readForestFile(vis->m_geometry.m_meshFileName, fileIO, forest))
+					b3Warning("cannot read forest file %s\n", vis->m_geometry.m_meshFileName.c_str());
+				if (!isForest)
 				{
-					const InstancedPrototype& prototype = found->second;
+					forest.m_meshes.push_back(vis->m_geometry.m_meshFileName);
+					forest.m_placements.push_back(std::vector<float>());
+				}
+				const InstancedPrototype* first = 0;
+				for (size_t mesh = 0; mesh < forest.m_meshes.size(); mesh++)
+				{
+					if (isForest && forest.m_placements[mesh].empty())
+						continue;
+					UrdfShape canonical = *vis;
+					canonical.m_geometry.m_meshScale.setValue(1, 1, 1);
+					if (isForest)
+					{
+						canonical.m_geometry.m_meshFileName = forest.m_meshes[mesh];
+						canonical.m_geometry.m_meshFileType = UrdfGeometry::FILE_OBJ;
+					}
+					const InstancedPrototype& prototype = instancedPrototype(m_data, prefix + "|" + canonical.m_geometry.m_meshFileName + look, canonical,
+																			  pathPrefix, rgbaColor, specularColor, materialsFromMtl, fileIO);
+					if (!first)
+						first = &prototype;
 					for (size_t m = 0; m < prototype.m_models.size(); m++)
 					{
 						TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
@@ -1089,29 +1268,35 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						tinyObj->m_renderInstanced = renderInstanced;
 						tinyObj->m_meshTransform = meshTransform;
 						tinyObj->m_glass = glass;
+						tinyObj->m_placements = forest.m_placements[mesh];
 						tinyObj->m_model = new TinyRender::Model();
 						tinyObj->m_model->shareFrom(*prototype.m_models[m]);
 						tinyObj->computeLocalAABB();
 						visuals->m_renderObjects.push_back(tinyObj);
 					}
-					b3VisualShapeData shape = prototype.m_shape;
+				}
+				b3VisualShapeData shape = visualShape;
+				if (first)
+				{
+					shape = first->m_shape;
 					shape.m_objectUniqueId = bodyUniqueId;
 					shape.m_linkIndex = linkIndex;
 					for (int i = 0; i < 7; i++)
 						shape.m_localVisualFrame[i] = visualShape.m_localVisualFrame[i];
-					for (int axis = 0; axis < 3; axis++)
-						shape.m_dimensions[axis] = vis->m_geometry.m_meshScale[axis];
-					btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
-					if (!shapes)
-					{
-						m_data->m_visualShapesMap.insert(shape.m_objectUniqueId, btAlignedObjectArray<b3VisualShapeData>());
-						shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
-					}
-					shapes->push_back(shape);
-					continue;
 				}
+				strncpy(shape.m_meshAssetFileName, vis->m_geometry.m_meshFileName.c_str(), VISUAL_SHAPE_MAX_PATH_LEN);
+				shape.m_meshAssetFileName[VISUAL_SHAPE_MAX_PATH_LEN - 1] = 0;
+				for (int axis = 0; axis < 3; axis++)
+					shape.m_dimensions[axis] = vis->m_geometry.m_meshScale[axis];
+				btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
+				if (!shapes)
+				{
+					m_data->m_visualShapesMap.insert(shape.m_objectUniqueId, btAlignedObjectArray<b3VisualShapeData>());
+					shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
+				}
+				shapes->push_back(shape);
+				continue;
 			}
-			const int firstObject = visuals->m_renderObjects.size();
 			btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 			{
 				B3_PROFILE("convertURDFToVisualShape");
@@ -1273,17 +1458,6 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			{
 				visualShape.m_tinyRendererTextureId = m_data->m_textures.size();
 				m_data->m_textures.push_back(textures[i]);
-			}
-			if (shareable && visuals->m_renderObjects.size() > firstObject)
-			{
-				InstancedPrototype& prototype = m_data->m_instancedPrototypes[prototypeKey];
-				for (int o = firstObject; o < visuals->m_renderObjects.size(); o++)
-				{
-					TinyRender::Model* kept = new TinyRender::Model();
-					kept->shareFrom(*visuals->m_renderObjects[o]->m_model);
-					prototype.m_models.push_back(kept);
-				}
-				prototype.m_shape = visualShape;
 			}
 			btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[visualShape.m_objectUniqueId];
 			if (!shapes)
@@ -1852,7 +2026,10 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 					modelM[i][j] = rec.m_modelMat[i + 4 * j];
 				}
 			TinyRender::Vec3f scaling(rec.m_scaling[0], rec.m_scaling[1], rec.m_scaling[2]);
-			TinyRenderer::renderObjectCameraDepthOnlyInto(*rec.m_obj, viewM, projM, modelM, scaling, zbuf, width, height);
+			if (rec.m_obj->m_placements.empty())
+				TinyRenderer::renderObjectCameraDepthOnlyInto(*rec.m_obj, viewM, projM, modelM, scaling, zbuf, width, height);
+			for (size_t p = 0; p * 12 < rec.m_obj->m_placements.size(); p++)
+				TinyRenderer::renderObjectCameraDepthOnlyInto(*rec.m_obj, viewM, projM, modelM * rec.m_obj->placementMatrix(p), scaling, zbuf, width, height);
 		}
 
 		int half = height >> 1;
@@ -2120,7 +2297,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 				renderObj->m_lightAmbientColor = ambientColor;
 				renderObj->m_lightDiffuseCoeff = lightDiffuseCoeff;
 				renderObj->m_lightSpecularCoeff = lightSpecularCoeff;
-				TinyRenderer::renderObjectDepth(*renderObj);
+				drawPlacements(*renderObj, TinyRenderer::renderObjectDepth);
 			}
 		}
 	}
@@ -2239,14 +2416,14 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 				{
 					renderObj->m_segmentationMaskBufferPtr = 0;
 				}
-				TinyRenderer::renderObjectCameraDepthOnly(*renderObj);
+				drawPlacements(*renderObj, TinyRenderer::renderObjectCameraDepthOnly);
 				renderObj->m_segmentationMaskBufferPtr = savedSegPtr;
 			}
 			else
 			{
 				renderObj->m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 				renderObj->m_glint = glint;
-				TinyRenderer::renderObject(*renderObj);
+				drawPlacements(*renderObj, TinyRenderer::renderObject);
 			}
 		}
 	}
