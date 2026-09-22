@@ -459,7 +459,8 @@ void TinyRenderObjectData::loadModel(const char* fileName, CommonFileIOInterface
 }
 
 void TinyRenderObjectData::registerMeshShape(const float* vertices, int numVertices, const int* indices, int numIndices, const float rgbaColor[4],
-											 unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha)
+											 unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha,
+											 const char* textureName)
 {
 	if (0 == m_model)
 	{
@@ -469,11 +470,11 @@ void TinyRenderObjectData::registerMeshShape(const float* vertices, int numVerti
 			m_model = new Model();
 			m_model->setColorRGBA(rgbaColor);
 		}
-		if (textureImage)
+		if (textureImage || (textureName && textureName[0]))
 		{
 			{
 				B3_PROFILE("setDiffuseTextureFromData");
-				m_model->setDiffuseTextureFromData(textureImage, textureWidth, textureHeight, textureAlpha);
+				m_model->setDiffuseTextureFromData(textureImage, textureWidth, textureHeight, textureAlpha, textureName);
 			}
 		}
 		else

@@ -112,8 +112,11 @@ struct TinyRenderObjectData
 
 	void loadModel(const char* fileName, struct CommonFileIOInterface* fileIO);
 	void createCube(float HalfExtentsX, float HalfExtentsY, float HalfExtentsZ, struct CommonFileIOInterface* fileIO=0);
+	// textureName is the file the texels came from: with one the renderer keeps a single copy per name
+	// and the caller may drop its own, and textureImage may be 0 when that copy already exists.
 	void registerMeshShape(const float* vertices, int numVertices, const int* indices, int numIndices, const float rgbaColor[4],
-						   unsigned char* textureImage = 0, int textureWidth = 0, int textureHeight = 0, const unsigned char* textureAlpha = 0);
+						   unsigned char* textureImage = 0, int textureWidth = 0, int textureHeight = 0, const unsigned char* textureAlpha = 0,
+						   const char* textureName = 0);
 
 	void registerMesh2(btAlignedObjectArray<btVector3>& vertices, btAlignedObjectArray<btVector3>& normals, btAlignedObjectArray<int>& indices, struct CommonFileIOInterface* fileIO);
 

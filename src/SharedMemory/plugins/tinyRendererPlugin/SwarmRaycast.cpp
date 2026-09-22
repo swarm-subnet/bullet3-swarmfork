@@ -99,9 +99,12 @@ struct StaticMember
 	unsigned m_geomId;
 	std::vector<float> m_vertices;
 	std::vector<unsigned> m_indices;
-	// Per-vertex unit normals already in world space, and uv pairs, indexed like m_vertices.
+	// Per-vertex unit normals already in world space, indexed like m_vertices.
 	std::vector<float> m_normals;
-	std::vector<float> m_uvs;
+	// uv pairs indexed like m_vertices: the model's own array when its corners are indexed by vertex,
+	// which never moves once a mesh is registered, and m_uvsOwned when they have to be gathered.
+	const float* m_uvs;
+	std::vector<float> m_uvsOwned;
 	const void* m_meshKey;
 	float m_transform[16];
 	// Row-major rotation of the body: what TinyRenderer's inverse-transpose model matrix does to a normal.
@@ -188,7 +191,7 @@ struct QueryContext
 
 // True when the hit lands on a texel the texture marks as see-through. The uv is accumulated in the
 // same order as the shader, so the texel tested here is the texel the colour would read.
-bool cutOut(const TinyRender::Model* model, const std::vector<float>& uvs, const std::vector<unsigned>& indices, const RTCHit* hit)
+bool cutOut(const TinyRender::Model* model, const float* uvs, const std::vector<unsigned>& indices, const RTCHit* hit)
 {
 	const unsigned* ids = &indices[(size_t)hit->primID * 3];
 	const float weights[3] = {1.0f - hit->u - hit->v, hit->u, hit->v};
@@ -236,7 +239,7 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		return;
 	if (!inst->m_doubleSided && facing * inst->m_facingSign >= 0.0f)
 		args->valid[0] = 0;
-	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs, inst->m_tree->m_indices, hit))
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
 }
 
@@ -260,7 +263,7 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		return;
 	}
 	const Instance* inst = hitInstance(ctx, hit);
-	if (inst && inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs, inst->m_tree->m_indices, hit))
+	if (inst && inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
 }
 
@@ -331,7 +334,8 @@ void copyIndices(TinyRender::Model* model, std::vector<unsigned>& out)
 	out.resize((size_t)numFaces * 3);
 	for (int f = 0; f < numFaces; f++)
 	{
-		std::vector<int> face = model->face(f);
+		int face[3];
+		model->faceVertices(f, face);
 		for (int j = 0; j < 3; j++)
 			out[(size_t)f * 3 + j] = (unsigned)face[j];
 	}
@@ -342,21 +346,26 @@ void copyIndices(TinyRender::Model* model, std::vector<unsigned>& out)
 // attributes. Normals are rotated into world space when a rotation is given. A model without normals
 // leaves the normal block empty and shades with the face normal instead.
 void copyAttributes(TinyRender::Model* model, const std::vector<unsigned>& indices, const float rotation[9],
-					std::vector<float>& normals, std::vector<float>& uvs)
+					std::vector<float>& normals, std::vector<float>& uvs, bool gatherUvs)
 {
 	const int numVerts = model->nverts();
 	const bool hasNormals = model->nnormals() > 0;
-	uvs.assign((size_t)numVerts * 2, 0.0f);
+	uvs.assign(gatherUvs ? (size_t)numVerts * 2 : 0, 0.0f);
 	normals.assign(hasNormals ? (size_t)numVerts * 3 : 0, 0.0f);
+	if (!gatherUvs && !hasNormals)
+		return;
 	for (size_t f = 0; f * 3 + 2 < indices.size(); f++)
 		for (int j = 0; j < 3; j++)
 		{
 			const unsigned v = indices[f * 3 + j];
 			if (v >= (unsigned)numVerts)
 				continue;
-			const TinyRender::Vec2f uv = model->uv((int)f, j);
-			uvs[(size_t)v * 2] = uv.x;
-			uvs[(size_t)v * 2 + 1] = uv.y;
+			if (gatherUvs)
+			{
+				const TinyRender::Vec2f uv = model->uv((int)f, j);
+				uvs[(size_t)v * 2] = uv.x;
+				uvs[(size_t)v * 2 + 1] = uv.y;
+			}
 			if (!hasNormals)
 				continue;
 			const TinyRender::Vec3f n = model->storedNormal((int)f, j);
@@ -860,7 +869,10 @@ struct SwarmRaycast::Data
 		member->m_retired = false;
 		copyWorldVertices(obj->m_model, worldTransform, localScaling, member->m_vertices);
 		copyIndices(obj->m_model, member->m_indices);
-		copyAttributes(obj->m_model, member->m_indices, member->m_rotation, member->m_normals, member->m_uvs);
+		// The model's uv array is already indexed by vertex for every mesh the plugin builds, so it is read, not copied.
+		const bool borrowUvs = obj->m_model->uvArray() != 0 && obj->m_model->uvIndexedByVertex();
+		copyAttributes(obj->m_model, member->m_indices, member->m_rotation, member->m_normals, member->m_uvsOwned, !borrowUvs);
+		member->m_uvs = borrowUvs ? obj->m_model->uvArray() : (member->m_uvsOwned.empty() ? 0 : &member->m_uvsOwned[0]);
 		member->m_geometry = newTriangles(m_device, member->m_vertices, member->m_indices);
 		rtcSetGeometryUserData(member->m_geometry, member);
 		rtcCommitGeometry(member->m_geometry);
@@ -884,7 +896,7 @@ struct SwarmRaycast::Data
 		tree->m_world = false;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
-		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs);
+		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true);
 		buildTree(*tree, 0);
 		m_trees[key] = tree;
 		return tree;
@@ -924,7 +936,7 @@ struct SwarmRaycast::Data
 			copyRotation(worldTransform, rotation);
 			copyWorldVertices(model, worldTransform, localScaling, tree->m_vertices);
 			copyIndices(model, tree->m_indices);
-			copyAttributes(model, tree->m_indices, rotation, tree->m_normals, tree->m_uvs);
+			copyAttributes(model, tree->m_indices, rotation, tree->m_normals, tree->m_uvs, true);
 		}
 		buildTree(*tree, &image);
 		if (!loaded)
@@ -952,7 +964,7 @@ struct SwarmRaycast::Data
 		if ((size_t)model->nverts() * 3 + kVertexPadding != tree.m_vertices.size())
 			return;
 		copyLocalVertices(model, tree.m_vertices);
-		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs);
+		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs, true);
 		rtcSetGeometryBuildQuality(tree.m_geometry, RTC_BUILD_QUALITY_REFIT);
 		rtcUpdateGeometryBuffer(tree.m_geometry, RTC_BUFFER_TYPE_VERTEX, 0);
 		rtcCommitGeometry(tree.m_geometry);
@@ -1398,7 +1410,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_glass = member->m_glass;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
-		surface->m_uvs = &member->m_uvs[0];
+		surface->m_uvs = member->m_uvs;
 		vertices = &member->m_vertices[0];
 		indices = &member->m_indices[0];
 	}
@@ -1416,7 +1428,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_glass = inst->m_glass;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
-		surface->m_uvs = &inst->m_tree->m_uvs[0];
+		surface->m_uvs = inst->m_tree->m_uvs.data();
 		vertices = &inst->m_tree->m_vertices[0];
 		indices = &inst->m_tree->m_indices[0];
 		transform = inst->m_transform;

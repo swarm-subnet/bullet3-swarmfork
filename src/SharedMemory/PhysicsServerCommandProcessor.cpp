@@ -2629,6 +2629,10 @@ struct ProgrammaticUrdfInterface : public URDFImporterInterface
 	virtual int convertLinkVisualShapes(int linkIndex, const char* pathPrefix, const btTransform& localInertiaFrame) const
 	{
 		int graphicsIndex = -1;
+		// Everything below feeds a graphics instance, and without a renderer there is none to feed: the
+		// mesh and its texture would be read again for every body that shares this visual shape.
+		if (!m_data->m_guiHelper->getRenderInterface())
+			return graphicsIndex;
 		double globalScaling = 1.f;  //todo!
 		int flags = 0;
 		CommonFileIOInterface* fileIO = m_data->m_pluginManager.getFileIOInterface();
