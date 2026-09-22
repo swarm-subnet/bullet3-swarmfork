@@ -904,6 +904,9 @@ enum EnumRendererAuxFlags
 	ER_SWARM_LINEAR_LIGHT = 4096,
 	// Ray-cast colour path: sky light by direction, a real sun, coated glass, soft two-grid shadows, footprint taps, haze, leaf light, a film curve; sky from ER_SWARM_SKY_SUN or a photo.
 	ER_SWARM_DAYLIGHT = 8192,
+	// Ray-cast shadows: a double-sided cut-out surface, a leaf or grass card, casts none, so a crown of
+	// cards is lit as one crown and not as a stack of blinds; it still receives every other shadow.
+	ER_SWARM_LEAF_NO_SHADOW = 16384,
 };
 
 ///flags to pick the IK solver and other options

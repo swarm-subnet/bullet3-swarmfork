@@ -29,6 +29,8 @@ struct SwarmRaycastShading
 	// changes; a body that moves or is hidden has only its own cells recast. Movers cast no shadow
 	// from the map itself.
 	bool m_shadowMap;
+	// Shadow rays and the map pass through double-sided cut-out surfaces, the leaf and grass cards.
+	bool m_leafNoShadow;
 	// With m_shadowMap: a hit the map calls lit also casts one occlusion ray against the small tree of
 	// the bodies that moved since the world was built, so movers cast shadows that follow them.
 	bool m_moverShadow;
