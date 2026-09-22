@@ -98,6 +98,9 @@ public:
 	bool hasAlpha() const;
 	// Alpha of the texel diffuse(uv) reads, 255 when the texture carries no alpha plane.
 	unsigned char alpha(Vec2f uv) const;
+	// Alpha averaged over a footprint of footprintUv2 in uv units squared, read from the halved alpha planes built with
+	// the mips; the plain texel when the footprint is one texel or less, or the chain is not built.
+	unsigned char alphaFiltered(Vec2f uv, float footprintUv2) const;
 	// Builds the mip chain now, so later diffuseFiltered calls only read; safe to call from many threads after this.
 	void buildMipmaps();
 	float specular(Vec2f uv);

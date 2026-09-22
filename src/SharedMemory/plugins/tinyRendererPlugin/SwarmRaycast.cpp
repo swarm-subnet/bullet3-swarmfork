@@ -217,6 +217,9 @@ struct QueryContext
 	bool m_alphaCutout;
 	// Set when leaf cards cast no shadow: the map rays and the occlusion rays pass through them.
 	bool m_leafNoShadow;
+	// Angle one pixel spans on the filtered camera rays, 0 on every other ray: a cut-out is then read over the
+	// pixel's footprint instead of one texel, so a far chain-link or leaf card fades instead of breaking into moire.
+	float m_pixelSpread;
 };
 
 // A double-sided cut-out surface is a leaf or grass card, which casts nothing when leaf shadows are off.
@@ -238,6 +241,45 @@ bool cutOut(const TinyRender::Model* model, const float* uvs, const std::vector<
 		uv.y += uvs[(size_t)ids[j] * 2 + 1] * weights[j];
 	}
 	return model->alpha(uv) < kAlphaCutoff;
+}
+
+// The same test read over the pixel's footprint. In the hit's own frame the ray's length times the pixel angle is the
+// footprint's width, stretched by the grazing angle; the triangle's uv area over its area turns that into uv units.
+bool cutOutAt(const TinyRender::Model* model, const float* vertices, const float* uvs, const std::vector<unsigned>& indices,
+			  const RTCHit* hit, const RTCRay* ray, float spread)
+{
+	if (!(spread > 0.0f))
+		return cutOut(model, uvs, indices, hit);
+	const unsigned* ids = &indices[(size_t)hit->primID * 3];
+	const float weights[3] = {1.0f - hit->u - hit->v, hit->u, hit->v};
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	for (int j = 0; j < 3; j++)
+	{
+		uv.x += uvs[(size_t)ids[j] * 2] * weights[j];
+		uv.y += uvs[(size_t)ids[j] * 2 + 1] * weights[j];
+	}
+	const float* p0 = vertices + (size_t)ids[0] * 3;
+	const float* p1 = vertices + (size_t)ids[1] * 3;
+	const float* p2 = vertices + (size_t)ids[2] * 3;
+	const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+	const float e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+	float cross[3];
+	cross3(e1, e2, cross);
+	const float area2 = sqrtf(dot3(cross, cross));
+	const float* t0 = uvs + (size_t)ids[0] * 2;
+	const float* t1 = uvs + (size_t)ids[1] * 2;
+	const float* t2 = uvs + (size_t)ids[2] * 2;
+	const float uvArea2 = fabsf((t1[0] - t0[0]) * (t2[1] - t0[1]) - (t2[0] - t0[0]) * (t1[1] - t0[1]));
+	const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
+	const float length = sqrtf(dot3(dir, dir));
+	const float normal[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
+	const float normalLength = sqrtf(dot3(normal, normal));
+	if (!(area2 > 0.0f) || !(length > 0.0f) || !(normalLength > 0.0f))
+		return cutOut(model, uvs, indices, hit);
+	float grazing = fabsf(dot3(dir, normal)) / (length * normalLength);
+	grazing = grazing > 0.05f ? grazing : 0.05f;
+	const float width = ray->tfar * length * spread;
+	return model->alphaFiltered(uv, width * width / grazing * (uvArea2 / area2)) < kAlphaCutoff;
 }
 
 // The instance a hit belongs to, or null for the static tree and for an id the scene does not know.
@@ -286,7 +328,8 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 			args->valid[0] = 0;
 		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(member->m_doubleSided, member->m_hasAlpha))
 			args->valid[0] = 0;
-		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
+		else if (member->m_hasAlpha && ctx->m_alphaCutout &&
+				 cutOutAt(member->m_obj->m_model, member->m_vertices.data(), member->m_uvs, member->m_indices, hit, ray, ctx->m_pixelSpread))
 			args->valid[0] = 0;
 		return;
 	}
@@ -298,7 +341,9 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 			args->valid[0] = 0;
 		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
 			args->valid[0] = 0;
-		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit))
+		else if (batch->m_hasAlpha && ctx->m_alphaCutout &&
+				 cutOutAt(batch->m_obj->m_model, batch->m_tree->m_vertices.data(), batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit,
+						  ray, ctx->m_pixelSpread))
 			args->valid[0] = 0;
 		return;
 	}
@@ -309,7 +354,9 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 	else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
-	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout &&
+			 cutOutAt(inst->m_obj->m_model, inst->m_tree->m_vertices.data(), inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit, ray,
+					  ctx->m_pixelSpread))
 		args->valid[0] = 0;
 }
 
@@ -774,6 +821,7 @@ struct SwarmRaycast::Data
 			ctx.m_anyWinding = true;
 			ctx.m_alphaCutout = map.m_alphaCutout;
 			ctx.m_leafNoShadow = map.m_leafNoShadow;
+			ctx.m_pixelSpread = 0.0f;
 			RTCIntersectArguments args;
 			rtcInitIntersectArguments(&args);
 			args.context = &ctx.m_context;
@@ -2190,6 +2238,8 @@ struct TileJob
 	int m_width;
 	int m_height;
 	bool m_filtered;
+	// Angle one pixel spans, for the cut-out footprint; 0 unless textures are filtered.
+	float m_pixelSpread;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -2891,6 +2941,18 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			setup.m_stepY[k] = (float)((setup.m_cam.m_far[2][k] - setup.m_cam.m_near[2][k]) * (2.0 / (double)height));
 		}
 	}
+	job.m_pixelSpread = 0.0f;
+	if (job.m_filtered && numTargets > 0 && setups[0].m_valid)
+	{
+		double step = 0.0, centre = 0.0;
+		for (int k = 0; k < 3; k++)
+		{
+			step += (double)setups[0].m_stepX[k] * setups[0].m_stepX[k];
+			const double axis = setups[0].m_cam.m_far[0][k] - setups[0].m_cam.m_near[0][k];
+			centre += axis * axis;
+		}
+		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
+	}
 
 	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias) ? (size_t)numTargets : 0);
 	for (size_t i = 0; i < scratch.size(); i++)
@@ -2929,6 +2991,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_anyWinding = false;
 		ctx.m_alphaCutout = alphaCutout;
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
+		ctx.m_pixelSpread = job.m_pixelSpread;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;

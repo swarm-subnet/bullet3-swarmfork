@@ -43,6 +43,10 @@ struct SharedTexture
 	bool mipsBuilt_;
 	// One byte per texel in img_'s row order, empty for an opaque texture.
 	std::vector<unsigned char> alpha_;
+	// The alpha plane halved like mips_, with each level's width and height, built in the same pass.
+	std::vector<std::vector<unsigned char> > alphaMips_;
+	std::vector<int> alphaMipW_;
+	std::vector<int> alphaMipH_;
 
 	SharedTexture() : source_(0), refs_(1), registered_(false), mipsBuilt_(false) {}
 	~SharedTexture()
@@ -650,11 +654,39 @@ unsigned char Model::alpha(Vec2f uvf) const
 	return m_diffuse->alpha_[(size_t)y * w + x];
 }
 
-// Each level halves the one before with an integer 2x2 box average, down to 1x1.
+// Each level halves the one before with an integer 2x2 box average, down to 1x1; the alpha plane is halved alongside.
 // Odd sizes drop their last row or column, as a GPU would.
 static void buildMips(SharedTexture& tex)
 {
 	tex.mipsBuilt_ = true;
+	if (!tex.alpha_.empty())
+	{
+		int sw = tex.img_.get_width(), sh = tex.img_.get_height();
+		while (sw > 1 || sh > 1)
+		{
+			const int dw = sw > 1 ? sw >> 1 : 1;
+			const int dh = sh > 1 ? sh >> 1 : 1;
+			const std::vector<unsigned char>& src = tex.alphaMips_.empty() ? tex.alpha_ : tex.alphaMips_.back();
+			std::vector<unsigned char> dst((size_t)dw * dh);
+			for (int y = 0; y < dh; y++)
+			{
+				const int y0 = 2 * y;
+				const int y1 = (y0 + 1 < sh) ? y0 + 1 : y0;
+				for (int x = 0; x < dw; x++)
+				{
+					const int x0 = 2 * x;
+					const int x1 = (x0 + 1 < sw) ? x0 + 1 : x0;
+					dst[(size_t)y * dw + x] = (unsigned char)((src[(size_t)y0 * sw + x0] + src[(size_t)y0 * sw + x1] +
+															   src[(size_t)y1 * sw + x0] + src[(size_t)y1 * sw + x1] + 2) >> 2);
+				}
+			}
+			tex.alphaMips_.push_back(dst);
+			tex.alphaMipW_.push_back(dw);
+			tex.alphaMipH_.push_back(dh);
+			sw = dw;
+			sh = dh;
+		}
+	}
 	for (;;)
 	{
 		TGAImage& src = tex.mips_.empty() ? tex.img_ : *tex.mips_[tex.mips_.size() - 1];
@@ -813,6 +845,28 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	for (int i = 0; i < (int)bytespp; i++)
 		out.bgra[i] = (unsigned char)((sum[i] + taps / 2) / taps);
 	return out;
+}
+
+unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2) const
+{
+	if (!hasAlpha() || !m_diffuse->mipsBuilt_ || m_diffuse->alphaMips_.empty())
+		return alpha(uvf);
+	const float rho2 = footprintUv2 * (float)m_diffuse->img_.get_width() * (float)m_diffuse->img_.get_height();
+	if (!(rho2 > 4.0f))
+		return alpha(uvf);
+	int level = (int)(0.5f * log2f(rho2));
+	const int last = (int)m_diffuse->alphaMips_.size();
+	level = level > last ? last : level;
+	const std::vector<unsigned char>& plane = m_diffuse->alphaMips_[(size_t)level - 1];
+	const int w = m_diffuse->alphaMipW_[(size_t)level - 1], h = m_diffuse->alphaMipH_[(size_t)level - 1];
+	const float x = wrapUnit(uvf[0]) * w - 0.5f, y = wrapUnit(uvf[1]) * h - 0.5f;
+	const float fx = std::floor(x), fy = std::floor(y);
+	const float ax = x - fx, ay = y - fy;
+	const int x0 = ((int)fx % w + w) % w, y0 = ((int)fy % h + h) % h;
+	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1, y1 = (y0 + 1 == h) ? 0 : y0 + 1;
+	const float top = plane[(size_t)y0 * w + x0] * (1.f - ax) + plane[(size_t)y0 * w + x1] * ax;
+	const float bottom = plane[(size_t)y1 * w + x0] * (1.f - ax) + plane[(size_t)y1 * w + x1] * ax;
+	return (unsigned char)(top * (1.f - ay) + bottom * ay + 0.5f);
 }
 
 void Model::buildMipmaps()
