@@ -22,6 +22,9 @@ subject to the following restrictions:
 #include "../../../../examples/CommonInterfaces/CommonGUIHelperInterface.h"
 #include "Bullet3Common/b3FileUtils.h"
 #include <string>
+#include <map>
+#include <vector>
+#include <cstdio>
 #include "../../../../examples/Utils/b3ResourcePath.h"
 #include "../../../TinyRenderer/TinyRenderer.h"
 #include "SwarmSky.h"
@@ -92,9 +95,18 @@ struct TinyRendererObjectArray
 #define START_WIDTH 640
 #define START_HEIGHT 480
 
+// The converted render objects of one instanced mesh, kept so the next body that loads the same file and look
+// borrows their mesh and texture instead of parsing, building and hashing every triangle again.
+struct InstancedPrototype
+{
+	std::vector<TinyRender::Model*> m_models;
+	b3VisualShapeData m_shape;
+};
+
 struct TinyRendererVisualShapeConverterInternalData
 {
 	btHashMap<btHashInt, TinyRendererObjectArray*> m_swRenderInstances;
+	std::map<std::string, InstancedPrototype> m_instancedPrototypes;
 
 	// Maps bodyUniqueId to a list of visual shapes belonging to the body.
 	btHashMap<btHashInt, btAlignedObjectArray<b3VisualShapeData> > m_visualShapesMap;
@@ -1042,6 +1054,64 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			bool renderInstanced = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_INSTANCED) != 0;
 			bool renderTreeCache = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_TREE_CACHE) != 0;
 			bool glass = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS) != 0;
+
+			TinyRender::Matrix meshTransform = TinyRender::Matrix::identity();
+			if (renderInstanced)
+			{
+				btScalar frame[16];
+				(localInertiaFrame.inverse() * childTrans).getOpenGLMatrix(frame);
+				for (int r = 0; r < 4; r++)
+					for (int c = 0; c < 4; c++)
+						meshTransform[r][c] = (float)frame[c * 4 + r] *
+							((c < 3 && vis->m_geometry.m_type == URDF_GEOM_MESH) ? (float)vis->m_geometry.m_meshScale[c] : 1.0f);
+			}
+
+			// An instanced mesh converts to the same canonical render objects whatever its pose and scale, so the
+			// file, the flags and the look are the whole key.
+			const bool shareable = renderInstanced && vis->m_geometry.m_type == URDF_GEOM_MESH;
+			std::string prototypeKey;
+			if (shareable)
+			{
+				char look[320];
+				snprintf(look, sizeof(look), "|%d|%d|%a|%a|%a|%a|%a|%a|%a", linkPtr->m_visualArray[v1].m_flags, m_data->m_flags,
+						 rgbaColor[0], rgbaColor[1], rgbaColor[2], rgbaColor[3],
+						 (double)specularColor[0], (double)specularColor[1], (double)specularColor[2]);
+				prototypeKey = std::string(pathPrefix ? pathPrefix : "") + "|" + vis->m_geometry.m_meshFileName + look;
+				std::map<std::string, InstancedPrototype>::iterator found = m_data->m_instancedPrototypes.find(prototypeKey);
+				if (found != m_data->m_instancedPrototypes.end())
+				{
+					const InstancedPrototype& prototype = found->second;
+					for (size_t m = 0; m < prototype.m_models.size(); m++)
+					{
+						TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
+						tinyObj->m_doubleSided = doubleSided;
+						tinyObj->m_renderTreeCache = renderTreeCache;
+						tinyObj->m_renderInstanced = renderInstanced;
+						tinyObj->m_meshTransform = meshTransform;
+						tinyObj->m_glass = glass;
+						tinyObj->m_model = new TinyRender::Model();
+						tinyObj->m_model->shareFrom(*prototype.m_models[m]);
+						tinyObj->computeLocalAABB();
+						visuals->m_renderObjects.push_back(tinyObj);
+					}
+					b3VisualShapeData shape = prototype.m_shape;
+					shape.m_objectUniqueId = bodyUniqueId;
+					shape.m_linkIndex = linkIndex;
+					for (int i = 0; i < 7; i++)
+						shape.m_localVisualFrame[i] = visualShape.m_localVisualFrame[i];
+					for (int axis = 0; axis < 3; axis++)
+						shape.m_dimensions[axis] = vis->m_geometry.m_meshScale[axis];
+					btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
+					if (!shapes)
+					{
+						m_data->m_visualShapesMap.insert(shape.m_objectUniqueId, btAlignedObjectArray<b3VisualShapeData>());
+						shapes = m_data->m_visualShapesMap[shape.m_objectUniqueId];
+					}
+					shapes->push_back(shape);
+					continue;
+				}
+			}
+			const int firstObject = visuals->m_renderObjects.size();
 			btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 			{
 				B3_PROFILE("convertURDFToVisualShape");
@@ -1106,17 +1176,6 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			rgbaColor[1] = visualShape.m_rgbaColor[1];
 			rgbaColor[2] = visualShape.m_rgbaColor[2];
 			rgbaColor[3] = visualShape.m_rgbaColor[3];
-
-			TinyRender::Matrix meshTransform = TinyRender::Matrix::identity();
-			if (renderInstanced)
-			{
-				btScalar frame[16];
-				(localInertiaFrame.inverse() * childTrans).getOpenGLMatrix(frame);
-				for (int r = 0; r < 4; r++)
-					for (int c = 0; c < 4; c++)
-						meshTransform[r][c] = (float)frame[c * 4 + r] *
-							((c < 3 && vis->m_geometry.m_type == URDF_GEOM_MESH) ? (float)vis->m_geometry.m_meshScale[c] : 1.0f);
-			}
 
 			if (vertices.size() && indices.size() && materialGroups.size())
 			{
@@ -1214,6 +1273,17 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			{
 				visualShape.m_tinyRendererTextureId = m_data->m_textures.size();
 				m_data->m_textures.push_back(textures[i]);
+			}
+			if (shareable && visuals->m_renderObjects.size() > firstObject)
+			{
+				InstancedPrototype& prototype = m_data->m_instancedPrototypes[prototypeKey];
+				for (int o = firstObject; o < visuals->m_renderObjects.size(); o++)
+				{
+					TinyRender::Model* kept = new TinyRender::Model();
+					kept->shareFrom(*visuals->m_renderObjects[o]->m_model);
+					prototype.m_models.push_back(kept);
+				}
+				prototype.m_shape = visualShape;
 			}
 			btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[visualShape.m_objectUniqueId];
 			if (!shapes)
@@ -2395,6 +2465,11 @@ void TinyRendererVisualShapeConverter::resetAll()
 			delete ptr;
 		}
 	}
+
+	for (std::map<std::string, InstancedPrototype>::iterator it = m_data->m_instancedPrototypes.begin(); it != m_data->m_instancedPrototypes.end(); ++it)
+		for (size_t m = 0; m < it->second.m_models.size(); m++)
+			delete it->second.m_models[m];
+	m_data->m_instancedPrototypes.clear();
 
 	// A photo sky reads the texture bytes freed below; a later texture may land at the same address.
 	m_data->m_sunSky.forgetPhoto();
