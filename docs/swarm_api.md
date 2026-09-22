@@ -83,6 +83,9 @@ Passed in `flags=` of `createVisualShape` and `changeVisualShape`; `loadURDF` ha
 | `URDF_USE_MATERIALS_FROM_MTL` | 1 << 24 | `loadURDF` | Sets the flag above on every visual of the loaded URDF | same | [#6](https://github.com/swarm-subnet/bullet3-swarmfork/pull/6) |
 | `VISUAL_SHAPE_RENDER_TREE_CACHE` | 32 | create | A static body gets its own world-space ray-cast tree, saved as `<SWARM_BVH_CACHE_DIR>/<key>.rtree` (key: mesh content hash, body transform, scale) and loaded on the next process; needs the folder to be set; a body that moves later drops the tree and carries on as a mover | first ray-cast frame on the solar park 489 ms unflagged, 813 ms cold write, 222 ms warm load; 80 MB of files for its seven pieces | [#19](https://github.com/swarm-subnet/bullet3-swarmfork/pull/19) |
 | `VISUAL_SHAPE_GLASS` | 64 | create, change | A thin pane on the ray-cast path under `ER_SWARM_DAYLIGHT`: the pixel is the sky mirrored in the pane by the Fresnel of its two faces (plain glass, about 8 % head-on, all mirror when the view grazes) plus, for the rest, what the same ray meets behind the pane shaded as any hit and tinted by the pane's colour and texture; the ray passes up to three panes, so a cab is seen through both its windows; depth, mask and shadows keep the first pane as a surface; without the daylight model the bit does nothing | one more ray and one more shade on the pixels that land on glass; nothing elsewhere | [#28](https://github.com/swarm-subnet/bullet3-swarmfork/pull/28) |
+| `VISUAL_SHAPE_RENDER_INSTANCED` | 128 | create; ray cast in `SwarmRaycast.cpp` | One local-space tree per mesh content hash, shared across body poses and mesh scales; the visual frame and scale live on the instance, normals use the inverse transpose, and material groups remain separate instances. These bodies cast into the shadow map without mover shadow rays; moving, hiding, retexturing or removing one recasts the whole map, so the flag is for bodies that stay put, never for movers. Takes precedence over the disk tree cache on that body; no disk files | 200 placements of one synthetic 60,000-triangle OBJ, 256 px, 4 threads, separate processes: peak RSS 2188.1 MB unflagged, 114.7 MB instanced (94.8 % less); five mesh scales share the same tree | pending PR (no PR opened) |
+
+The next free visual shape flag is 256.
 
 The `loadURDF` flag enum in full. Only the last row is the fork's; the rest is upstream and listed so a new bit is never taken twice:
 
@@ -173,6 +176,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `edgeAntialiasTest.py` | `ER_EDGE_ANTIALIAS`, depth and mask unchanged |
 | `alphaCutoutTest.py` | `ER_ALPHA_CUTOUT` in colour, depth, shadow ray and shadow map |
 | `glintTest.py` | `ER_SPECULAR_GLINT`, `specularColor` reaching the renderer |
+| `instancedStaticTest.py` | `VISUAL_SHAPE_RENDER_INSTANCED`: identical single-body buffers, shadow maps and rays, leaf cut-outs, glass, movement and removal, scale sharing, isolated peak RSS and thread identity |
 | `renderTreeCacheTest.py` | `VISUAL_SHAPE_RENDER_TREE_CACHE` |
 | `skySunTest.py` | `ER_SWARM_SKY_SUN`, `skyCloudSeed`, both paths paint the same sky |
 | `shadowLightCoeffTest.py` | `shadowLightCoeff` |

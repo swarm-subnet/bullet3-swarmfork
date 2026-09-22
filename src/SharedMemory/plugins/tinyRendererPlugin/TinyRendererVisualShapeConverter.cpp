@@ -1039,12 +1039,27 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 
 			bool doubleSided = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY) != 0;
 			bool materialsFromMtl = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_MATERIALS_FROM_MTL) != 0;
+			bool renderInstanced = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_INSTANCED) != 0;
 			bool renderTreeCache = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_TREE_CACHE) != 0;
 			bool glass = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS) != 0;
 			btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 			{
 				B3_PROFILE("convertURDFToVisualShape");
-				convertURDFToVisualShape(vis, pathPrefix, localInertiaFrame.inverse() * childTrans, vertices, indices, textures, visualShape, fileIO, m_data->m_flags, materialsFromMtl ? &materialGroups : 0);
+				// Keep scale and visual pose out of the mesh hash for shared local trees.
+				UrdfShape canonical;
+				const UrdfShape* source = vis;
+				btTransform visualTransform = localInertiaFrame.inverse() * childTrans;
+				if (renderInstanced)
+				{
+					canonical = *vis;
+					canonical.m_geometry.m_meshScale.setValue(1, 1, 1);
+					source = &canonical;
+					visualTransform.setIdentity();
+				}
+				convertURDFToVisualShape(source, pathPrefix, visualTransform, vertices, indices, textures, visualShape, fileIO, m_data->m_flags, materialsFromMtl ? &materialGroups : 0);
+				if (renderInstanced && vis->m_geometry.m_type == URDF_GEOM_MESH)
+					for (int axis = 0; axis < 3; axis++)
+						visualShape.m_dimensions[axis] = vis->m_geometry.m_meshScale[axis];
 				if ((vis->m_geometry.m_type == URDF_GEOM_PLANE) || (vis->m_geometry.m_type == URDF_GEOM_HEIGHTFIELD))
 				{
 					int texWidth = 1024;
@@ -1092,6 +1107,17 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			rgbaColor[2] = visualShape.m_rgbaColor[2];
 			rgbaColor[3] = visualShape.m_rgbaColor[3];
 
+			TinyRender::Matrix meshTransform = TinyRender::Matrix::identity();
+			if (renderInstanced)
+			{
+				btScalar frame[16];
+				(localInertiaFrame.inverse() * childTrans).getOpenGLMatrix(frame);
+				for (int r = 0; r < 4; r++)
+					for (int c = 0; c < 4; c++)
+						meshTransform[r][c] = (float)frame[c * 4 + r] *
+							((c < 3 && vis->m_geometry.m_type == URDF_GEOM_MESH) ? (float)vis->m_geometry.m_meshScale[c] : 1.0f);
+			}
+
 			if (vertices.size() && indices.size() && materialGroups.size())
 			{
 				// one render object per material, all under the same body and link
@@ -1117,6 +1143,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 					tinyObj->m_doubleSided = doubleSided;
 					tinyObj->m_renderTreeCache = renderTreeCache;
+					tinyObj->m_renderInstanced = renderInstanced;
+					tinyObj->m_meshTransform = meshTransform;
 					tinyObj->m_glass = glass;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
 						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
@@ -1147,6 +1175,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 				TinyRenderObjectData* tinyObj = new TinyRenderObjectData(m_data->m_rgbColorBuffer, m_data->m_depthBuffer, &m_data->m_shadowBuffer, &m_data->m_segmentationMaskBuffer, bodyUniqueId, linkIndex);
 				tinyObj->m_doubleSided = doubleSided;
 				tinyObj->m_renderTreeCache = renderTreeCache;
+				tinyObj->m_renderInstanced = renderInstanced;
+				tinyObj->m_meshTransform = meshTransform;
 				tinyObj->m_glass = glass;
 				unsigned char* textureImage1 = 0;
 				const unsigned char* textureAlpha = 0;
@@ -1606,6 +1636,18 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 				rec.m_modelMat[m] = (float)glMat[m];
 			}
 			rec.m_scaling = visualArray->m_localScaling;
+			if (rec.m_obj->m_renderInstanced)
+			{
+				for (int r = 0; r < 4; r++)
+					for (int c = 0; c < 4; c++)
+						rec.m_obj->m_modelMatrix[r][c] = rec.m_modelMat[c * 4 + r];
+				rec.m_obj->m_localScaling = rec.m_scaling;
+				rec.m_obj->applyMeshTransform();
+				for (int r = 0; r < 4; r++)
+					for (int c = 0; c < 4; c++)
+						rec.m_modelMat[c * 4 + r] = rec.m_obj->m_modelMatrix[r][c];
+				rec.m_scaling.setValue(1, 1, 1);
+			}
 			rec.m_hasAABB = rec.m_obj->m_hasLocalAABB;
 			if (rec.m_hasAABB)
 			{
@@ -2000,6 +2042,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 					}
 				}
 				renderObj->m_localScaling = visualArray->m_localScaling;
+				renderObj->applyMeshTransform();
 				renderObj->m_lightDirWorld = lightDirWorld;
 				renderObj->m_lightColor = lightColor;
 				renderObj->m_lightDistance = lightDistance;
@@ -2059,7 +2102,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			const btTransform& tr = visualArray->m_worldTransform;
 			tr.getOpenGLMatrix(modelMat);
 
-			if (renderObj->m_hasLocalAABB)
+			if (renderObj->m_hasLocalAABB && !renderObj->m_renderInstanced)
 			{
 				const btVector3& ls = visualArray->m_localScaling;
 				btVector3 sMin, sMax;
@@ -2110,6 +2153,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 				}
 			}
 			renderObj->m_localScaling = visualArray->m_localScaling;
+			renderObj->applyMeshTransform();
 			renderObj->m_lightDirWorld = lightDirWorld;
 			renderObj->m_lightColor = lightColor;
 			renderObj->m_lightDistance = lightDistance;
@@ -2395,10 +2439,12 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 						if (textureUniqueId >= 0)
 						{
 							const MyTexture2& tex = m_data->m_textures[textureUniqueId];
+							renderObj->m_textureRevision++;
 							renderObj->m_model->setDiffuseTextureFromData(tex.textureData1, tex.m_width, tex.m_height, tex.m_alpha, tex.m_name.c_str());
 						}
 						else
 						{
+							renderObj->m_textureRevision++;
 							renderObj->m_model->setDiffuseTextureFromData(0, 0, 0);
 						}
 					}

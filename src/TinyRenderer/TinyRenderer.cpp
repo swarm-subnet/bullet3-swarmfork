@@ -332,6 +332,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_objectIndex(-1),
 	  m_doubleSided(false),
 	  m_textureFilter(false),
+	  m_renderInstanced(false),
+	  m_textureRevision(0),
 	  m_renderTreeCache(false),
 	  m_glass(false)
 {
@@ -363,6 +365,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_linkIndex(linkIndex),
 	  m_doubleSided(false),
 	  m_textureFilter(false),
+	  m_renderInstanced(false),
+	  m_textureRevision(0),
 	  m_renderTreeCache(false),
 	  m_glass(false)
 {
@@ -393,6 +397,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_objectIndex(-1),
 	m_doubleSided(false),
 	  m_textureFilter(false),
+	  m_renderInstanced(false),
+	  m_textureRevision(0),
 	  m_renderTreeCache(false),
 	  m_glass(false)
 {
@@ -424,6 +430,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_objectIndex(objectIndex),
 	m_doubleSided(false),
 	  m_textureFilter(false),
+	  m_renderInstanced(false),
+	  m_textureRevision(0),
 	  m_renderTreeCache(false),
 	  m_glass(false)
 {
@@ -1101,4 +1109,17 @@ void TinyRenderer::renderObjectCameraDepthOnly(TinyRenderObjectData& renderData)
 			}
 		}
 	}
+}
+
+// Deferred visual transforms also place the canonical mesh on the raster path.
+void TinyRenderObjectData::applyMeshTransform()
+{
+	if (!m_renderInstanced)
+		return;
+	TinyRender::Matrix scaled = m_modelMatrix;
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 3; c++)
+			scaled[r][c] *= (float)m_localScaling[c];
+	m_modelMatrix = scaled * m_meshTransform;
+	m_localScaling.setValue(1, 1, 1);
 }
