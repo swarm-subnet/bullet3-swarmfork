@@ -21,7 +21,7 @@ OPEN = (slice(4, 20), slice(4, 20))
 
 @unittest.skipUnless(RAYCAST and DAYLIGHT and SKY and LEAF, "wheel without the leaf shadow flag")
 class TestLeafNoShadow(unittest.TestCase):
-  """A leaf card and a box above a white ground under a noon sun, rendered with the flag off and on."""
+  """A leaf card and a box above a white ground under a low sun, rendered with the flag off and on."""
 
   def setUp(self):
     """A DIRECT client, a temporary folder, the ground, a horizontal leaf card 1.5 m up and a box beside it."""
