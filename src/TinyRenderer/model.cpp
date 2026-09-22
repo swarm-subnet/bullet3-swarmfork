@@ -847,13 +847,17 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	return out;
 }
 
-unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2) const
+unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged) const
 {
+	if (averaged)
+		*averaged = false;
 	if (!hasAlpha() || !m_diffuse->mipsBuilt_ || m_diffuse->alphaMips_.empty())
 		return alpha(uvf);
 	const float rho2 = footprintUv2 * (float)m_diffuse->img_.get_width() * (float)m_diffuse->img_.get_height();
 	if (!(rho2 > 4.0f))
 		return alpha(uvf);
+	if (averaged)
+		*averaged = true;
 	int level = (int)(0.5f * log2f(rho2));
 	const int last = (int)m_diffuse->alphaMips_.size();
 	level = level > last ? last : level;

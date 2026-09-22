@@ -288,6 +288,44 @@ class TestDaylight(unittest.TestCase):
     self.assertLess(behind[hit].mean(), ahead[hit].mean())
     self.assertGreater(behind[hit].mean(), ahead[hit].mean() * 0.2)
 
+  def chain_link_card(self):
+    """A 60 by 20 m card of thin dark lines every 25 cm in front of the sky, 18 % of it wire; returns its body."""
+    tex = np.zeros((256, 256, 4), dtype=np.uint8)
+    tex[..., :3] = 60
+    lines = np.zeros((256, 256), dtype=bool)
+    for k in range(0, 256, 32):
+      lines[k:k + 3, :] = True
+      lines[:, k:k + 3] = True
+    tex[lines, 3] = 255
+    png = os.path.join(self.folder, "link.png")
+    write_png(png, tex)
+    obj = os.path.join(self.folder, "link.obj")
+    with open(obj, "w") as handle:
+      handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\nvt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
+                   "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
+    vis = p.createVisualShape(p.GEOM_MESH, fileName=obj, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0],
+                              flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+    uid = p.createMultiBody(0, -1, vis)
+    p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(png))
+    return uid
+
+  def test_far_chain_link_is_an_even_veil_and_near_stays_sharp(self):
+    """Far, thin wire darkens the sky behind it evenly by its coverage; per-texel reads break it up; near, lines stay crisp."""
+    eye, target, band = (0, -25, 10), (0, 0, 10), slice(40, 56)
+    sky, _, _ = self.render(eye=eye, target=target, flags=PICTURE | DAYLIGHT, sun=NOON)
+    card_id = self.chain_link_card()
+    veil, _, _ = self.render(eye=eye, target=target, flags=PICTURE | DAYLIGHT, sun=NOON)
+    point, _, _ = self.render(eye=eye, target=target, flags=(PICTURE & ~getattr(p, "ER_TEXTURE_FILTER", 0)) | DAYLIGHT, sun=NOON)
+    sky, veil, point = (a[band, :, 1].astype(float) for a in (sky, veil, point))
+    darkening = (sky - veil).mean()
+    self.assertGreater(darkening, 2.0)
+    self.assertLess(darkening, 0.5 * (sky.mean() - 60.0))
+    self.assertLess((veil - sky).std(), (point - sky).std() / 3.0)
+    near, _, seg = self.render(eye=(0, -0.5, 10), target=(0, 0, 10), flags=PICTURE | DAYLIGHT, sun=NOON)
+    card = seg == card_id
+    self.assertGreater(int(card.sum()), 0)
+    self.assertLess(int(card.sum()), card.size // 2)
+
   def test_threads_give_the_same_bytes(self):
     """The frame is byte-identical at every render thread count the build allows."""
     self.ground()
