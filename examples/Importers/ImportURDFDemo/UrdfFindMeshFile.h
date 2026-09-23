@@ -49,6 +49,10 @@ static bool UrdfFindMeshFile(
 	{
 		*out_type = UrdfGeometry::FILE_VTK;
 	}
+	else if (ext == ".fst")
+	{
+		*out_type = UrdfGeometry::FILE_FOREST;
+	}
 	else
 	{
 		b3Warning("%s: invalid mesh filename extension '%s'\n", error_message_prefix.c_str(), ext.c_str());

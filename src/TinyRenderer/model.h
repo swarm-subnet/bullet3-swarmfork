@@ -56,6 +56,8 @@ public:
 	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha = 0, const char* textureName = 0);
 	// Takes the texture already held under this file name; false when no owner is left to take it from.
 	bool shareDiffuseTextureByName(const char* textureName);
+	// Holds the other Model's mesh and texture by reference and copies its colours, with no mesh work at all.
+	void shareFrom(const Model& other);
 	// Vertex stride is 9 floats: xyz, w (ignored), normal xyz, uv.
 	void setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 	void reserveMemory(int numVertices, int numIndices);
@@ -96,6 +98,10 @@ public:
 	bool hasAlpha() const;
 	// Alpha of the texel diffuse(uv) reads, 255 when the texture carries no alpha plane.
 	unsigned char alpha(Vec2f uv) const;
+	// Alpha averaged over a footprint of footprintUv2 in uv units squared, read from the halved alpha planes built with
+	// the mips; the plain texel when the footprint is two texels or less, or the chain is not built. averaged, when
+	// given, says which of the two it was.
+	unsigned char alphaFiltered(Vec2f uv, float footprintUv2, bool* averaged = 0) const;
 	// Builds the mip chain now, so later diffuseFiltered calls only read; safe to call from many threads after this.
 	void buildMipmaps();
 	float specular(Vec2f uv);

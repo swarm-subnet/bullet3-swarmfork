@@ -904,6 +904,9 @@ enum EnumRendererAuxFlags
 	ER_SWARM_LINEAR_LIGHT = 4096,
 	// Ray-cast colour path: sky light by direction, a real sun, coated glass, soft two-grid shadows, footprint taps, haze, leaf light, a film curve; sky from ER_SWARM_SKY_SUN or a photo.
 	ER_SWARM_DAYLIGHT = 8192,
+	// Ray-cast shadows: a double-sided cut-out surface, a leaf or grass card, casts none, so a crown of
+	// cards is lit as one crown and not as a stack of blinds; it still receives every other shadow.
+	ER_SWARM_LEAF_NO_SHADOW = 16384,
 };
 
 ///flags to pick the IK solver and other options
@@ -1149,6 +1152,7 @@ enum eEnumUpdateVisualShapeFlags
 	eVISUAL_SHAPE_MATERIALS_FROM_MTL = 16,//one render object per OBJ material, colour and texture from the MTL
 	eVISUAL_SHAPE_RENDER_TREE_CACHE = 32,//ray-cast tree of a static body saved under SWARM_BVH_CACHE_DIR and loaded when present
 	eVISUAL_SHAPE_GLASS = 64,//thin glass under ER_SWARM_DAYLIGHT: the sky by Fresnel plus the view through, tinted by the colour
+	eVISUAL_SHAPE_RENDER_INSTANCED = 128,//share one local ray-cast mesh tree across poses and scales
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

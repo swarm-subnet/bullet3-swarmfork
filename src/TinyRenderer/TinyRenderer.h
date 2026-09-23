@@ -1,6 +1,7 @@
 #ifndef TINY_RENDERER_H
 #define TINY_RENDERER_H
 
+#include <vector>
 #include "geometry.h"
 #include "model.h"
 #include "Bullet3Common/b3AlignedObjectArray.h"
@@ -126,6 +127,14 @@ struct TinyRenderObjectData
 	int m_linkIndex;
 	bool m_doubleSided;
 	bool m_textureFilter;  // ER_TEXTURE_FILTER: bilinear + mipmap sampling instead of nearest texel
+	bool m_renderInstanced;  // Keep the mesh unscaled so placements share one ray-cast tree.
+	unsigned m_textureRevision;  // Retexturing invalidates a flagged placement's shadow map.
+	TinyRender::Matrix m_meshTransform;  // Visual frame and mesh scale deferred until placement.
+	void applyMeshTransform();
+	// A forest batch: 12 floats per placement of the mesh (3x4 column-major, inside m_meshTransform); empty for one body.
+	std::vector<float> m_placements;
+	// One placement as a full matrix, for the raster path that draws a batch once per placement.
+	TinyRender::Matrix placementMatrix(size_t index) const;
 	bool m_renderTreeCache;  // VISUAL_SHAPE_RENDER_TREE_CACHE: the ray-cast tree of this static body is kept on disk
 	bool m_glass;  // VISUAL_SHAPE_GLASS: a thin pane on the daylight path, sky by Fresnel plus the tinted view through
 	TinyRenderGlint m_glint;
