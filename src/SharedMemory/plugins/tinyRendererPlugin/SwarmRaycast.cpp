@@ -1773,7 +1773,8 @@ inline bool shadowMapBlocked(const ShadowMap& map, const float point[3], const f
 	return depth > map.m_depth[(size_t)(int)v * map.m_cols + (int)u] + map.m_cell;
 }
 
-// Lit share of a point from the nine cells around it, weighted 1-2-1 each way: a soft edge about one cell wide.
+// Lit share of a point from the nine cells around it, a tent two cells wide centred on the point itself, so the
+// edge slides with the point inside a cell instead of jumping cell by cell into a staircase.
 inline float shadowMapLit(const ShadowMap& map, const float point[3], const float unitNormal[3])
 {
 	if (!map.m_built)
@@ -1788,21 +1789,23 @@ inline float shadowMapLit(const ShadowMap& map, const float point[3], const floa
 	if (!(u >= 0.0f) || !(v >= 0.0f) || u >= (float)map.m_cols || v >= (float)map.m_rows)
 		return 1.0f;
 	const float depth = -dot3(rel, map.m_lightDir) - map.m_cell;
-	const int iu = (int)u, iv = (int)v;
-	static const int kWeights[3] = {1, 2, 1};
-	int lit = 0;
-	for (int dv = -1; dv <= 1; dv++)
+	const float su = u - 1.0f, sv = v - 1.0f;
+	const int iu = (int)floorf(su), iv = (int)floorf(sv);
+	const float fu = su - (float)iu, fv = sv - (float)iv;
+	const float weightU[3] = {0.5f * (1.0f - fu), 0.5f, 0.5f * fu};
+	const float weightV[3] = {0.5f * (1.0f - fv), 0.5f, 0.5f * fv};
+	float lit = 0.0f;
+	for (int dv = 0; dv < 3; dv++)
 	{
 		const int row = iv + dv;
-		for (int du = -1; du <= 1; du++)
+		for (int du = 0; du < 3; du++)
 		{
 			const int col = iu + du;
-			const int weight = kWeights[dv + 1] * kWeights[du + 1];
 			if (row < 0 || col < 0 || row >= map.m_rows || col >= map.m_cols || !(depth > map.m_depth[(size_t)row * map.m_cols + col]))
-				lit += weight;
+				lit += weightV[dv] * weightU[du];
 		}
 	}
-	return (float)lit * (1.0f / 16.0f);
+	return lit;
 }
 
 // Whether a point lies over the cells of a map, so the fine core grid can answer for it.

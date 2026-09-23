@@ -266,6 +266,20 @@ class TestDaylight(unittest.TestCase):
       between = int(((lum > dark + 5) & (lum < lit - 5)).sum())
       self.assertGreater(between, 0, core)
 
+  def test_shadow_edge_moves_smoothly_inside_a_cell(self):
+    """Ground points a tenth of a coarse grid cell apart across a shadow edge darken by small steps, not one jump per cell."""
+    self.ground(size=2000.0)
+    self.box((0, 0, 8.0), half=3.0)
+    shades = []
+    for step in range(10):
+      x = -2.0 + 0.138 * step
+      rgb, _, seg = self.render(eye=(x, -2, 4), target=(x, 0, 0), flags=PICTURE | DAYLIGHT, size=33,
+                                sun=[0.7071, 0.0, 0.7071], ambient=0.3)
+      self.assertEqual(seg[16, 16], 0)
+      shades.append(int(rgb[16, 16, 1]))
+    self.assertGreater(max(shades), min(shades) + 10, shades)
+    self.assertGreaterEqual(sum(b != a for a, b in zip(shades, shades[1:])), 7, shades)
+
   def test_leaf_lets_the_sun_through_from_behind(self):
     """A cut-out double-sided quad seen from its back is brighter with the sun behind it than with the sun ahead."""
     photo = np.zeros((32, 32, 4), dtype=np.uint8)
