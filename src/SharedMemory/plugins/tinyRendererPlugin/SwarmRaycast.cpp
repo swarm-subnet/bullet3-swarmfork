@@ -46,6 +46,8 @@ const float kPaneBias = 2e-3f;
 const int kPaneDepth = 3;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
+// A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
+const unsigned char kVeilCoverage = 8;
 
 inline float dot3(const float a[3], const float b[3])
 {
@@ -217,6 +219,9 @@ struct QueryContext
 	bool m_alphaCutout;
 	// Set when leaf cards cast no shadow: the map rays and the occlusion rays pass through them.
 	bool m_leafNoShadow;
+	// Angle one pixel spans on the filtered camera rays, 0 on every other ray: a cut-out is then read over the
+	// pixel's footprint instead of one texel, so a far chain-link or leaf card fades instead of breaking into moire.
+	float m_pixelSpread;
 };
 
 // A double-sided cut-out surface is a leaf or grass card, which casts nothing when leaf shadows are off.
@@ -238,6 +243,48 @@ bool cutOut(const TinyRender::Model* model, const float* uvs, const std::vector<
 		uv.y += uvs[(size_t)ids[j] * 2 + 1] * weights[j];
 	}
 	return model->alpha(uv) < kAlphaCutoff;
+}
+
+// The same test read over the pixel's footprint. In the hit's own frame the ray's length times the pixel angle is the
+// footprint's width, stretched by the grazing angle; the triangle's uv area over its area turns that into uv units.
+// Over many texels the surface is a veil: kept from kVeilCoverage, and blended by its coverage where it is shaded.
+bool cutOutAt(const TinyRender::Model* model, const float* vertices, const float* uvs, const std::vector<unsigned>& indices,
+			  const RTCHit* hit, const RTCRay* ray, float spread)
+{
+	if (!(spread > 0.0f))
+		return cutOut(model, uvs, indices, hit);
+	const unsigned* ids = &indices[(size_t)hit->primID * 3];
+	const float weights[3] = {1.0f - hit->u - hit->v, hit->u, hit->v};
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	for (int j = 0; j < 3; j++)
+	{
+		uv.x += uvs[(size_t)ids[j] * 2] * weights[j];
+		uv.y += uvs[(size_t)ids[j] * 2 + 1] * weights[j];
+	}
+	const float* p0 = vertices + (size_t)ids[0] * 3;
+	const float* p1 = vertices + (size_t)ids[1] * 3;
+	const float* p2 = vertices + (size_t)ids[2] * 3;
+	const float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+	const float e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+	float cross[3];
+	cross3(e1, e2, cross);
+	const float area2 = sqrtf(dot3(cross, cross));
+	const float* t0 = uvs + (size_t)ids[0] * 2;
+	const float* t1 = uvs + (size_t)ids[1] * 2;
+	const float* t2 = uvs + (size_t)ids[2] * 2;
+	const float uvArea2 = fabsf((t1[0] - t0[0]) * (t2[1] - t0[1]) - (t2[0] - t0[0]) * (t1[1] - t0[1]));
+	const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
+	const float length = sqrtf(dot3(dir, dir));
+	const float normal[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
+	const float normalLength = sqrtf(dot3(normal, normal));
+	if (!(area2 > 0.0f) || !(length > 0.0f) || !(normalLength > 0.0f))
+		return cutOut(model, uvs, indices, hit);
+	float grazing = fabsf(dot3(dir, normal)) / (length * normalLength);
+	grazing = grazing > 0.05f ? grazing : 0.05f;
+	const float width = ray->tfar * length * spread;
+	bool averaged = false;
+	const unsigned char alpha = model->alphaFiltered(uv, width * width / grazing * (uvArea2 / area2), &averaged);
+	return alpha < (averaged ? kVeilCoverage : kAlphaCutoff);
 }
 
 // The instance a hit belongs to, or null for the static tree and for an id the scene does not know.
@@ -286,7 +333,8 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 			args->valid[0] = 0;
 		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(member->m_doubleSided, member->m_hasAlpha))
 			args->valid[0] = 0;
-		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
+		else if (member->m_hasAlpha && ctx->m_alphaCutout &&
+				 cutOutAt(member->m_obj->m_model, member->m_vertices.data(), member->m_uvs, member->m_indices, hit, ray, ctx->m_pixelSpread))
 			args->valid[0] = 0;
 		return;
 	}
@@ -298,7 +346,9 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 			args->valid[0] = 0;
 		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
 			args->valid[0] = 0;
-		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit))
+		else if (batch->m_hasAlpha && ctx->m_alphaCutout &&
+				 cutOutAt(batch->m_obj->m_model, batch->m_tree->m_vertices.data(), batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit,
+						  ray, ctx->m_pixelSpread))
 			args->valid[0] = 0;
 		return;
 	}
@@ -309,7 +359,9 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 	else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
-	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout &&
+			 cutOutAt(inst->m_obj->m_model, inst->m_tree->m_vertices.data(), inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit, ray,
+					  ctx->m_pixelSpread))
 		args->valid[0] = 0;
 }
 
@@ -774,6 +826,7 @@ struct SwarmRaycast::Data
 			ctx.m_anyWinding = true;
 			ctx.m_alphaCutout = map.m_alphaCutout;
 			ctx.m_leafNoShadow = map.m_leafNoShadow;
+			ctx.m_pixelSpread = 0.0f;
 			RTCIntersectArguments args;
 			rtcInitIntersectArguments(&args);
 			args.context = &ctx.m_context;
@@ -2190,6 +2243,8 @@ struct TileJob
 	int m_width;
 	int m_height;
 	bool m_filtered;
+	// Angle one pixel spans, for the cut-out footprint; 0 unless textures are filtered under daylight.
+	float m_pixelSpread;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -2388,6 +2443,70 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
 	if (filtered)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
+
+	// A cut-out seen over many of its texels is a veil, such as a far chain-link fence: its coverage of the pixel is lit as
+	// the surface and the rest is the next surface along the ray, so thin wire fades as it does to a lens.
+	if (shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass)
+	{
+		const float weights[3] = {1.0f - rayhit.hit.u - rayhit.hit.v, rayhit.hit.u, rayhit.hit.v};
+		TinyRender::Vec2f uv(0.0f, 0.0f);
+		for (int j = 0; j < 3; j++)
+		{
+			const float* uvj = surface.m_uvs + (size_t)surface.m_vertexIds[j] * 2;
+			uv.x += uvj[0] * weights[j];
+			uv.y += uvj[1] * weights[j];
+		}
+		const float rx2 = duvdx[0] * duvdx[0] + duvdx[1] * duvdx[1], ry2 = duvdy[0] * duvdy[0] + duvdy[1] * duvdy[1];
+		bool averaged = false;
+		const float coverage = surface.m_model->alphaFiltered(uv, rx2 > ry2 ? rx2 : ry2, &averaged) / 255.0f;
+		if (averaged && coverage < 0.97f)
+		{
+			float normal[3], base[3], lit[3], behind[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			daylightLight(*shading, surface, normal, base, dir, shadow, lit);
+			RTCRayHit next = rayhit;
+			next.ray.tnear = t + kPaneBias;
+			next.ray.tfar = tNear + length;
+			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+			rtcIntersect1(job.m_top, &next, args);
+			int backSegmentation = -1;
+			HitSurface back;
+			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
+			{
+				if (shading->m_sky)
+					shading->m_sky->radiance(dir[0], dir[1], dir[2], behind);
+				else
+					for (int i = 0; i < 3; i++)
+						behind[i] = shading->m_ambientColor[i];
+			}
+			else
+			{
+				float backWound[3], backFace[3], f1[3], f2[3];
+				for (int i = 0; i < 3; i++)
+				{
+					f1[i] = back.m_corners[1][i] - back.m_corners[0][i];
+					f2[i] = back.m_corners[2][i] - back.m_corners[0][i];
+				}
+				cross3(f1, f2, backWound);
+				const bool backAway = dot3(backWound, dir) > 0.0f;
+				for (int i = 0; i < 3; i++)
+					backFace[i] = backAway ? -backWound[i] : backWound[i];
+				float duv2x[2] = {0.0f, 0.0f}, duv2y[2] = {0.0f, 0.0f};
+				footprintAt(setup, rawDir, back, backWound, next.hit, duv2x, duv2y);
+				const float t2 = next.ray.tfar;
+				const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
+				const float shadow2 = shading->m_shadow ? shadowAt(job, point2, backFace, leafCard(back.m_doubleSided, back.m_hasAlpha), shadowArgs) : 1.0f;
+				float backNormal[3], backBase[3];
+				surfaceAt(back, next.hit, backFace, filtered, duv2x, duv2y, backNormal, backBase);
+				daylightLight(*shading, back, backNormal, backBase, dir, shadow2, behind);
+			}
+			for (int i = 0; i < 3; i++)
+				lit[i] = coverage * lit[i] + (1.0f - coverage) * behind[i];
+			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			return true;
+		}
+	}
 
 	if (shading->m_daylight && surface.m_glass)
 	{
@@ -2891,6 +3010,18 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			setup.m_stepY[k] = (float)((setup.m_cam.m_far[2][k] - setup.m_cam.m_near[2][k]) * (2.0 / (double)height));
 		}
 	}
+	job.m_pixelSpread = 0.0f;
+	if (job.m_filtered && shading->m_daylight && numTargets > 0 && setups[0].m_valid)
+	{
+		double step = 0.0, centre = 0.0;
+		for (int k = 0; k < 3; k++)
+		{
+			step += (double)setups[0].m_stepX[k] * setups[0].m_stepX[k];
+			const double axis = setups[0].m_cam.m_far[0][k] - setups[0].m_cam.m_near[0][k];
+			centre += axis * axis;
+		}
+		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
+	}
 
 	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias) ? (size_t)numTargets : 0);
 	for (size_t i = 0; i < scratch.size(); i++)
@@ -2929,6 +3060,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_anyWinding = false;
 		ctx.m_alphaCutout = alphaCutout;
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
+		ctx.m_pixelSpread = job.m_pixelSpread;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;
