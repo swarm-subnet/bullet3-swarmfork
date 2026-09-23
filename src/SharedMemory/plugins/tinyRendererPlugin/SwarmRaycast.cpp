@@ -88,6 +88,8 @@ struct ShadowMap
 	bool m_built;
 	// Whether the cells were cast with cut-outs on; the map is recast when a frame asks for the other.
 	bool m_alphaCutout;
+	// Whether the cells were cast with leaf cards letting the light through; the map is recast likewise.
+	bool m_leafNoShadow;
 };
 
 // A body that never moved since the first frame: its triangles sit in world space inside the one
@@ -187,7 +189,15 @@ struct QueryContext
 	// Set for the rays that build the shadow map: any drawn face stops them, like a shadow ray.
 	bool m_anyWinding;
 	bool m_alphaCutout;
+	// Set when leaf cards cast no shadow: the map rays and the occlusion rays pass through them.
+	bool m_leafNoShadow;
 };
+
+// A double-sided cut-out surface is a leaf or grass card, which casts nothing when leaf shadows are off.
+inline bool leafCard(bool doubleSided, bool hasAlpha)
+{
+	return doubleSided && hasAlpha;
+}
 
 // True when the hit lands on a texel the texture marks as see-through. The uv is accumulated in the
 // same order as the shader, so the texel tested here is the texel the colour would read.
@@ -230,6 +240,8 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
 		if (member->m_retired || !member->m_visible || (!member->m_doubleSided && !ctx->m_anyWinding && facing >= 0.0f))
 			args->valid[0] = 0;
+		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(member->m_doubleSided, member->m_hasAlpha))
+			args->valid[0] = 0;
 		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
 			args->valid[0] = 0;
 		return;
@@ -238,6 +250,8 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 	if (!inst)
 		return;
 	if (!inst->m_doubleSided && facing * inst->m_facingSign >= 0.0f)
+		args->valid[0] = 0;
+	else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
 	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
@@ -258,12 +272,18 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		const StaticMember* member = (const StaticMember*)args->geometryUserPtr;
 		if (member->m_retired || !member->m_visible)
 			args->valid[0] = 0;
+		else if (ctx->m_leafNoShadow && leafCard(member->m_doubleSided, member->m_hasAlpha))
+			args->valid[0] = 0;
 		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
 			args->valid[0] = 0;
 		return;
 	}
 	const Instance* inst = hitInstance(ctx, hit);
-	if (inst && inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
+	if (!inst)
+		return;
+	if (ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
+		args->valid[0] = 0;
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
 }
 
@@ -676,6 +696,7 @@ struct SwarmRaycast::Data
 			ctx.m_instances = 0;
 			ctx.m_anyWinding = true;
 			ctx.m_alphaCutout = map.m_alphaCutout;
+			ctx.m_leafNoShadow = map.m_leafNoShadow;
 			RTCIntersectArguments args;
 			rtcInitIntersectArguments(&args);
 			args.context = &ctx.m_context;
@@ -705,10 +726,11 @@ struct SwarmRaycast::Data
 	}
 
 	// Lays the grid over `bounds` for this light, at most kShadowMapMaxCells a side, then casts every cell.
-	void buildShadowMap(ShadowMap& map, const RTCBounds& bounds, const float lightDir[3], bool alphaCutout, int threads)
+	void buildShadowMap(ShadowMap& map, const RTCBounds& bounds, const float lightDir[3], bool alphaCutout, bool leafNoShadow, int threads)
 	{
 		map.m_built = false;
 		map.m_alphaCutout = alphaCutout;
+		map.m_leafNoShadow = leafNoShadow;
 		std::vector<float>().swap(map.m_depth);
 		if (!(bounds.lower_x <= bounds.upper_x) || !(bounds.lower_y <= bounds.upper_y) || !(bounds.lower_z <= bounds.upper_z))
 			return;
@@ -781,15 +803,15 @@ struct SwarmRaycast::Data
 	}
 
 	// Recasts both maps for a new light, core or cut-out setting, otherwise only the cells under the members that changed.
-	void prepareShadowMap(const float lightDir[3], bool alphaCutout, float coreRadius, int upAxis, int threads)
+	void prepareShadowMap(const float lightDir[3], bool alphaCutout, bool leafNoShadow, float coreRadius, int upAxis, int threads)
 	{
-		const bool stale = !m_shadowMap.m_built || m_shadowMap.m_alphaCutout != alphaCutout ||
+		const bool stale = !m_shadowMap.m_built || m_shadowMap.m_alphaCutout != alphaCutout || m_shadowMap.m_leafNoShadow != leafNoShadow ||
 						   memcmp(m_shadowMap.m_lightDir, lightDir, sizeof(m_shadowMap.m_lightDir)) != 0;
 		const bool coreStale = stale || coreRadius != m_coreRadius || (coreRadius > 0.0f) != m_shadowCore.m_built;
 		RTCBounds bounds;
 		rtcGetSceneBounds(m_static, &bounds);
 		if (stale)
-			buildShadowMap(m_shadowMap, bounds, lightDir, alphaCutout, threads);
+			buildShadowMap(m_shadowMap, bounds, lightDir, alphaCutout, leafNoShadow, threads);
 		else
 			for (size_t i = 0; i < m_shadowDirty.size(); i++)
 			{
@@ -822,7 +844,7 @@ struct SwarmRaycast::Data
 			core.upper_x = upper[0];
 			core.upper_y = upper[1];
 			core.upper_z = upper[2];
-			buildShadowMap(m_shadowCore, core, lightDir, alphaCutout, threads);
+			buildShadowMap(m_shadowCore, core, lightDir, alphaCutout, leafNoShadow, threads);
 		}
 	}
 
@@ -1772,11 +1794,15 @@ const double kCoverageEpsilon = 1.0 / 512.0;
 
 // One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
-float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], RTCOccludedArguments* shadowArgs)
+// A leaf card with leaf shadows off asks from its sunward side, since its back-light is not its own shadow.
+float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
 {
 	const SwarmRaycastShading* shading = job.m_shading;
 	float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 	normalize3(unitNormal);
+	if (leaf && shading->m_leafNoShadow && dot3(unitNormal, shading->m_lightDir) < 0.0f)
+		for (int i = 0; i < 3; i++)
+			unitNormal[i] = -unitNormal[i];
 	float litShare = 1.0f;
 	bool blocked = false;
 	if (job.m_shadowMap && shading->m_daylight)
@@ -1914,7 +1940,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	if (shading->m_shadow)
 	{
 		const float point[3] = {hx, hy, hz};
-		shadow = shadowAt(job, point, faceNormal, shadowArgs);
+		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
 	}
 
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
@@ -1987,7 +2013,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			}
 			const float t2 = next.ray.tfar;
 			const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
-			const float shadow2 = shading->m_shadow ? shadowAt(job, point2, backFace, shadowArgs) : 1.0f;
+			const float shadow2 = shading->m_shadow ? shadowAt(job, point2, backFace, leafCard(back.m_doubleSided, back.m_hasAlpha), shadowArgs) : 1.0f;
 			float backNormal[3], backBase[3], behind[3];
 			surfaceAt(back, next.hit, backFace, filtered, duv2x, duv2y, backNormal, backBase);
 			daylightLight(*shading, back, backNormal, backBase, dir, shadow2, behind);
@@ -2385,7 +2411,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_movers = 0;
 	if (shading && shading->m_shadow && shading->m_shadowMap)
 	{
-		m_data->prepareShadowMap(shading->m_lightDir, alphaCutout, shading->m_daylight ? shading->m_shadowCoreRadius : 0.0f, shading->m_glint.m_upAxis, threads);
+		m_data->prepareShadowMap(shading->m_lightDir, alphaCutout, shading->m_leafNoShadow, shading->m_daylight ? shading->m_shadowCoreRadius : 0.0f, shading->m_glint.m_upAxis, threads);
 		job.m_shadowMap = &m_data->m_shadowMap;
 		if (shading->m_daylight && m_data->m_shadowCore.m_built)
 			job.m_shadowCore = &m_data->m_shadowCore;
@@ -2452,6 +2478,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_instances = job.m_instances;
 		ctx.m_anyWinding = false;
 		ctx.m_alphaCutout = alphaCutout;
+		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;

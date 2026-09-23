@@ -13565,6 +13565,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_SKY_SUN", ER_SWARM_SKY_SUN);
 	PyModule_AddIntConstant(m, "ER_SWARM_LINEAR_LIGHT", ER_SWARM_LINEAR_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
+	PyModule_AddIntConstant(m, "ER_SWARM_LEAF_NO_SHADOW", ER_SWARM_LEAF_NO_SHADOW);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);
