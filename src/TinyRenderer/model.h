@@ -56,6 +56,8 @@ public:
 	void setDiffuseTextureFromData(unsigned char* textureImage, int textureWidth, int textureHeight, const unsigned char* textureAlpha = 0, const char* textureName = 0);
 	// Takes the texture already held under this file name; false when no owner is left to take it from.
 	bool shareDiffuseTextureByName(const char* textureName);
+	// Holds the other Model's mesh and texture by reference and copies its colours, with no mesh work at all.
+	void shareFrom(const Model& other);
 	// Vertex stride is 9 floats: xyz, w (ignored), normal xyz, uv.
 	void setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 	void reserveMemory(int numVertices, int numIndices);

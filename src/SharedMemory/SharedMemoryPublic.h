@@ -1152,6 +1152,7 @@ enum eEnumUpdateVisualShapeFlags
 	eVISUAL_SHAPE_MATERIALS_FROM_MTL = 16,//one render object per OBJ material, colour and texture from the MTL
 	eVISUAL_SHAPE_RENDER_TREE_CACHE = 32,//ray-cast tree of a static body saved under SWARM_BVH_CACHE_DIR and loaded when present
 	eVISUAL_SHAPE_GLASS = 64,//thin glass under ER_SWARM_DAYLIGHT: the sky by Fresnel plus the view through, tinted by the colour
+	eVISUAL_SHAPE_RENDER_INSTANCED = 128,//share one local ray-cast mesh tree across poses and scales
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

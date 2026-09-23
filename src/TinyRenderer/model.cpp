@@ -464,6 +464,21 @@ Model::~Model()
 	releaseTexture(m_diffuse);
 }
 
+void Model::shareFrom(const Model& other)
+{
+	if (&other == this)
+		return;
+	other.m_mesh->refs_++;
+	releaseMesh(m_mesh);
+	m_mesh = other.m_mesh;
+	if (other.m_diffuse)
+		other.m_diffuse->refs_++;
+	releaseTexture(m_diffuse);
+	m_diffuse = other.m_diffuse;
+	m_colorRGBA = other.m_colorRGBA;
+	m_specularColor = other.m_specularColor;
+}
+
 int Model::nverts()
 {
 	return (int)m_mesh->verts_.size();

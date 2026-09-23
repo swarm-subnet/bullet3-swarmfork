@@ -173,6 +173,27 @@ struct Instance
 	bool m_glass;
 	// Sign of the instance determinant: a mirroring scale flips which side of a face is the front.
 	float m_facingSign;
+	bool m_staticShared;
+	unsigned m_textureRevision;
+	int m_segmentation;
+};
+
+// A forest batch: every placement of one shared mesh tree in a single Embree instance array. Batches live in
+// the forest scene, which is built once and reached through one instance, so a moving body never re-sorts them.
+struct Batch
+{
+	TinyRenderObjectData* m_obj;
+	RTCGeometry m_geometry;
+	unsigned m_geomId;
+	MeshTree* m_tree;
+	// One 3x4 column-major world transform per placement, shared with Embree.
+	std::vector<float> m_transforms;
+	float m_bodyTransform[16];
+	bool m_enabled;
+	bool m_doubleSided;
+	bool m_hasAlpha;
+	bool m_glass;
+	unsigned m_textureRevision;
 	int m_segmentation;
 };
 
@@ -180,12 +201,17 @@ struct ObjectState
 {
 	StaticMember* m_member;
 	Instance* m_instance;
+	bool m_deformed;
+	Batch* m_batch;
 };
 
 struct QueryContext
 {
 	RTCRayQueryContext m_context;
 	const std::vector<Instance*>* m_instances;
+	// The forest's batches by id inside the forest scene, and the forest's own id in the top scene.
+	const std::vector<Batch*>* m_batches;
+	unsigned m_forestId;
 	// Set for the rays that build the shadow map: any drawn face stops them, like a shadow ray.
 	bool m_anyWinding;
 	bool m_alphaCutout;
@@ -223,6 +249,24 @@ const Instance* hitInstance(const QueryContext* ctx, const RTCHit* hit)
 	return (*ctx->m_instances)[instId];
 }
 
+// The batch a hit inside the forest belongs to and the placement it landed on; null for any other hit.
+const Batch* hitBatch(const QueryContext* ctx, const RTCHit* hit, unsigned& placement)
+{
+	if (!ctx->m_batches || ctx->m_forestId == RTC_INVALID_GEOMETRY_ID || hit->instID[0] != ctx->m_forestId)
+		return 0;
+	if (hit->instID[1] >= ctx->m_batches->size())
+		return 0;
+	placement = hit->instPrimID[1];
+	return (*ctx->m_batches)[hit->instID[1]];
+}
+
+// Sign of a 3x4 column-major placement's determinant: a mirroring scale flips which side of a face is the front.
+inline float placementSign(const float* t)
+{
+	const float det = t[0] * (t[4] * t[8] - t[7] * t[5]) - t[3] * (t[1] * t[8] - t[7] * t[2]) + t[6] * (t[1] * t[5] - t[4] * t[2]);
+	return det < 0.0f ? -1.0f : 1.0f;
+}
+
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
 // filter does the same in object space, where Embree hands over both the ray and the hit. Static
 // members also drop out here when retired or fully transparent, so the static tree is never rebuilt.
@@ -246,10 +290,22 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 			args->valid[0] = 0;
 		return;
 	}
+	unsigned placement = 0;
+	const Batch* batch = hitBatch(ctx, hit, placement);
+	if (batch)
+	{
+		if (!batch->m_doubleSided && !ctx->m_anyWinding && facing * placementSign(&batch->m_transforms[(size_t)placement * 12]) >= 0.0f)
+			args->valid[0] = 0;
+		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
+			args->valid[0] = 0;
+		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit))
+			args->valid[0] = 0;
+		return;
+	}
 	const Instance* inst = hitInstance(ctx, hit);
 	if (!inst)
 		return;
-	if (!inst->m_doubleSided && facing * inst->m_facingSign >= 0.0f)
+	if (!inst->m_doubleSided && !ctx->m_anyWinding && facing * inst->m_facingSign >= 0.0f)
 		args->valid[0] = 0;
 	else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
@@ -275,6 +331,16 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		else if (ctx->m_leafNoShadow && leafCard(member->m_doubleSided, member->m_hasAlpha))
 			args->valid[0] = 0;
 		else if (member->m_hasAlpha && ctx->m_alphaCutout && cutOut(member->m_obj->m_model, member->m_uvs, member->m_indices, hit))
+			args->valid[0] = 0;
+		return;
+	}
+	unsigned placement = 0;
+	const Batch* batch = hitBatch(ctx, hit, placement);
+	if (batch)
+	{
+		if (ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
+			args->valid[0] = 0;
+		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit))
 			args->valid[0] = 0;
 		return;
 	}
@@ -366,7 +432,7 @@ void copyIndices(TinyRender::Model* model, std::vector<unsigned>& out)
 // attributes. Normals are rotated into world space when a rotation is given. A model without normals
 // leaves the normal block empty and shades with the face normal instead.
 void copyAttributes(TinyRender::Model* model, const std::vector<unsigned>& indices, const float rotation[9],
-					std::vector<float>& normals, std::vector<float>& uvs, bool gatherUvs)
+					std::vector<float>& normals, std::vector<float>& uvs, bool gatherUvs, bool unitNormals = true)
 {
 	const int numVerts = model->nverts();
 	const bool hasNormals = model->nnormals() > 0;
@@ -395,7 +461,7 @@ void copyAttributes(TinyRender::Model* model, const std::vector<unsigned>& indic
 				out[r] = rotation ? (rotation[r * 3] * local[0] + rotation[r * 3 + 1] * local[1]) + rotation[r * 3 + 2] * local[2] : local[r];
 			const float length = sqrtf((out[0] * out[0] + out[1] * out[1]) + out[2] * out[2]);
 			for (int r = 0; r < 3; r++)
-				normals[(size_t)v * 3 + r] = length > 0.0f ? out[r] / length : 0.0f;
+				normals[(size_t)v * 3 + r] = unitNormals ? (length > 0.0f ? out[r] / length : 0.0f) : out[r];
 		}
 }
 
@@ -653,6 +719,15 @@ struct SwarmRaycast::Data
 	RTCDevice m_device;
 	RTCScene m_top;
 	RTCScene m_static;
+	RTCScene m_staticShadows;  // Allocated only when a flagged placement needs the shadow map.
+	bool m_staticShadowsDirty;
+	std::map<unsigned long long, MeshTree*> m_sharedTrees;
+	// The forest: every batch's instance array, reached from the top and shadow scenes through one instance.
+	RTCScene m_forest;
+	RTCGeometry m_forestInstance;
+	unsigned m_forestId;
+	bool m_forestDirty;
+	std::vector<Batch*> m_batches;
 	// Only the mover instances, so a shadow ray from a lit hit never walks the static tree.
 	RTCScene m_movers;
 	RTCGeometry m_staticInstance;
@@ -693,7 +768,9 @@ struct SwarmRaycast::Data
 		{
 			QueryContext ctx;
 			rtcInitRayQueryContext(&ctx.m_context);
-			ctx.m_instances = 0;
+			ctx.m_instances = &m_byGeomId;
+			ctx.m_batches = &m_batches;
+			ctx.m_forestId = m_forestId;
 			ctx.m_anyWinding = true;
 			ctx.m_alphaCutout = map.m_alphaCutout;
 			ctx.m_leafNoShadow = map.m_leafNoShadow;
@@ -719,7 +796,7 @@ struct SwarmRaycast::Data
 				rayhit.ray.flags = 0;
 				rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 				rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-				rtcIntersect1(m_static, &rayhit, &args);
+				rtcIntersect1(m_staticShadows ? m_staticShadows : m_static, &rayhit, &args);
 				map.m_depth[(size_t)row * map.m_cols + col] = rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID ? INFINITY : rayhit.ray.tfar;
 			}
 		}
@@ -809,7 +886,7 @@ struct SwarmRaycast::Data
 						   memcmp(m_shadowMap.m_lightDir, lightDir, sizeof(m_shadowMap.m_lightDir)) != 0;
 		const bool coreStale = stale || coreRadius != m_coreRadius || (coreRadius > 0.0f) != m_shadowCore.m_built;
 		RTCBounds bounds;
-		rtcGetSceneBounds(m_static, &bounds);
+		rtcGetSceneBounds(m_staticShadows ? m_staticShadows : m_static, &bounds);
 		if (stale)
 			buildShadowMap(m_shadowMap, bounds, lightDir, alphaCutout, leafNoShadow, threads);
 		else
@@ -966,6 +1043,31 @@ struct SwarmRaycast::Data
 		return tree;
 	}
 
+	// Content hashes share canonical trees even when model storage sharing is disabled.
+	MeshTree* acquireSharedTree(TinyRender::Model* model, bool deformed)
+	{
+		const unsigned long long hash = deformed ? 0 : model->meshHash();
+		std::map<unsigned long long, MeshTree*>::iterator found = m_sharedTrees.find(hash);
+		// A hash match must also match in size, so a collision builds its own tree instead of borrowing one.
+		if (hash && found != m_sharedTrees.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
+			found->second->m_vertices.size() == (size_t)model->nverts() * 3 + kVertexPadding)
+		{
+			found->second->m_refs++;
+			return found->second;
+		}
+		MeshTree* tree = new MeshTree;
+		tree->m_refs = 1;
+		tree->m_dirty = false;
+		tree->m_world = false;
+		copyLocalVertices(model, tree->m_vertices);
+		copyIndices(model, tree->m_indices);
+		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true, false);
+		buildTree(*tree, 0);
+		if (hash)
+			m_sharedTrees[hash] = tree;
+		return tree;
+	}
+
 	void releaseTree(MeshTree* tree)
 	{
 		if (!tree || --tree->m_refs > 0)
@@ -974,6 +1076,12 @@ struct SwarmRaycast::Data
 			if (it->second == tree)
 			{
 				m_trees.erase(it);
+				break;
+			}
+		for (std::map<unsigned long long, MeshTree*>::iterator it = m_sharedTrees.begin(); it != m_sharedTrees.end(); ++it)
+			if (it->second == tree)
+			{
+				m_sharedTrees.erase(it);
 				break;
 			}
 		rtcReleaseGeometry(tree->m_geometry);
@@ -1086,13 +1194,234 @@ struct SwarmRaycast::Data
 		}
 	}
 
+	// Flagged placements remain in the map scene when moved, without changing the mover path.
+	void syncSharedInstance(ObjectState& state, TinyRenderObjectData* obj, const float bodyTransform[16], bool enabled, int segmentation)
+	{
+		float transform[16];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+			{
+				float sum = 0.0f;
+				for (int k = 0; k < 4; k++)
+					sum += bodyTransform[k * 4 + r] * obj->m_meshTransform[k][c];
+				transform[c * 4 + r] = sum;
+			}
+		Instance* inst = state.m_instance;
+		const bool fresh = !inst;
+		if (fresh)
+		{
+			if (!m_staticShadows)
+			{
+				m_staticShadows = rtcNewScene(m_device);
+				rtcSetSceneFlags(m_staticShadows, RTC_SCENE_FLAG_ROBUST);
+				rtcSetSceneBuildQuality(m_staticShadows, RTC_BUILD_QUALITY_MEDIUM);
+				rtcAttachGeometryByID(m_staticShadows, m_staticInstance, m_staticInstanceId);
+			}
+			inst = new Instance;
+			memset(inst, 0, sizeof(Instance));
+			inst->m_obj = obj;
+			inst->m_staticShared = true;
+			inst->m_tree = acquireSharedTree(obj->m_model, state.m_deformed);
+			inst->m_meshKey = obj->m_model->meshKey();
+			inst->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
+			rtcSetGeometryInstancedScene(inst->m_geometry, inst->m_tree->m_scene);
+			inst->m_geomId = allocateGeomId(inst);
+			rtcAttachGeometryByID(m_top, inst->m_geometry, inst->m_geomId);
+			rtcAttachGeometryByID(m_staticShadows, inst->m_geometry, inst->m_geomId);
+			state.m_instance = inst;
+		}
+		const bool changed = fresh || memcmp(transform, inst->m_transform, sizeof(transform)) != 0 || inst->m_enabled != enabled;
+		if (changed)
+		{
+			memcpy(inst->m_transform, transform, sizeof(transform));
+			btMatrix3x3 basis(transform[0], transform[4], transform[8], transform[1], transform[5], transform[9], transform[2], transform[6], transform[10]);
+			const btScalar det = basis.determinant();
+			inst->m_facingSign = det < 0 ? -1.0f : 1.0f;
+			// Inverse transpose keeps normals perpendicular under non-uniform and mirrored scales.
+			const btMatrix3x3 normal = det != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
+			for (int r = 0; r < 3; r++)
+				for (int c = 0; c < 3; c++)
+					inst->m_rotation[r * 3 + c] = (float)normal[r][c];
+			rtcSetGeometryTransform(inst->m_geometry, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, transform);
+			if (enabled && det != 0)
+				rtcEnableGeometry(inst->m_geometry);
+			else
+				rtcDisableGeometry(inst->m_geometry);
+			rtcCommitGeometry(inst->m_geometry);
+			m_topDirty = true;
+			m_staticShadowsDirty = true;
+		}
+		// Texture contents can change without changing the mesh or its pose.
+		if (changed || inst->m_doubleSided != obj->m_doubleSided || inst->m_textureRevision != obj->m_textureRevision)
+			m_shadowMap.m_built = false;
+		inst->m_textureRevision = obj->m_textureRevision;
+		inst->m_enabled = enabled;
+		inst->m_doubleSided = obj->m_doubleSided;
+		inst->m_hasAlpha = obj->m_model->hasAlpha();
+		inst->m_glass = obj->m_glass;
+		inst->m_segmentation = segmentation;
+	}
+
+	// The forest scene and its one instance, made when the first batch arrives; the shadow scene then holds it too.
+	void ensureForest()
+	{
+		if (m_forest)
+			return;
+		m_forest = rtcNewScene(m_device);
+		rtcSetSceneFlags(m_forest, RTC_SCENE_FLAG_ROBUST);
+		rtcSetSceneBuildQuality(m_forest, RTC_BUILD_QUALITY_MEDIUM);
+		m_forestInstance = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
+		rtcSetGeometryInstancedScene(m_forestInstance, m_forest);
+		const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+		rtcSetGeometryTransform(m_forestInstance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, identity);
+		m_forestId = allocateGeomId(0);
+		rtcAttachGeometryByID(m_top, m_forestInstance, m_forestId);
+		if (!m_staticShadows)
+		{
+			m_staticShadows = rtcNewScene(m_device);
+			rtcSetSceneFlags(m_staticShadows, RTC_SCENE_FLAG_ROBUST);
+			rtcSetSceneBuildQuality(m_staticShadows, RTC_BUILD_QUALITY_MEDIUM);
+			rtcAttachGeometryByID(m_staticShadows, m_staticInstance, m_staticInstanceId);
+		}
+		rtcAttachGeometryByID(m_staticShadows, m_forestInstance, m_forestId);
+		m_forestDirty = true;
+	}
+
+	// One batch per forest render object: its placements carried into world space by the body, the visual
+	// frame and the mesh scale. They are written again only when the body moves.
+	void syncBatch(ObjectState& state, TinyRenderObjectData* obj, const float bodyTransform[16], bool enabled, int segmentation)
+	{
+		const size_t count = obj->m_placements.size() / 12;
+		if (count == 0)
+			return;
+		Batch* batch = state.m_batch;
+		const bool fresh = !batch;
+		if (fresh)
+		{
+			ensureForest();
+			batch = new Batch;
+			batch->m_obj = obj;
+			batch->m_tree = acquireSharedTree(obj->m_model, false);
+			batch->m_transforms.assign(count * 12, 0.0f);
+			batch->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE_ARRAY);
+			rtcSetGeometryInstancedScene(batch->m_geometry, batch->m_tree->m_scene);
+			rtcSetSharedGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0, RTC_FORMAT_FLOAT3X4_COLUMN_MAJOR,
+									   &batch->m_transforms[0], 0, 12 * sizeof(float), count);
+			batch->m_enabled = true;
+			batch->m_textureRevision = obj->m_textureRevision;
+			memset(batch->m_bodyTransform, 0, sizeof(batch->m_bodyTransform));
+			state.m_batch = batch;
+		}
+		bool changed = fresh;
+		if (fresh || memcmp(bodyTransform, batch->m_bodyTransform, sizeof(batch->m_bodyTransform)) != 0)
+		{
+			memcpy(batch->m_bodyTransform, bodyTransform, sizeof(batch->m_bodyTransform));
+			float frame[16];
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 4; c++)
+				{
+					float sum = 0.0f;
+					for (int k = 0; k < 4; k++)
+						sum += bodyTransform[k * 4 + r] * obj->m_meshTransform[k][c];
+					frame[c * 4 + r] = sum;
+				}
+			for (size_t p = 0; p < count; p++)
+			{
+				const float* local = &obj->m_placements[p * 12];
+				float* world = &batch->m_transforms[p * 12];
+				for (int c = 0; c < 4; c++)
+					for (int r = 0; r < 3; r++)
+					{
+						float sum = c == 3 ? frame[12 + r] : 0.0f;
+						for (int k = 0; k < 3; k++)
+							sum += frame[k * 4 + r] * local[c * 3 + k];
+						world[c * 3 + r] = sum;
+					}
+			}
+			if (!fresh)
+				rtcUpdateGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0);
+			changed = true;
+		}
+		if (enabled != batch->m_enabled)
+		{
+			if (enabled)
+				rtcEnableGeometry(batch->m_geometry);
+			else
+				rtcDisableGeometry(batch->m_geometry);
+			batch->m_enabled = enabled;
+			changed = true;
+		}
+		if (changed || batch->m_doubleSided != obj->m_doubleSided || batch->m_textureRevision != obj->m_textureRevision)
+			m_shadowMap.m_built = false;
+		batch->m_doubleSided = obj->m_doubleSided;
+		batch->m_hasAlpha = obj->m_model->hasAlpha();
+		batch->m_glass = obj->m_glass;
+		batch->m_textureRevision = obj->m_textureRevision;
+		batch->m_segmentation = segmentation;
+		if (changed)
+		{
+			rtcCommitGeometry(batch->m_geometry);
+			m_forestDirty = true;
+		}
+		if (fresh)
+		{
+			batch->m_geomId = (unsigned)m_batches.size();
+			m_batches.push_back(batch);
+			rtcAttachGeometryByID(m_forest, batch->m_geometry, batch->m_geomId);
+		}
+	}
+
+	void dropBatch(Batch* batch)
+	{
+		rtcDetachGeometry(m_forest, batch->m_geomId);
+		rtcReleaseGeometry(batch->m_geometry);
+		releaseTree(batch->m_tree);
+		m_batches[batch->m_geomId] = 0;
+		m_forestDirty = true;
+		m_shadowMap.m_built = false;
+		delete batch;
+	}
+
+	// Drops every batch and the forest scene itself, before the shadow scene that holds its instance goes.
+	void releaseForest()
+	{
+		for (size_t i = 0; i < m_batches.size(); i++)
+			if (m_batches[i])
+			{
+				rtcReleaseGeometry(m_batches[i]->m_geometry);
+				releaseTree(m_batches[i]->m_tree);
+				delete m_batches[i];
+			}
+		m_batches.clear();
+		if (m_forest)
+		{
+			rtcDetachGeometry(m_top, m_forestId);
+			rtcReleaseGeometry(m_forestInstance);
+			rtcReleaseScene(m_forest);
+		}
+		m_forest = 0;
+		m_forestInstance = 0;
+		m_forestId = RTC_INVALID_GEOMETRY_ID;
+		m_forestDirty = false;
+	}
+
 	void dropInstance(Instance* inst)
 	{
 		rtcDetachGeometry(m_top, inst->m_geomId);
-		rtcDetachGeometry(m_movers, inst->m_geomId);
-		m_moverCount--;
+		if (inst->m_staticShared)
+		{
+			rtcDetachGeometry(m_staticShadows, inst->m_geomId);
+			m_staticShadowsDirty = true;
+			m_shadowMap.m_built = false;
+		}
+		else
+		{
+			rtcDetachGeometry(m_movers, inst->m_geomId);
+			m_moverCount--;
+		}
 		rtcReleaseGeometry(inst->m_geometry);
-		rtcReleaseGeometry(inst->m_shadowGeometry);
+		if (inst->m_shadowGeometry)
+			rtcReleaseGeometry(inst->m_shadowGeometry);
 		releaseTree(inst->m_tree);
 		m_byGeomId[inst->m_geomId] = 0;
 		m_freeGeomIds.push_back(inst->m_geomId);
@@ -1103,6 +1432,10 @@ struct SwarmRaycast::Data
 
 	void releaseStatic()
 	{
+		if (m_staticShadows)
+			rtcReleaseScene(m_staticShadows);
+		m_staticShadows = 0;
+		m_staticShadowsDirty = false;
 		m_shadowMap.m_built = false;
 		std::vector<float>().swap(m_shadowMap.m_depth);
 		m_shadowCore.m_built = false;
@@ -1128,6 +1461,12 @@ SwarmRaycast::SwarmRaycast()
 	m_data = new Data;
 	m_data->m_top = 0;
 	m_data->m_static = 0;
+	m_data->m_staticShadows = 0;
+	m_data->m_staticShadowsDirty = false;
+	m_data->m_forest = 0;
+	m_data->m_forestInstance = 0;
+	m_data->m_forestId = RTC_INVALID_GEOMETRY_ID;
+	m_data->m_forestDirty = false;
 	m_data->m_movers = 0;
 	m_data->m_staticInstance = 0;
 	m_data->m_staticInstanceId = 0;
@@ -1192,6 +1531,16 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	const bool worldTree = renderObj->m_renderTreeCache && !m_data->m_cacheDir.empty() && model->meshHash() != 0;
 
 	ObjectState& state = m_data->m_objects[renderObj];
+	if (!renderObj->m_placements.empty())
+	{
+		m_data->syncBatch(state, renderObj, transform, visible, segmentation);
+		return;
+	}
+	if (renderObj->m_renderInstanced)
+	{
+		m_data->syncSharedInstance(state, renderObj, transform, visible, segmentation);
+		return;
+	}
 	StaticMember* member = state.m_member;
 	if (member && !member->m_retired)
 	{
@@ -1230,9 +1579,23 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 
 void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 {
+	// A batch's mesh tree is shared by every placement and never rewritten.
+	if (!renderObj->m_placements.empty())
+		return;
+	if (renderObj->m_renderInstanced)
+		m_data->m_objects[renderObj].m_deformed = true;
 	std::map<TinyRenderObjectData*, ObjectState>::iterator found = m_data->m_objects.find(renderObj);
 	if (found == m_data->m_objects.end())
 		return;
+	if (renderObj->m_renderInstanced)
+	{
+		// A rewritten mesh must never refit the immutable tree used by its other placements.
+		if (found->second.m_instance)
+			m_data->dropInstance(found->second.m_instance);
+		found->second.m_instance = 0;
+		found->second.m_deformed = true;
+		return;
+	}
 	// A rewritten static member counts as moved at the next sync; a mover refits its tree.
 	if (found->second.m_member && !found->second.m_member->m_retired)
 		found->second.m_member->m_transform[15] = -1.0f;
@@ -1254,6 +1617,8 @@ void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)
 	}
 	if (state.m_instance)
 		m_data->dropInstance(state.m_instance);
+	if (state.m_batch)
+		m_data->dropBatch(state.m_batch);
 }
 
 void SwarmRaycast::removeAll()
@@ -1264,6 +1629,7 @@ void SwarmRaycast::removeAll()
 		if (it->second.m_instance)
 			m_data->dropInstance(it->second.m_instance);
 	m_data->m_objects.clear();
+	m_data->releaseForest();
 	// Retired members keep their triangles until the world is cleared, which is what happens here.
 	rtcDetachGeometry(m_data->m_top, m_data->m_staticInstanceId);
 	m_data->releaseStatic();
@@ -1281,6 +1647,20 @@ void SwarmRaycast::commit()
 		rtcCommitScene(m_data->m_static);
 		m_data->m_staticBuilt = true;
 		m_data->m_topDirty = true;
+	}
+	// The forest is committed before the instance that reaches it, and both parents after it.
+	if (m_data->m_forestDirty)
+	{
+		rtcCommitScene(m_data->m_forest);
+		rtcCommitGeometry(m_data->m_forestInstance);
+		m_data->m_forestDirty = false;
+		m_data->m_topDirty = true;
+		m_data->m_staticShadowsDirty = m_data->m_staticShadows != 0;
+	}
+	if (m_data->m_staticShadowsDirty)
+	{
+		rtcCommitScene(m_data->m_staticShadows);
+		m_data->m_staticShadowsDirty = false;
 	}
 	if (m_data->m_topDirty)
 	{
@@ -1306,6 +1686,8 @@ struct HitSurface
 	const float* m_normals;
 	const float* m_uvs;
 	unsigned m_vertexIds[3];
+	float m_cornerNormals[9];
+	bool m_transformedNormals;
 	float m_corners[3][3];
 	bool m_doubleSided;
 	bool m_hasAlpha;
@@ -1413,12 +1795,53 @@ inline float powInt(float x, int e)
 
 // Segmentation id of a hit, plus the surface when asked for; false for a hit the scene does not know.
 bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMember*>& members,
-				const std::vector<Instance*>& instances, int& segmentation, HitSurface* surface)
+				const std::vector<Instance*>& instances, const std::vector<Batch*>& batches, unsigned forestId,
+				int& segmentation, HitSurface* surface)
 {
 	const float* vertices;
 	const unsigned* indices;
 	const float* transform = 0;
-	if (hit.instID[0] == staticId)
+	const float* cornerRotation = 0;
+	float placement[16];
+	float normalRotation[9];
+	if (surface)
+		surface->m_transformedNormals = false;
+	if (forestId != RTC_INVALID_GEOMETRY_ID && hit.instID[0] == forestId)
+	{
+		if (hit.instID[1] >= batches.size() || !batches[hit.instID[1]])
+			return false;
+		const Batch* batch = batches[hit.instID[1]];
+		segmentation = batch->m_segmentation;
+		if (!surface)
+			return true;
+		const float* t = &batch->m_transforms[(size_t)hit.instPrimID[1] * 12];
+		for (int c = 0; c < 4; c++)
+		{
+			for (int r = 0; r < 3; r++)
+				placement[c * 4 + r] = t[c * 3 + r];
+			placement[c * 4 + 3] = c == 3 ? 1.0f : 0.0f;
+		}
+		// Inverse transpose keeps normals perpendicular under a non-uniform or mirrored placement.
+		btMatrix3x3 basis(t[0], t[3], t[6], t[1], t[4], t[7], t[2], t[5], t[8]);
+		const btScalar det = basis.determinant();
+		const btMatrix3x3 normal = det != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
+		for (int r = 0; r < 3; r++)
+			for (int c = 0; c < 3; c++)
+				normalRotation[r * 3 + c] = (float)normal[r][c];
+		surface->m_model = batch->m_obj->m_model;
+		surface->m_doubleSided = batch->m_doubleSided;
+		surface->m_hasAlpha = batch->m_hasAlpha;
+		surface->m_glass = batch->m_glass;
+		surface->m_rotation = 0;
+		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
+		surface->m_uvs = batch->m_tree->m_uvs.data();
+		vertices = &batch->m_tree->m_vertices[0];
+		indices = &batch->m_tree->m_indices[0];
+		transform = placement;
+		cornerRotation = normalRotation;
+		surface->m_transformedNormals = surface->m_normals != 0;
+	}
+	else if (hit.instID[0] == staticId)
 	{
 		if (hit.geomID >= members.size())
 			return false;
@@ -1454,11 +1877,23 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		vertices = &inst->m_tree->m_vertices[0];
 		indices = &inst->m_tree->m_indices[0];
 		transform = inst->m_transform;
+		cornerRotation = inst->m_rotation;
+		surface->m_transformedNormals = inst->m_staticShared && surface->m_normals;
 	}
 	for (int j = 0; j < 3; j++)
 	{
 		const unsigned id = indices[(size_t)hit.primID * 3 + j];
 		surface->m_vertexIds[j] = id;
+		if (surface->m_transformedNormals)
+		{
+			const float* n = surface->m_normals + (size_t)id * 3;
+			float* out = surface->m_cornerNormals + j * 3;
+			for (int r = 0; r < 3; r++)
+				out[r] = dot3(cornerRotation + r * 3, n);
+			const float length = sqrtf(dot3(out, out));
+			for (int r = 0; r < 3; r++)
+				out[r] = length > 0.0f ? out[r] / length : 0.0f;
+		}
 		const float* v = vertices + (size_t)id * 3;
 		if (transform)
 			transformPoint(transform, v, surface->m_corners[j]);
@@ -1525,9 +1960,9 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		uv.y += uvj[1] * weights[j];
 		if (!surface.m_normals)
 			continue;
-		const float* nj = surface.m_normals + (size_t)surface.m_vertexIds[j] * 3;
+		const float* nj = surface.m_transformedNormals ? surface.m_cornerNormals + j * 3 : surface.m_normals + (size_t)surface.m_vertexIds[j] * 3;
 		for (int r = 0; r < 3; r++)
-			normal[r] += (surface.m_rotation ? dot3(surface.m_rotation + r * 3, nj) : nj[r]) * weights[j];
+			normal[r] += (surface.m_rotation && !surface.m_transformedNormals ? dot3(surface.m_rotation + r * 3, nj) : nj[r]) * weights[j];
 	}
 	if (!surface.m_normals)
 		for (int i = 0; i < 3; i++)
@@ -1594,9 +2029,9 @@ void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNor
 		uv.y += uvj[1] * weights[j];
 		if (!surface.m_normals)
 			continue;
-		const float* nj = surface.m_normals + (size_t)surface.m_vertexIds[j] * 3;
+		const float* nj = surface.m_transformedNormals ? surface.m_cornerNormals + j * 3 : surface.m_normals + (size_t)surface.m_vertexIds[j] * 3;
 		for (int r = 0; r < 3; r++)
-			normal[r] += (surface.m_rotation ? dot3(surface.m_rotation + r * 3, nj) : nj[r]) * weights[j];
+			normal[r] += (surface.m_rotation && !surface.m_transformedNormals ? dot3(surface.m_rotation + r * 3, nj) : nj[r]) * weights[j];
 	}
 	if (!surface.m_normals)
 		for (int i = 0; i < 3; i++)
@@ -1742,6 +2177,8 @@ struct TileJob
 	RTCScene m_top;
 	const std::vector<Instance*>* m_instances;
 	const std::vector<StaticMember*>* m_members;
+	const std::vector<Batch*>* m_batches;
+	unsigned m_forestId;
 	const SwarmRaycastShading* m_shading;
 	// The light's view of the static tree when the shadow comes from the map; null for shadow rays.
 	const ShadowMap* m_shadowMap;
@@ -1761,6 +2198,9 @@ struct HitId
 	unsigned m_inst;
 	unsigned m_geom;
 	unsigned m_prim;
+	// Inside the forest: the batch and the placement within it.
+	unsigned m_inst1;
+	unsigned m_instPrim1;
 };
 
 // What one ray brings back: the clip depth and its reciprocal eye depth, the segmentation id and
@@ -1914,11 +2354,13 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 
 	int segmentation = -1;
 	HitSurface surface;
-	const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, shading ? &surface : 0);
+	const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, shading ? &surface : 0);
 	out.m_segmentation = segmentation;
 	out.m_hit.m_inst = rayhit.hit.instID[0];
 	out.m_hit.m_geom = rayhit.hit.geomID;
 	out.m_hit.m_prim = rayhit.hit.primID;
+	out.m_hit.m_inst1 = rayhit.hit.instID[1];
+	out.m_hit.m_instPrim1 = rayhit.hit.instPrimID[1];
 	out.m_shaded = shading && known;
 	if (!out.m_shaded)
 		return true;
@@ -1974,7 +2416,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			rtcIntersect1(job.m_top, &next, args);
 			int backSegmentation = -1;
 			HitSurface back;
-			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, backSegmentation, &back))
+			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
 			{
 				float behind[3];
 				if (shading->m_sky)
@@ -2119,9 +2561,12 @@ bool projectTriangle(const TileJob& job, const Camera& cam, const HitId& hit, do
 	rtcHit.instID[0] = hit.m_inst;
 	rtcHit.geomID = hit.m_geom;
 	rtcHit.primID = hit.m_prim;
+	rtcHit.instID[1] = hit.m_inst1;
+	rtcHit.instPrimID[0] = 0;
+	rtcHit.instPrimID[1] = hit.m_instPrim1;
 	int segmentation;
 	HitSurface surface;
-	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, segmentation, &surface))
+	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface))
 		return false;
 	for (int j = 0; j < 3; j++)
 	{
@@ -2135,6 +2580,11 @@ bool projectTriangle(const TileJob& job, const Camera& cam, const HitId& hit, do
 		y[j] = clip[1] / clip[3];
 	}
 	return true;
+}
+
+inline bool sameTriangle(const HitId& a, const HitId& b)
+{
+	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim && a.m_inst1 == b.m_inst1 && a.m_instPrim1 == b.m_instPrim1;
 }
 
 // The last few triangles a thread put onto the frame: an edge runs through several pixels that all
@@ -2152,7 +2602,7 @@ struct ProjectionCache
 bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam, const HitId& hit, const double*& x, const double*& y)
 {
 	for (int i = 0; i < cache.m_count; i++)
-		if (cache.m_key[i].m_inst == hit.m_inst && cache.m_key[i].m_geom == hit.m_geom && cache.m_key[i].m_prim == hit.m_prim)
+		if (sameTriangle(cache.m_key[i], hit))
 		{
 			x = cache.m_x[i];
 			y = cache.m_y[i];
@@ -2242,10 +2692,6 @@ struct Candidate
 	float m_depth;
 };
 
-inline bool sameTriangle(const HitId& a, const HitId& b)
-{
-	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim;
-}
 
 // Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
 // the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
@@ -2400,6 +2846,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_top = m_data->m_top;
 	job.m_instances = &m_data->m_byGeomId;
 	job.m_members = &m_data->m_members;
+	job.m_batches = &m_data->m_batches;
+	job.m_forestId = m_data->m_forestId;
 	job.m_shading = shading;
 	job.m_staticId = m_data->m_staticInstanceId;
 	job.m_width = width;
@@ -2450,7 +2898,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
 			continue;
 		HitId none;
-		none.m_inst = none.m_geom = none.m_prim = RTC_INVALID_GEOMETRY_ID;
+		none.m_inst = none.m_geom = none.m_prim = none.m_inst1 = none.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
 		scratch[i].m_ids.assign(numPixels, -1);
 		scratch[i].m_hits.assign(numPixels, none);
 		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
@@ -2476,6 +2924,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		QueryContext ctx;
 		rtcInitRayQueryContext(&ctx.m_context);
 		ctx.m_instances = job.m_instances;
+		ctx.m_batches = job.m_batches;
+		ctx.m_forestId = job.m_forestId;
 		ctx.m_anyWinding = false;
 		ctx.m_alphaCutout = alphaCutout;
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;

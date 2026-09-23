@@ -83,6 +83,7 @@ struct UrdfGeometry
 		FILE_CDF = 4,
 		MEMORY_VERTICES = 5,
 	        FILE_VTK = 6,
+		FILE_FOREST = 7,  // .fst: placements of OBJ meshes, drawn as one instanced forest batch
 
 	};
 	int m_meshFileType;
