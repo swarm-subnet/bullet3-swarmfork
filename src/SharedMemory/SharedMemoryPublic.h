@@ -907,6 +907,17 @@ enum EnumRendererAuxFlags
 	// Ray-cast shadows: a double-sided cut-out surface, a leaf or grass card, casts none, so a crown of
 	// cards is lit as one crown and not as a stack of blinds; it still receives every other shadow.
 	ER_SWARM_LEAF_NO_SHADOW = 16384,
+	// Ray-cast path: an 8-bit White Hot frame from surface temperatures, through a long-wave camera's lens, grain and
+	// per-frame contrast, written as R = G = B; the colour terms are not read.
+	ER_SWARM_THERMAL = 32768,
+};
+
+// The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.
+enum eThermalFields
+{
+	THERMAL_FIELD_TEMPERATURE = 1,
+	THERMAL_FIELD_EMISSIVITY = 2,
+	THERMAL_FIELD_HEAT_MAP = 4,
 };
 
 ///flags to pick the IK solver and other options

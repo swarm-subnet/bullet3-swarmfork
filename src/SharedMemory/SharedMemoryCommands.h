@@ -292,6 +292,10 @@ struct RequestPixelDataArgs
 	int m_skyTextureId;
 	float m_skyYaw;
 	float m_shadowCoreRadius;
+	// ER_SWARM_THERMAL arguments, carried under the same field bits
+	float m_airTemperature;
+	float m_skyTemperature;
+	int m_thermalSeed;
 };
 
 enum EnumRequestPixelDaylightFields
@@ -300,6 +304,9 @@ enum EnumRequestPixelDaylightFields
 	REQUEST_PIXEL_DAYLIGHT_HAZE = 2,
 	REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO = 4,
 	REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE = 8,
+	REQUEST_PIXEL_THERMAL_AIR = 16,
+	REQUEST_PIXEL_THERMAL_SKY = 32,
+	REQUEST_PIXEL_THERMAL_SEED = 64,
 };
 
 enum EnumRequestPixelDataUpdateFlags
@@ -412,6 +419,7 @@ enum EnumUpdateVisualShapeData
 	CMD_UPDATE_VISUAL_SHAPE_RGBA_COLOR = 2,
 	CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR = 4,
 	CMD_UPDATE_VISUAL_SHAPE_FLAGS = 8,
+	CMD_UPDATE_VISUAL_SHAPE_THERMAL = 16,
 };
 
 
@@ -425,6 +433,12 @@ struct UpdateVisualShapeDataArgs
 	double m_rgbaColor[4];
 	double m_specularColor[3];
 	int m_flags;
+	// ER_SWARM_THERMAL: the THERMAL_FIELD_ bits present, and their values
+	int m_thermalFields;
+	double m_temperature;
+	double m_emissivity;
+	int m_heatTextureUniqueId;
+	double m_heatRange[2];
 };
 
 struct LoadTextureArgs

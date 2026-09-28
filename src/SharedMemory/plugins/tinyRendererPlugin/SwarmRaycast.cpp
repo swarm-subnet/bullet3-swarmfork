@@ -22,6 +22,7 @@
 #include "../../../TinyRenderer/SwarmGamma.h"
 #include "SwarmDaylight.h"
 #include "SwarmSky.h"
+#include "SwarmThermal.h"
 #include "Bullet3Common/b3Logging.h"
 #include "LinearMath/btTransform.h"
 
@@ -800,6 +801,9 @@ struct SwarmRaycast::Data
 	float m_coreRadius;
 	// Static members whose shadow changed since the map was cast: retired, hidden or shown again.
 	std::vector<StaticMember*> m_shadowDirty;
+	// ER_SWARM_THERMAL: the static bodies seen from straight above, so a point knows how much open sky it has.
+	ShadowMap m_shelterMap;
+	std::vector<StaticMember*> m_shelterDirty;
 	// Mover instances attached to the mover scene, so a frame with none skips their shadow ray.
 	int m_moverCount;
 
@@ -807,6 +811,8 @@ struct SwarmRaycast::Data
 	{
 		if (m_shadowMap.m_built)
 			m_shadowDirty.push_back(member);
+		if (m_shelterMap.m_built)
+			m_shelterDirty.push_back(member);
 	}
 
 	// Casts the cells [col0, col1) x [row0, row1) of the shadow map from the start plane along -light
@@ -976,6 +982,24 @@ struct SwarmRaycast::Data
 			core.upper_z = upper[2];
 			buildShadowMap(m_shadowCore, core, lightDir, alphaCutout, leafNoShadow, threads);
 		}
+	}
+
+	// The shelter map is the shadow map of a light straight overhead; it is cast once per world and then only under
+	// the members that changed, since the sky does not move. Leaf cards shelter what is under them.
+	void prepareShelterMap(int upAxis, bool alphaCutout, int threads)
+	{
+		float up[3] = {0.0f, 0.0f, 0.0f};
+		up[upAxis] = 1.0f;
+		if (!m_shelterMap.m_built || m_shelterMap.m_alphaCutout != alphaCutout || memcmp(m_shelterMap.m_lightDir, up, sizeof(up)) != 0)
+		{
+			RTCBounds bounds;
+			rtcGetSceneBounds(m_staticShadows ? m_staticShadows : m_static, &bounds);
+			buildShadowMap(m_shelterMap, bounds, up, alphaCutout, false, threads);
+		}
+		else
+			for (size_t i = 0; i < m_shelterDirty.size(); i++)
+				recastMember(m_shelterMap, m_shelterDirty[i], threads);
+		m_shelterDirty.clear();
 	}
 
 	void createStaticScene()
@@ -1306,7 +1330,7 @@ struct SwarmRaycast::Data
 		}
 		// Texture contents can change without changing the mesh or its pose.
 		if (changed || inst->m_doubleSided != obj->m_doubleSided || inst->m_textureRevision != obj->m_textureRevision)
-			m_shadowMap.m_built = false;
+			m_shadowMap.m_built = m_shelterMap.m_built = false;
 		inst->m_textureRevision = obj->m_textureRevision;
 		inst->m_enabled = enabled;
 		inst->m_doubleSided = obj->m_doubleSided;
@@ -1405,7 +1429,7 @@ struct SwarmRaycast::Data
 			changed = true;
 		}
 		if (changed || batch->m_doubleSided != obj->m_doubleSided || batch->m_textureRevision != obj->m_textureRevision)
-			m_shadowMap.m_built = false;
+			m_shadowMap.m_built = m_shelterMap.m_built = false;
 		batch->m_doubleSided = obj->m_doubleSided;
 		batch->m_hasAlpha = obj->m_model->hasAlpha();
 		batch->m_glass = obj->m_glass;
@@ -1431,7 +1455,7 @@ struct SwarmRaycast::Data
 		releaseTree(batch->m_tree);
 		m_batches[batch->m_geomId] = 0;
 		m_forestDirty = true;
-		m_shadowMap.m_built = false;
+		m_shadowMap.m_built = m_shelterMap.m_built = false;
 		delete batch;
 	}
 
@@ -1465,7 +1489,7 @@ struct SwarmRaycast::Data
 		{
 			rtcDetachGeometry(m_staticShadows, inst->m_geomId);
 			m_staticShadowsDirty = true;
-			m_shadowMap.m_built = false;
+			m_shadowMap.m_built = m_shelterMap.m_built = false;
 		}
 		else
 		{
@@ -1494,6 +1518,9 @@ struct SwarmRaycast::Data
 		m_shadowCore.m_built = false;
 		std::vector<float>().swap(m_shadowCore.m_depth);
 		m_shadowDirty.clear();
+		m_shelterMap.m_built = false;
+		std::vector<float>().swap(m_shelterMap.m_depth);
+		m_shelterDirty.clear();
 		for (size_t i = 0; i < m_members.size(); i++)
 		{
 			rtcReleaseGeometry(m_members[i]->m_geometry);
@@ -1528,6 +1555,7 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_moversDirty = true;
 	m_data->m_shadowMap.m_built = false;
 	m_data->m_shadowCore.m_built = false;
+	m_data->m_shelterMap.m_built = false;
 	m_data->m_coreRadius = 0.0f;
 	m_data->m_moverCount = 0;
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
@@ -1745,6 +1773,7 @@ struct HitSurface
 	bool m_doubleSided;
 	bool m_hasAlpha;
 	bool m_glass;
+	const TinyRenderThermal* m_thermal;
 };
 
 // Shadow rays start this far off the surface, along the face normal, so a surface never shades itself.
@@ -1888,6 +1917,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = batch->m_doubleSided;
 		surface->m_hasAlpha = batch->m_hasAlpha;
 		surface->m_glass = batch->m_glass;
+		surface->m_thermal = &batch->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
 		surface->m_uvs = batch->m_tree->m_uvs.data();
@@ -1909,6 +1939,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = member->m_doubleSided;
 		surface->m_hasAlpha = member->m_hasAlpha;
 		surface->m_glass = member->m_glass;
+		surface->m_thermal = &member->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
 		surface->m_uvs = member->m_uvs;
@@ -1927,6 +1958,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = inst->m_doubleSided;
 		surface->m_hasAlpha = inst->m_hasAlpha;
 		surface->m_glass = inst->m_glass;
+		surface->m_thermal = &inst->m_obj->m_thermal;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
 		surface->m_uvs = inst->m_tree->m_uvs.data();
@@ -2071,7 +2103,7 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 }
 // The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
 void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
-			   float normal[3], float base[3])
+			   float normal[3], float base[3], TinyRender::Vec2f* uvOut = 0)
 {
 	TinyRender::Model* model = surface.m_model;
 	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
@@ -2104,6 +2136,8 @@ void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNor
 	const TinyRender::Vec4f& rgba = model->getColorRGBA();
 	for (int i = 0; i < 3; i++)
 		base[i] = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+	if (uvOut)
+		*uvOut = uv;
 }
 
 // Daylight on a surface, in linear light: the sky in the direction it faces plus the sun, and the glint of the sky on glass.
@@ -2242,6 +2276,9 @@ struct TileJob
 	RTCScene m_movers;
 	// Under ER_SWARM_DAYLIGHT: the fine grid about the origin, read before the map for a point it covers.
 	const ShadowMap* m_shadowCore;
+	// Under ER_SWARM_THERMAL: the static bodies seen from straight above, for the open sky a point has, and the sky.
+	const ShadowMap* m_shelterMap;
+	SwarmThermal::Sky m_sky;
 	unsigned m_staticId;
 	int m_width;
 	int m_height;
@@ -2271,6 +2308,8 @@ struct Sample
 	HitId m_hit;
 	bool m_shaded;
 	unsigned char m_rgb[3];
+	// ER_SWARM_THERMAL: the in-band radiance reaching the camera along the ray, the sky's on a miss.
+	float m_radiance;
 };
 
 // Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
@@ -2357,6 +2396,121 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 	}
 }
 
+// ER_SWARM_THERMAL surfaces. Emissivity when none is set; an open surface cools by kSkyCooling of the air-to-zenith
+// gap and a black one facing a full sun warms by kSunHeating degrees. A texel brighter than its texture's mean is
+// warmer, by kPassiveDetail degrees per unit of linear luminance on a passive surface (soil, grass, moisture) and by
+// kSetDetail on one whose temperature is given (folds and seams), within kDetailLimit either way.
+const float kThermalEmissivity = 0.95f;
+const float kThermalGlassEmissivity = 0.84f;
+const float kSkyCooling = 0.1f;
+const float kSunHeating = 22.0f;
+const float kPassiveDetail = 25.0f;
+const float kSetDetail = 2.0f;
+const float kDetailLimit = 0.2f;
+// A footprint wide enough that the read is the last mip level, the texture's mean.
+const float kMeanFootprint = 1.0e4f;
+
+// Temperature a heat map gives at uv: its red byte from low to high, with the colour texture's wrap and nearest texel.
+float heatAt(const TinyRenderThermal& thermal, const TinyRender::Vec2f& uv)
+{
+	double whole;
+	float u = (float)modf((double)uv.x, &whole), v = (float)modf((double)uv.y, &whole);
+	u = u < 0.0f ? u + 1.0f : u;
+	v = v < 0.0f ? v + 1.0f : v;
+	const int w = thermal.m_heatWidth, h = thermal.m_heatHeight;
+	int x = (int)(u * w), y = (int)(v * h);
+	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
+	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
+	// The colour texture is stored bottom row first, so its row y is row h - 1 - y of the texels as loaded.
+	const unsigned char byte = thermal.m_heatTexels[((size_t)(h - 1 - y) * w + x) * 3];
+	return thermal.m_heatLow + (thermal.m_heatHigh - thermal.m_heatLow) * ((float)byte * (1.0f / 255.0f));
+}
+
+// Linear luminance of a texel times the object colour.
+float texelLuminance(TGAColor texel, const TinyRender::Vec4f& rgba)
+{
+	return (0.2126f * kSwarmSrgbToLinear[(unsigned char)(texel[0] * rgba[0])] + 0.7152f * kSwarmSrgbToLinear[(unsigned char)(texel[1] * rgba[1])]) +
+		   0.0722f * kSwarmSrgbToLinear[(unsigned char)(texel[2] * rgba[2])];
+}
+
+// Share of the pixel a cut-out covers, from its alpha averaged over the pixel's footprint; averaged says the footprint
+// spans more than one texel, the only case where a hit is a veil rather than a solid texel.
+float veilCoverage(const HitSurface& surface, const RTCHit& hit, const float duvdx[2], const float duvdy[2], bool* averaged)
+{
+	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	for (int j = 0; j < 3; j++)
+	{
+		const float* uvj = surface.m_uvs + (size_t)surface.m_vertexIds[j] * 2;
+		uv.x += uvj[0] * weights[j];
+		uv.y += uvj[1] * weights[j];
+	}
+	const float rx2 = duvdx[0] * duvdx[0] + duvdx[1] * duvdx[1], ry2 = duvdy[0] * duvdy[0] + duvdy[1] * duvdy[1];
+	return surface.m_model->alphaFiltered(uv, rx2 > ry2 ? rx2 : ry2, averaged) / 255.0f;
+}
+
+// In-band radiance leaving a hit towards the camera: the surface's emission at its temperature, plus the sky or the
+// surroundings its emissivity leaves it to reflect, mirrored about its normal when it is glossy.
+float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
+				 const float point[3], const float duvdx[2], const float duvdy[2])
+{
+	const SwarmRaycastShading& shading = *job.m_shading;
+	const int upAxis = shading.m_glint.m_upAxis;
+	const float air = shading.m_airTemperature, zenith = shading.m_skyTemperature;
+	float normal[3], base[3];
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	surfaceAt(surface, hit, faceNormal, true, duvdx, duvdy, normal, base, &uv);
+	const float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
+	TGAColor mean = surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(kMeanFootprint, 0.0f), TinyRender::Vec2f(0.0f, kMeanFootprint));
+	float detail = albedo - texelLuminance(mean, surface.m_model->getColorRGBA());
+	detail = detail < -kDetailLimit ? -kDetailLimit : (detail > kDetailLimit ? kDetailLimit : detail);
+
+	// Open sky: the shelter map read as if lit from straight overhead, times the share of the sky the surface's tilt
+	// faces. A leaf or grass card is a thin blade open on both sides, so it takes the open sky whole.
+	float up[3] = {0.0f, 0.0f, 0.0f};
+	up[upAxis] = 1.0f;
+	const float open = job.m_shelterMap ? shadowMapLit(*job.m_shelterMap, point, up) : 1.0f;
+	const float skyView = leafCard(surface.m_doubleSided, surface.m_hasAlpha) ? open : open * 0.5f * (1.0f + normal[upAxis]);
+
+	const TinyRenderThermal& thermal = *surface.m_thermal;
+	float temperature;
+	if (thermal.m_heatTexels)
+		temperature = heatAt(thermal, uv) + kSetDetail * detail;
+	else if (thermal.m_hasTemperature)
+		temperature = thermal.m_temperature + kSetDetail * detail;
+	else
+	{
+		temperature = air - kSkyCooling * (air - zenith) * skyView + kPassiveDetail * detail;
+		const float nDotL = dot3(normal, shading.m_lightDir);
+		if (shading.m_lightDir[upAxis] > 0.0f && nDotL > 0.0f)
+		{
+			const float lit = job.m_shadowMap ? shadowMapLit(*job.m_shadowMap, point, normal) : 1.0f;
+			const float sun = (0.2126f * shading.m_lightColor[0] + 0.7152f * shading.m_lightColor[1]) + 0.0722f * shading.m_lightColor[2];
+			temperature += kSunHeating * sun * (1.0f - albedo) * nDotL * lit;
+		}
+	}
+
+	const float emissivity = thermal.m_emissivity >= 0.0f ? thermal.m_emissivity : (surface.m_glass ? kThermalGlassEmissivity : kThermalEmissivity);
+	float reflectance = 1.0f - emissivity;
+	float environment;
+	const float* specular = &surface.m_model->getSpecularColor()[0];
+	if (surface.m_glass || specular[0] > 0.0f || specular[1] > 0.0f || specular[2] > 0.0f)
+	{
+		// Glossy: the Fresnel rise towards a mirror as the view grazes, and the sky in the mirrored direction.
+		const float toCamera[3] = {-dir[0], -dir[1], -dir[2]};
+		float nDotV = dot3(normal, toCamera);
+		nDotV = nDotV < 0.0f ? 0.0f : (nDotV > 1.0f ? 1.0f : nDotV);
+		const float away = 1.0f - nDotV, away2 = away * away;
+		reflectance += (1.0f - reflectance) * (away2 * away2 * away);
+		// Mirrored below the horizon it is the open ground, cooled as a passive surface is.
+		const float mirrorUp = normal[upAxis] * (2.0f * nDotV) - toCamera[upAxis];
+		environment = mirrorUp > 0.0f ? SwarmThermal::skyRadiance(job.m_sky, mirrorUp) : SwarmThermal::radiance(air - kSkyCooling * (air - zenith));
+	}
+	else
+		environment = skyView * job.m_sky.m_hemisphere + (1.0f - skyView) * job.m_sky.m_air;
+	return (1.0f - reflectance) * SwarmThermal::radiance(temperature) + reflectance * environment;
+}
+
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out)
 {
@@ -2381,6 +2535,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		toNear[i] = nearPoint[i] - cam.m_origin[i];
 	}
 	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+	if (shading && shading->m_thermal)
+		out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 
 	RTCRayHit rayhit;
 	rayhit.ray.org_x = cam.m_origin[0];
@@ -2437,7 +2593,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
 
 	float shadow = 1.0f;
-	if (shading->m_shadow)
+	if (shading->m_shadow && !shading->m_thermal)
 	{
 		const float point[3] = {hx, hy, hz};
 		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
@@ -2446,6 +2602,49 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
 	if (filtered)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
+
+	if (shading->m_thermal)
+	{
+		const float point[3] = {hx, hy, hz};
+		float radiance = thermalHit(job, dir, surface, rayhit.hit, faceNormal, point, duvdx, duvdy);
+		bool averaged = false;
+		const float coverage = job.m_pixelSpread > 0.0f && surface.m_hasAlpha ? veilCoverage(surface, rayhit.hit, duvdx, duvdy, &averaged) : 1.0f;
+		if (averaged && coverage < 0.97f)
+		{
+			// A veil, such as a far fence or a thin crown: its share of the pixel, and the rest from what the ray meets next.
+			float behind = out.m_radiance;
+			RTCRayHit next = rayhit;
+			next.ray.tnear = t + kPaneBias;
+			next.ray.tfar = tNear + length;
+			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+			rtcIntersect1(job.m_top, &next, args);
+			int backSegmentation = -1;
+			HitSurface back;
+			if (next.hit.geomID != RTC_INVALID_GEOMETRY_ID &&
+				resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
+			{
+				float backWound[3], backFace[3], f1[3], f2[3];
+				for (int i = 0; i < 3; i++)
+				{
+					f1[i] = back.m_corners[1][i] - back.m_corners[0][i];
+					f2[i] = back.m_corners[2][i] - back.m_corners[0][i];
+				}
+				cross3(f1, f2, backWound);
+				const bool backAway = dot3(backWound, dir) > 0.0f;
+				for (int i = 0; i < 3; i++)
+					backFace[i] = backAway ? -backWound[i] : backWound[i];
+				float duv2x[2] = {0.0f, 0.0f}, duv2y[2] = {0.0f, 0.0f};
+				footprintAt(setup, rawDir, back, backWound, next.hit, duv2x, duv2y);
+				const float t2 = next.ray.tfar;
+				const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
+				behind = thermalHit(job, dir, back, next.hit, backFace, point2, duv2x, duv2y);
+			}
+			radiance = coverage * radiance + (1.0f - coverage) * behind;
+		}
+		out.m_radiance = radiance;
+		return true;
+	}
 
 	// A cut-out seen over many of its texels is a veil, such as a far chain-link fence: its coverage of the pixel is lit as
 	// the surface and the rest is the next surface along the ray, so thin wire fades as it does to a lens.
@@ -2614,8 +2813,9 @@ inline float inverseEyeDepth(const Camera& cam, float depth)
 
 // Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
 // written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
-// `scratch`, when given, records the id and triangle of every hit for the edge pass.
-void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, EdgeScratch* scratch,
+// `scratch`, when given, records the id and triangle of every hit for the edge pass. `radiance`, under ER_SWARM_THERMAL,
+// takes every pixel's in-band radiance, hit or miss, in place of a colour.
+void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, EdgeScratch* scratch, float* radiance,
 				int row0, int row1, int col0, int col1,
 				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
 {
@@ -2626,8 +2826,12 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		for (int col = col0; col < col1; col++)
 		{
 			Sample sample;
+			sample.m_radiance = 0.0f;
 			const size_t offset = (size_t)row * width + col;
-			if (!traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample))
+			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample);
+			if (radiance)
+				radiance[offset] = sample.m_radiance;
+			if (!hit)
 			{
 				if (scratch)
 					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
@@ -2642,7 +2846,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				scratch->m_hits[offset] = sample.m_hit;
 				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
-			if (sample.m_shaded)
+			if (sample.m_shaded && !radiance)
 				for (int i = 0; i < 3; i++)
 					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
 		}
@@ -2974,12 +3178,28 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	job.m_staticId = m_data->m_staticInstanceId;
 	job.m_width = width;
 	job.m_height = height;
-	job.m_filtered = shading && shading->m_textureFilter;
+	const bool thermal = shading && shading->m_thermal;
+	// Thermal reads every texture at its footprint, for the detail it takes from the mip chain.
+	job.m_filtered = shading && (shading->m_textureFilter || thermal);
 	// The map is cast on the calling thread's schedule before the pixel loop, which then only reads it.
 	job.m_shadowMap = 0;
 	job.m_shadowCore = 0;
+	job.m_shelterMap = 0;
 	job.m_movers = 0;
-	if (shading && shading->m_shadow && shading->m_shadowMap)
+	if (thermal)
+	{
+		// The shelter map every frame, the sun's map only while the sun is up; movers leave no warm print of their shade.
+		const int upAxis = shading->m_glint.m_upAxis;
+		job.m_sky = SwarmThermal::sky(shading->m_airTemperature, shading->m_skyTemperature);
+		m_data->prepareShelterMap(upAxis, alphaCutout, threads);
+		job.m_shelterMap = &m_data->m_shelterMap;
+		if (shading->m_lightDir[upAxis] > 0.0f)
+		{
+			m_data->prepareShadowMap(shading->m_lightDir, alphaCutout, shading->m_leafNoShadow, m_data->m_coreRadius, upAxis, threads);
+			job.m_shadowMap = &m_data->m_shadowMap;
+		}
+	}
+	else if (shading && shading->m_shadow && shading->m_shadowMap)
 	{
 		m_data->prepareShadowMap(shading->m_lightDir, alphaCutout, shading->m_leafNoShadow, shading->m_daylight ? shading->m_shadowCoreRadius : 0.0f, shading->m_glint.m_upAxis, threads);
 		job.m_shadowMap = &m_data->m_shadowMap;
@@ -3014,7 +3234,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		}
 	}
 	job.m_pixelSpread = 0.0f;
-	if (job.m_filtered && shading->m_daylight && numTargets > 0 && setups[0].m_valid)
+	if (job.m_filtered && (shading->m_daylight || thermal) && numTargets > 0 && setups[0].m_valid)
 	{
 		double step = 0.0, centre = 0.0;
 		for (int k = 0; k < 3; k++)
@@ -3026,7 +3246,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
 	}
 
-	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias) ? (size_t)numTargets : 0);
+	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
+	std::vector<float> radiance(thermal ? numPixels * (size_t)numTargets : 0);
 	for (size_t i = 0; i < scratch.size(); i++)
 	{
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
@@ -3098,11 +3319,17 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 				const int row1 = row0 + kTileSize < height ? row0 + kTileSize : height;
 				const int col1 = col0 + kTileSize < width ? col0 + kTileSize : width;
 				EdgeScratch* edge = (!scratch.empty() && !scratch[(size_t)camIndex].m_ids.empty()) ? &scratch[(size_t)camIndex] : 0;
+				float* cameraRadiance = thermal ? &radiance[(size_t)camIndex * numPixels] : 0;
 				if (pass == 0)
-					renderTile(job, setups[(size_t)camIndex], targets[camIndex], edge, row0, row1, col0, col1, &args, &shadowArgs);
+					renderTile(job, setups[(size_t)camIndex], targets[camIndex], edge, cameraRadiance, row0, row1, col0, col1, &args, &shadowArgs);
 				else if (edge)
 					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache);
 			}
 		}
 	}
+
+	// The camera chain needs the whole frame, so it runs once every ray has landed.
+	for (int i = 0; thermal && i < numTargets; i++)
+		if (setups[(size_t)i].m_valid && targets[i].m_rgb)
+			SwarmThermal::develop(&radiance[(size_t)i * numPixels], width, height, shading->m_thermalSeed, threads, targets[i].m_rgb);
 }
