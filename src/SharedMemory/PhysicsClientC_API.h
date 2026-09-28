@@ -277,6 +277,9 @@ extern "C"
 	B3_SHARED_API void b3RequestCameraImageSetHazeDistance(b3SharedMemoryCommandHandle commandHandle, float hazeDistance);
 	B3_SHARED_API void b3RequestCameraImageSetSkyPhoto(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, float yawDegrees);
 	B3_SHARED_API void b3RequestCameraImageSetShadowCoreRadius(b3SharedMemoryCommandHandle commandHandle, float radius);
+	B3_SHARED_API void b3RequestCameraImageSetAirTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius);
+	B3_SHARED_API void b3RequestCameraImageSetSkyTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius);
+	B3_SHARED_API void b3RequestCameraImageSetThermalSeed(b3SharedMemoryCommandHandle commandHandle, int seed);
 	B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow);
 	B3_SHARED_API void b3RequestCameraImageSelectRenderer(b3SharedMemoryCommandHandle commandHandle, int renderer);
 	B3_SHARED_API void b3RequestCameraImageSetFlags(b3SharedMemoryCommandHandle commandHandle, int flags);
@@ -352,6 +355,9 @@ extern "C"
 	B3_SHARED_API void b3UpdateVisualShapeFlags(b3SharedMemoryCommandHandle commandHandle, int flags);
 	
 	B3_SHARED_API void b3UpdateVisualShapeSpecularColor(b3SharedMemoryCommandHandle commandHandle, const double specularColor[/*3*/]);
+	B3_SHARED_API void b3UpdateVisualShapeTemperature(b3SharedMemoryCommandHandle commandHandle, double temperature);
+	B3_SHARED_API void b3UpdateVisualShapeEmissivity(b3SharedMemoryCommandHandle commandHandle, double emissivity);
+	B3_SHARED_API void b3UpdateVisualShapeHeatMap(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, double low, double high);
 
 	B3_SHARED_API b3SharedMemoryCommandHandle b3InitPhysicsParamCommand(b3PhysicsClientHandle physClient);
 	B3_SHARED_API b3SharedMemoryCommandHandle b3InitPhysicsParamCommand2(b3SharedMemoryCommandHandle commandHandle);

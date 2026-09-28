@@ -4417,6 +4417,12 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 							m_data->m_pluginManager.getRenderInterface()->setHazeDistance(clientCmd.m_requestPixelDataArguments.m_hazeDistance);
 						if ((fields & REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE) != 0)
 							m_data->m_pluginManager.getRenderInterface()->setShadowCoreRadius(clientCmd.m_requestPixelDataArguments.m_shadowCoreRadius);
+						if ((fields & REQUEST_PIXEL_THERMAL_AIR) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setAirTemperature(clientCmd.m_requestPixelDataArguments.m_airTemperature);
+						if ((fields & REQUEST_PIXEL_THERMAL_SKY) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSkyTemperature(clientCmd.m_requestPixelDataArguments.m_skyTemperature);
+						if ((fields & REQUEST_PIXEL_THERMAL_SEED) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setThermalSeed(clientCmd.m_requestPixelDataArguments.m_thermalSeed);
 						m_data->m_pluginManager.getRenderInterface()->setSkyPhoto((fields & REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO) != 0, clientCmd.m_requestPixelDataArguments.m_skyTextureId, clientCmd.m_requestPixelDataArguments.m_skyYaw);
 					}
 
@@ -14745,6 +14751,21 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 				clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex,-1);
 			}
 		}
+	}
+
+	// Temperatures only reach the software renderer, whatever kind of body carries the shape.
+	if ((clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_THERMAL) && m_data->m_pluginManager.getRenderInterface())
+	{
+		const UpdateVisualShapeDataArgs& thermal = clientCmd.m_updateVisualShapeDataArguments;
+		int heatTexture = -1;
+		if ((thermal.m_thermalFields & THERMAL_FIELD_HEAT_MAP) && thermal.m_heatTextureUniqueId >= 0)
+		{
+			InternalTextureHandle* heatHandle = m_data->m_textureHandles.getHandle(thermal.m_heatTextureUniqueId);
+			heatTexture = heatHandle ? heatHandle->m_tinyRendererTextureId : -1;
+		}
+		m_data->m_pluginManager.getRenderInterface()->changeThermal(thermal.m_bodyUniqueId, thermal.m_jointIndex, thermal.m_shapeIndex,
+																	 thermal.m_thermalFields, (float)thermal.m_temperature, (float)thermal.m_emissivity,
+																	 heatTexture, (float)thermal.m_heatRange[0], (float)thermal.m_heatRange[1]);
 	}
 
 	{

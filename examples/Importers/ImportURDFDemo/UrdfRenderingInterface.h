@@ -44,6 +44,12 @@ struct UrdfRenderingInterface
 	///change the specular color for some visual shape; renderers without a use for it keep the default
 	virtual void changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3]) {}
 
+	///ER_SWARM_THERMAL: change the fields of a visual shape that `fields` names (the THERMAL_FIELD_ bits): a temperature
+	///in degrees Celsius, NaN making the surface passive again; an emissivity, below zero for the default; a heat map
+	///texture whose red byte runs from low to high degrees, -1 removing it
+	virtual void changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
+							   int textureUniqueId, float low, float high) {}
+
 	//change the instance flags, double-sided rendering
 	virtual void changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags) = 0;
 
@@ -94,6 +100,15 @@ struct UrdfRenderingInterface
 
 	///share of the direct light a shadowed surface keeps on the ray-cast path: 0.8 is the rasteriser's floor, 0 a full shadow
 	virtual void setShadowLightCoeff(float shadowLightCoeff) {}
+
+	///ER_SWARM_THERMAL: the air in degrees Celsius, which is the sky at the horizon and what a passive surface starts from
+	virtual void setAirTemperature(float celsius) {}
+
+	///ER_SWARM_THERMAL: apparent temperature of the clear sky straight up, in degrees Celsius
+	virtual void setSkyTemperature(float celsius) {}
+
+	///ER_SWARM_THERMAL: seed of the frame's sensor grain
+	virtual void setThermalSeed(int seed) {}
 
 	///ER_SWARM_DAYLIGHT: scale on the linear light before the film curve; 1 is the sky as built
 	virtual void setExposure(float exposure) {}

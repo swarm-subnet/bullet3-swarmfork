@@ -78,6 +78,26 @@ struct TinyRenderGlint
 	}
 };
 
+// What ER_SWARM_THERMAL reads from one render object. Without a temperature the surface is passive: it follows the
+// air, cooling where it sees the night sky and warming where the sun reaches it.
+struct TinyRenderThermal
+{
+	bool m_hasTemperature;
+	float m_temperature;  // degrees Celsius
+	float m_emissivity;   // below zero: 0.95, or 0.84 for a VISUAL_SHAPE_GLASS pane
+	// A heat map: RGB rows as loaded, owned by the renderer's texture list; the red byte runs m_heatLow to m_heatHigh.
+	const unsigned char* m_heatTexels;
+	int m_heatWidth;
+	int m_heatHeight;
+	float m_heatLow;
+	float m_heatHigh;
+
+	TinyRenderThermal()
+		: m_hasTemperature(false), m_temperature(0.f), m_emissivity(-1.f), m_heatTexels(0), m_heatWidth(0), m_heatHeight(0), m_heatLow(0.f), m_heatHigh(0.f)
+	{
+	}
+};
+
 struct TinyRenderObjectData
 {
 	//Camera
@@ -137,6 +157,7 @@ struct TinyRenderObjectData
 	TinyRender::Matrix placementMatrix(size_t index) const;
 	bool m_renderTreeCache;  // VISUAL_SHAPE_RENDER_TREE_CACHE: the ray-cast tree of this static body is kept on disk
 	bool m_glass;  // VISUAL_SHAPE_GLASS: a thin pane on the daylight path, sky by Fresnel plus the tinted view through
+	TinyRenderThermal m_thermal;
 	TinyRenderGlint m_glint;
 
 	btVector3 m_localAABBMin;

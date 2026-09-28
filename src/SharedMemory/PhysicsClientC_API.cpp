@@ -4711,6 +4711,27 @@ B3_SHARED_API void b3RequestCameraImageSetShadowCoreRadius(b3SharedMemoryCommand
 	command->m_requestPixelDataArguments.m_shadowCoreRadius = radius;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetAirTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_THERMAL_AIR);
+	command->m_requestPixelDataArguments.m_airTemperature = celsius;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSkyTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_THERMAL_SKY);
+	command->m_requestPixelDataArguments.m_skyTemperature = celsius;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetThermalSeed(b3SharedMemoryCommandHandle commandHandle, int seed)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_THERMAL_SEED);
+	command->m_requestPixelDataArguments.m_thermalSeed = seed;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
@@ -5357,6 +5378,53 @@ B3_SHARED_API void b3UpdateVisualShapeSpecularColor(b3SharedMemoryCommandHandle 
 		command->m_updateVisualShapeDataArguments.m_specularColor[1] = specularColor[1];
 		command->m_updateVisualShapeDataArguments.m_specularColor[2] = specularColor[2];
 		command->m_updateFlags |= CMD_UPDATE_VISUAL_SHAPE_SPECULAR_COLOR;
+	}
+}
+
+// Each thermal setter marks its own field under the one update flag.
+static void b3UpdateVisualShapeMarkThermal(struct SharedMemoryCommand* command, int field)
+{
+	if ((command->m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_THERMAL) == 0)
+		command->m_updateVisualShapeDataArguments.m_thermalFields = 0;
+	command->m_updateVisualShapeDataArguments.m_thermalFields |= field;
+	command->m_updateFlags |= CMD_UPDATE_VISUAL_SHAPE_THERMAL;
+}
+
+B3_SHARED_API void b3UpdateVisualShapeTemperature(b3SharedMemoryCommandHandle commandHandle, double temperature)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_UPDATE_VISUAL_SHAPE);
+	if (command->m_type == CMD_UPDATE_VISUAL_SHAPE)
+	{
+		b3UpdateVisualShapeMarkThermal(command, THERMAL_FIELD_TEMPERATURE);
+		command->m_updateVisualShapeDataArguments.m_temperature = temperature;
+	}
+}
+
+B3_SHARED_API void b3UpdateVisualShapeEmissivity(b3SharedMemoryCommandHandle commandHandle, double emissivity)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_UPDATE_VISUAL_SHAPE);
+	if (command->m_type == CMD_UPDATE_VISUAL_SHAPE)
+	{
+		b3UpdateVisualShapeMarkThermal(command, THERMAL_FIELD_EMISSIVITY);
+		command->m_updateVisualShapeDataArguments.m_emissivity = emissivity;
+	}
+}
+
+B3_SHARED_API void b3UpdateVisualShapeHeatMap(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, double low, double high)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_UPDATE_VISUAL_SHAPE);
+	if (command->m_type == CMD_UPDATE_VISUAL_SHAPE)
+	{
+		b3UpdateVisualShapeMarkThermal(command, THERMAL_FIELD_HEAT_MAP);
+		command->m_updateVisualShapeDataArguments.m_heatTextureUniqueId = textureUniqueId;
+		command->m_updateVisualShapeDataArguments.m_heatRange[0] = low;
+		command->m_updateVisualShapeDataArguments.m_heatRange[1] = high;
 	}
 }
 

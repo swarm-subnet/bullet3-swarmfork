@@ -153,6 +153,10 @@ struct TinyRendererVisualShapeConverterInternalData
 	int m_skyTextureId;
 	float m_skyYaw;
 	float m_shadowCoreRadius;
+	// ER_SWARM_THERMAL arguments, each kept until the next call sets it.
+	float m_airTemperature;
+	float m_skyTemperature;
+	int m_thermalSeed;
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
@@ -200,6 +204,9 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_skyTextureId(-1),
 		m_skyYaw(0.0f),
 		m_shadowCoreRadius(0.0f),
+		m_airTemperature(20.0f),
+		m_skyTemperature(-20.0f),
+		m_thermalSeed(0),
 		m_hasShadow(false),
 		m_flags(0),
 		m_batchCameraCount(1),
@@ -344,6 +351,21 @@ void TinyRendererVisualShapeConverter::setSkyPhoto(bool enabled, int textureUniq
 void TinyRendererVisualShapeConverter::setShadowCoreRadius(float radius)
 {
 	m_data->m_shadowCoreRadius = radius > 0.0f ? radius : 0.0f;
+}
+
+void TinyRendererVisualShapeConverter::setAirTemperature(float celsius)
+{
+	m_data->m_airTemperature = celsius;
+}
+
+void TinyRendererVisualShapeConverter::setSkyTemperature(float celsius)
+{
+	m_data->m_skyTemperature = celsius;
+}
+
+void TinyRendererVisualShapeConverter::setThermalSeed(int seed)
+{
+	m_data->m_thermalSeed = seed;
 }
 
 // materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
@@ -2149,8 +2171,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	}
 
 	const bool depthOnly = (m_data->m_flags & ER_DEPTH_ONLY) != 0;
-	// The daylight model lives on the ray-cast colour path; elsewhere the flag has no effect.
-	const bool daylight = (m_data->m_flags & ER_SWARM_DAYLIGHT) != 0 && (m_data->m_flags & ER_SWARM_RAYCAST) != 0 && !depthOnly;
+	// Thermal and the daylight model live on the ray-cast colour path; elsewhere the flags have no effect. Thermal draws
+	// every pixel itself, sky included, so it takes no daylight, sun sky or painted sky.
+	const bool thermal = (m_data->m_flags & ER_SWARM_THERMAL) != 0 && (m_data->m_flags & ER_SWARM_RAYCAST) != 0 && !depthOnly;
+	const bool daylight = (m_data->m_flags & ER_SWARM_DAYLIGHT) != 0 && (m_data->m_flags & ER_SWARM_RAYCAST) != 0 && !depthOnly && !thermal;
 
 	// The sun sky is computed from the light once and kept while the light stays; it also tints
 	// the ambient term. Without it the tint is exactly 1, so the shading bytes are unchanged.
@@ -2160,7 +2184,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	// A sky photo needs its own texels, so only a texture the plugin still holds can serve as one.
 	const bool hasPhoto = daylight && m_data->m_hasSkyPhoto && m_data->m_skyTextureId >= 0 && m_data->m_skyTextureId < m_data->m_textures.size() &&
 						  m_data->m_textures[m_data->m_skyTextureId].textureData1 != 0;
-	if (((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 || hasPhoto) && !depthOnly)
+	if (((m_data->m_flags & ER_SWARM_SKY_SUN) != 0 || hasPhoto) && !depthOnly && !thermal)
 	{
 		float sunDir[3], sunColor[3];
 		for (int i = 0; i < 3; i++)
@@ -2208,7 +2232,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			glint.m_skyZenith[i] = (float)m_data->m_skyZenithColor[i];
 		}
 	}
-	if ((sunSky || m_data->m_hasSky) && !depthOnly)
+	if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
 	{
 		paintSky(viewMat, projMat, sunSky, daylight);
 	}
@@ -2222,7 +2246,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
 		// The sky is painted for the flip the rasterised path does once it has drawn; this path
 		// writes its rows the right way up and never flips, so the sky is turned over here.
-		if ((sunSky || m_data->m_hasSky) && !depthOnly)
+		if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
 			m_data->m_rgbColorBuffer.flip_vertically();
 		SwarmRaycastShading shading;
 		for (int i = 0; i < 3; i++)
@@ -2248,6 +2272,10 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_hazeDistance = m_data->m_hazeDistance;
 		shading.m_shadowCoreRadius = m_data->m_shadowCoreRadius;
 		shading.m_glint = glint;
+		shading.m_thermal = thermal;
+		shading.m_airTemperature = m_data->m_airTemperature;
+		shading.m_skyTemperature = m_data->m_skyTemperature;
+		shading.m_thermalSeed = (unsigned int)m_data->m_thermalSeed;
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;
 		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
@@ -2701,6 +2729,55 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 						}
 					}
 				}
+			}
+		}
+	}
+}
+
+void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
+													 int textureUniqueId, float low, float high)
+{
+	// A heat map reads the texels the plugin keeps for a loaded texture; one handed over to a mesh has none left here.
+	const unsigned char* heatTexels = 0;
+	int heatWidth = 0, heatHeight = 0;
+	if ((fields & THERMAL_FIELD_HEAT_MAP) && textureUniqueId >= 0)
+	{
+		if (textureUniqueId < m_data->m_textures.size() && m_data->m_textures[textureUniqueId].textureData1)
+		{
+			heatTexels = m_data->m_textures[textureUniqueId].textureData1;
+			heatWidth = m_data->m_textures[textureUniqueId].m_width;
+			heatHeight = m_data->m_textures[textureUniqueId].m_height;
+		}
+		else
+			b3Warning("changeVisualShape: the heat map texture %d has no texels to read", textureUniqueId);
+	}
+	for (int n = 0; n < m_data->m_swRenderInstances.size(); n++)
+	{
+		TinyRendererObjectArray** visualArrayPtr = m_data->m_swRenderInstances.getAtIndex(n);
+		if (!visualArrayPtr || !*visualArrayPtr)
+			continue;
+		TinyRendererObjectArray* visualArray = *visualArrayPtr;
+		if (visualArray->m_objectUniqueId != bodyUniqueId || visualArray->m_linkIndex != linkIndex)
+			continue;
+		for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
+		{
+			if (shapeIndex >= 0 && shapeIndex != v)
+				continue;
+			TinyRenderThermal& thermal = visualArray->m_renderObjects[v]->m_thermal;
+			if (fields & THERMAL_FIELD_TEMPERATURE)
+			{
+				thermal.m_hasTemperature = temperature == temperature;
+				thermal.m_temperature = thermal.m_hasTemperature ? temperature : 0.f;
+			}
+			if (fields & THERMAL_FIELD_EMISSIVITY)
+				thermal.m_emissivity = emissivity;
+			if (fields & THERMAL_FIELD_HEAT_MAP)
+			{
+				thermal.m_heatTexels = heatTexels;
+				thermal.m_heatWidth = heatWidth;
+				thermal.m_heatHeight = heatHeight;
+				thermal.m_heatLow = low;
+				thermal.m_heatHigh = high;
 			}
 		}
 	}

@@ -34,6 +34,9 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 
 	virtual void changeShapeTexture(int bodyUniqueId, int linkIndex, int shapeIndex, int textureUniqueId);
 
+	virtual void changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
+							   int textureUniqueId, float low, float high);
+
 	virtual void setUpAxis(int axis);
 
 	virtual void resetCamera(float camDist, float yaw, float pitch, float camPosX, float camPosY, float camPosZ);
@@ -58,6 +61,9 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void setHazeDistance(float hazeDistance);
 	virtual void setSkyPhoto(bool enabled, int textureUniqueId, float yawDegrees);
 	virtual void setShadowCoreRadius(float radius);
+	virtual void setAirTemperature(float celsius);
+	virtual void setSkyTemperature(float celsius);
+	virtual void setThermalSeed(int seed);
 	virtual void setShadow(bool hasShadow);
 	virtual void setFlags(int flags);
 

@@ -7935,9 +7935,32 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 	PyObject* rgbaColorObj = 0;
 	PyObject* specularColorObj = 0;
 	int flags = -1;
+	// ER_SWARM_THERMAL: a temperature (NaN makes the surface passive again), an emissivity, and a heat map texture with
+	// the range its red byte spans (-1 removes it)
+	PyObject* temperatureObj = 0;
+	PyObject* emissivityObj = 0;
+	int thermalTextureUniqueId = -2;
+	PyObject* temperatureRangeObj = 0;
+	double temperatureRange[2] = {0, 0};
+	int hasTemperature, hasEmissivity;
+	double temperature, emissivity;
 	b3PhysicsClientHandle sm = 0;
-	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOii", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags , &physicsClientId))
+	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", "temperature", "emissivity", "thermalTextureUniqueId", "temperatureRange", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOiiOOiO", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags, &physicsClientId,
+									 &temperatureObj, &emissivityObj, &thermalTextureUniqueId, &temperatureRangeObj))
+	{
+		return NULL;
+	}
+	if (thermalTextureUniqueId >= 0 && !pybullet_internalSetVector2d(temperatureRangeObj, temperatureRange))
+	{
+		PyErr_SetString(SpamError, "thermalTextureUniqueId needs temperatureRange=[low, high] in degrees Celsius.");
+		return NULL;
+	}
+	hasTemperature = temperatureObj && temperatureObj != Py_None;
+	hasEmissivity = emissivityObj && emissivityObj != Py_None;
+	temperature = hasTemperature ? PyFloat_AsDouble(temperatureObj) : 0;
+	emissivity = hasEmissivity ? PyFloat_AsDouble(emissivityObj) : 0;
+	if (PyErr_Occurred())
 	{
 		return NULL;
 	}
@@ -7972,6 +7995,18 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 		if (flags >= 0)
 		{
 			b3UpdateVisualShapeFlags(commandHandle, flags);
+		}
+		if (hasTemperature)
+		{
+			b3UpdateVisualShapeTemperature(commandHandle, temperature);
+		}
+		if (hasEmissivity)
+		{
+			b3UpdateVisualShapeEmissivity(commandHandle, emissivity);
+		}
+		if (thermalTextureUniqueId >= -1)
+		{
+			b3UpdateVisualShapeHeatMap(commandHandle, thermalTextureUniqueId, temperatureRange[0], temperatureRange[1]);
 		}
 
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, commandHandle);
@@ -10159,6 +10194,12 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int skyTextureId = -1;
 	float skyYaw = 0;
 	float shadowCoreRadius = -1;
+	// ER_SWARM_THERMAL arguments; absent leaves the last setting in place
+	PyObject* airTemperatureObj = 0;
+	PyObject* skyTemperatureObj = 0;
+	PyObject* thermalSeedObj = 0;
+	float airTemperature, skyTemperature;
+	int thermalSeed;
 	int flags = -1;
 	int renderer = -1;
 	// inialize cmd
@@ -10166,9 +10207,22 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", "airTemperature", "skyTemperature", "thermalSeed", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiff", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiffOOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius, &airTemperatureObj, &skyTemperatureObj, &thermalSeedObj))
+	{
+		return NULL;
+	}
+	if (airTemperatureObj == Py_None)
+		airTemperatureObj = 0;
+	if (skyTemperatureObj == Py_None)
+		skyTemperatureObj = 0;
+	if (thermalSeedObj == Py_None)
+		thermalSeedObj = 0;
+	airTemperature = airTemperatureObj ? (float)PyFloat_AsDouble(airTemperatureObj) : 0;
+	skyTemperature = skyTemperatureObj ? (float)PyFloat_AsDouble(skyTemperatureObj) : 0;
+	thermalSeed = thermalSeedObj ? (int)PyLong_AsLong(thermalSeedObj) : 0;
+	if (PyErr_Occurred())
 	{
 		return NULL;
 	}
@@ -10255,6 +10309,18 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (shadowCoreRadius >= 0)
 	{
 		b3RequestCameraImageSetShadowCoreRadius(command, shadowCoreRadius);
+	}
+	if (airTemperatureObj)
+	{
+		b3RequestCameraImageSetAirTemperature(command, airTemperature);
+	}
+	if (skyTemperatureObj)
+	{
+		b3RequestCameraImageSetSkyTemperature(command, skyTemperature);
+	}
+	if (thermalSeedObj)
+	{
+		b3RequestCameraImageSetThermalSeed(command, thermalSeed);
 	}
 
 	if (flags >= 0)
@@ -13102,7 +13168,8 @@ static PyMethodDef SpamMethods[] = {
 	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
 	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky, "
 	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path, and under "
-	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius), and return the "
+	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius, and under "
+	 "ER_SWARM_THERMAL airTemperature, skyTemperature and thermalSeed), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
@@ -13197,7 +13264,8 @@ static PyMethodDef SpamMethods[] = {
 	 "Return the collision shape information for one object."},
 
 	{"changeVisualShape", (PyCFunction)pybullet_changeVisualShape, METH_VARARGS | METH_KEYWORDS,
-	 "Change part of the visual shape information for one object."},
+	 "Change part of the visual shape information for one object; under ER_SWARM_THERMAL also its temperature, emissivity, "
+	 "and a heat map thermalTextureUniqueId with the temperatureRange its red byte spans."},
 
 	{"resetVisualShapeData", (PyCFunction)pybullet_changeVisualShape, METH_VARARGS | METH_KEYWORDS,
 	 "Obsolete method, kept for backward compatibility, use changeVisualShapeData instead."},
@@ -13566,6 +13634,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_LINEAR_LIGHT", ER_SWARM_LINEAR_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_LEAF_NO_SHADOW", ER_SWARM_LEAF_NO_SHADOW);
+	PyModule_AddIntConstant(m, "ER_SWARM_THERMAL", ER_SWARM_THERMAL);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

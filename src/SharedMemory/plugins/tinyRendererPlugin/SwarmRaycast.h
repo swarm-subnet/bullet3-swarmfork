@@ -51,6 +51,13 @@ struct SwarmRaycastShading
 	float m_hazeDistance;      // metres at which a hit is 63 % haze; 0 turns the haze off
 	float m_shadowCoreRadius;  // half side of the fine shadow grid about the world origin; 0 for one grid
 	TinyRenderGlint m_glint;
+	// ER_SWARM_THERMAL: every pixel is in-band radiance from the surface temperatures, the camera chain makes the
+	// 8-bit White Hot frame, and the colour terms above are not read. The sky is m_airTemperature at the horizon and
+	// m_skyTemperature straight up; m_thermalSeed draws the frame's sensor grain.
+	bool m_thermal;
+	float m_airTemperature;
+	float m_skyTemperature;
+	unsigned int m_thermalSeed;
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh
