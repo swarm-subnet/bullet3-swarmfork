@@ -85,8 +85,11 @@ struct TinyRendererObjectArray
 	int m_linkIndex;
 	btTransform m_worldTransform;
 	btVector3 m_localScaling;
+	// Set while the ray-cast scene has not yet seen this pose, this scaling or a change to one of the render objects.
+	bool m_raycastDirty;
 
 	TinyRendererObjectArray()
+		: m_raycastDirty(true)
 	{
 		m_worldTransform.setIdentity();
 		m_localScaling.setValue(1, 1, 1);
@@ -242,7 +245,8 @@ struct TinyRendererVisualShapeConverterInternalData
 	}
 
 #ifdef SWARM_RAYCAST
-	// Brings every render object into the ray-cast scene and rebuilds the top-level tree.
+	// Brings every render object that changed since the last call into the ray-cast scene, in the same order as a
+	// full sync, and rebuilds the top-level tree; an unchanged object would leave the scene as it is.
 	SwarmRaycast& syncRaycast()
 	{
 		if (!m_raycast)
@@ -250,9 +254,10 @@ struct TinyRendererVisualShapeConverterInternalData
 		for (int n = 0; n < m_swRenderInstances.size(); n++)
 		{
 			TinyRendererObjectArray** visualArrayPtr = m_swRenderInstances.getAtIndex(n);
-			if (0 == visualArrayPtr)
+			if (0 == visualArrayPtr || !(*visualArrayPtr)->m_raycastDirty)
 				continue;
 			TinyRendererObjectArray* visualArray = *visualArrayPtr;
+			visualArray->m_raycastDirty = false;
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
 		}
@@ -1306,6 +1311,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			TinyRendererObjectArray* visuals = *visualsPtr;
 			visuals->m_objectUniqueId = bodyUniqueId;
 			visuals->m_linkIndex = linkIndex;
+			visuals->m_raycastDirty = true;
 
 			b3VisualShapeData visualShape;
 			visualShape.m_objectUniqueId = bodyUniqueId;
@@ -1633,6 +1639,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 				visuals->m_linkIndex = linkIndex;
 				visuals->m_objectUniqueId = bodyUniqueId;
 				visuals->m_renderObjects.push_back(tinyObj);
+				visuals->m_raycastDirty = true;
 			}
 			
 			shapes1->push_back(visualShape);
@@ -1655,6 +1662,7 @@ void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVe
 
 			if (renderObj->m_model->nverts() == numVertices)
 			{
+				visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
 				if (m_data->m_raycast)
 					m_data->m_raycast->meshChanged(renderObj);
@@ -1728,6 +1736,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
@@ -1770,6 +1779,7 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
@@ -2178,12 +2188,24 @@ void TinyRendererVisualShapeConverter::render()
 	render(viewMat, projMat);
 }
 
+// True when two poses and scalings hold the same bits in every component a render reads.
+static bool samePose(const btTransform& a, const btVector3& aScaling, const btTransform& b, const btVector3& bScaling)
+{
+	const size_t row = 3 * sizeof(btScalar);
+	for (int r = 0; r < 3; r++)
+		if (memcmp(&a.getBasis()[r][0], &b.getBasis()[r][0], row) != 0)
+			return false;
+	return memcmp(&a.getOrigin()[0], &b.getOrigin()[0], row) == 0 && memcmp(&aScaling[0], &bScaling[0], row) == 0;
+}
+
 void TinyRendererVisualShapeConverter::syncTransform(int shapeUniqueId, const btTransform& worldTransform, const btVector3& localScaling)
 {
 	TinyRendererObjectArray** renderObjPtr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (renderObjPtr)
 	{
 		TinyRendererObjectArray* renderObj = *renderObjPtr;
+		if (!samePose(renderObj->m_worldTransform, renderObj->m_localScaling, worldTransform, localScaling))
+			renderObj->m_raycastDirty = true;
 		renderObj->m_worldTransform = worldTransform;
 		renderObj->m_localScaling = localScaling;
 	}
@@ -2709,6 +2731,7 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 			}
 			model->recomputeNormals();
 			renderObj->computeLocalAABB();
+			visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
 			if (m_data->m_raycast)
 				m_data->m_raycast->meshChanged(renderObj);
@@ -2805,6 +2828,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 
 			if (visualArray->m_objectUniqueId == bodyUniqueId && visualArray->m_linkIndex == jointIndex)
 			{
+				visualArray->m_raycastDirty = true;
 				for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				{
 					TinyRenderObjectData* renderObj = visualArray->m_renderObjects[v];
