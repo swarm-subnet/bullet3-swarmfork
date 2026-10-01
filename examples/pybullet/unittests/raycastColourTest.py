@@ -185,6 +185,13 @@ class TestRaycastDepthHint(unittest.TestCase):
     warm = subprocess.check_output([sys.executable, __file__, "--hint", "warm"], text=True)
     self.assertEqual(first, warm)
 
+  def test_coincident_faces_resolve_as_in_a_first_frame(self):
+    """Two boxes sharing a top face among other bodies, seen from 50 places, resolve every tie as in a first frame."""
+    first = subprocess.check_output([sys.executable, __file__, "--ties", "first"], text=True)
+    warm = subprocess.check_output([sys.executable, __file__, "--ties", "warm"], text=True)
+    self.assertEqual(len(first.split()), 50)
+    self.assertEqual(first, warm)
+
 
 @NEEDS_BACKEND
 class TestRaycastColourThreads(unittest.TestCase):
@@ -238,9 +245,55 @@ def hint_hash(warm):
   os.rmdir(tmp)
 
 
+def build_coincident(flags, proj):
+  """Two 4 x 4 m boxes of different colours moved together to one pose, two small bodies nearer the cameras and four
+  further along the view, all moved once so each is its own instance box in the top tree; the opening frame is too
+  small to leave a last frame."""
+  bodies = []
+  for colour in ([1, 0, 0, 1], [0, 0, 1, 1]):
+    shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[2, 2, 0.25], rgbaColor=colour)
+    bodies.append((p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape), [0.1, 0.2, 0.25]))
+  for k in range(6):
+    shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3, 0.3, 0.3], rgbaColor=[0.15 * k, 0.8, 0.3, 1])
+    place = [-2.6 + 5.2 * (k % 2), -2.5, 0.8] if k < 2 else [-3.0 + 2.0 * (k - 2), 6.0 + 1.5 * (k - 2), 0.6]
+    bodies.append((p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape), place))
+  p.getCameraImage(16, 16, p.computeViewMatrix([0, -6, 4], [0, 0, 0], [0, 0, 1]), proj, renderer=p.ER_TINY_RENDERER, flags=flags)
+  for body, place in bodies:
+    p.resetBasePositionAndOrientation(body, place, [0, 0, 0, 1])
+
+
+def ties_hashes(warm):
+  """Prints one hash per camera place over the coincident boxes, each frame drawn first or right after a nearby one."""
+  p.connect(p.DIRECT)
+  rng = np.random.default_rng(7)
+  flags = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX | p.ER_SWARM_RAYCAST | getattr(p, "ER_EDGE_ANTIALIAS", 0)
+  proj = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 60.0)
+  build_coincident(flags, proj)
+  digests = []
+  for _ in range(50):
+    height = rng.uniform(2.0, 8.0)
+    pitch = np.radians(rng.uniform(30.0, 60.0))
+    eye = [rng.uniform(-0.5, 0.5), rng.uniform(-0.5, 0.5) - height / np.tan(pitch), height]
+    target = [eye[0], eye[1] + height / np.tan(pitch), 0.5]
+    if warm:
+      p.getCameraImage(SIZE, SIZE, p.computeViewMatrix([eye[0] + 0.3, eye[1] - 0.2, eye[2] + 0.2], target, [0, 0, 1]), proj,
+                       lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+    else:
+      p.resetSimulation()
+      build_coincident(flags, proj)
+    _, _, rgb, depth, seg = p.getCameraImage(SIZE, SIZE, p.computeViewMatrix(eye, target, [0, 0, 1]), proj,
+                                             lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+    blob = np.asarray(rgb, dtype=np.uint8).tobytes() + np.asarray(depth, dtype=np.float32).tobytes() + np.asarray(seg, dtype=np.int32).tobytes()
+    digests.append(hashlib.sha256(blob).hexdigest()[:16])
+  print(" ".join(digests))
+  p.disconnect()
+
+
 if __name__ == '__main__':
   if "--hash" in sys.argv:
     colour_hash()
+  elif "--ties" in sys.argv:
+    ties_hashes(sys.argv[-1] == "warm")
   elif "--hint" in sys.argv:
     hint_hash(sys.argv[-1] == "warm")
   else:
