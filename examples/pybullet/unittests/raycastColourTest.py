@@ -192,6 +192,14 @@ class TestRaycastDepthHint(unittest.TestCase):
     self.assertEqual(len(first.split()), 50)
     self.assertEqual(first, warm)
 
+  def test_flattened_tilted_instances_seen_grazing_resolve_as_in_a_first_frame(self):
+    """Rows of boxes scaled (2, 1, 0.04) and tilted, one mesh 1 km from its origin, seen grazing from 30 places: each
+    frame after a nearby one has the bytes of a first frame."""
+    first = subprocess.check_output([sys.executable, __file__, "--grazing", "first"], text=True)
+    warm = subprocess.check_output([sys.executable, __file__, "--grazing", "warm"], text=True)
+    self.assertEqual(len(first.split()), 30)
+    self.assertEqual(first, warm)
+
 
 @NEEDS_BACKEND
 class TestRaycastColourThreads(unittest.TestCase):
@@ -289,11 +297,57 @@ def ties_hashes(warm):
   p.disconnect()
 
 
+def build_grazing(flags, proj):
+  """Two rows of unit boxes scaled (2, 1, 0.04) and tilted 20 to 30 degrees, and a box whose vertices sit 1 km from
+  its origin, all moved once so each is drawn through its own instance; the opening frame leaves no last frame."""
+  corners = [[x, y, z] for z in (-0.5, 0.5) for y in (-0.5, 0.5) for x in (-0.5, 0.5)]
+  faces = [0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 0, 1, 4, 1, 5, 4, 2, 6, 3, 3, 6, 7, 0, 4, 2, 2, 4, 6, 1, 3, 5, 3, 7, 5]
+  bodies = []
+  for k in range(12):
+    shape = p.createVisualShape(p.GEOM_MESH, vertices=corners, indices=faces, meshScale=[2, 1, 0.04],
+                                rgbaColor=[0.2 + 0.06 * k, 0.5, 0.9 - 0.06 * k, 1])
+    tilt = p.getQuaternionFromEuler([np.radians(20 + k % 6 * 2), np.radians(5 * (k % 3)), np.radians(10 * k)])
+    bodies.append((p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape), [-3 + 3 * (k % 2), 1.5 * (k // 2), 0.4], tilt))
+  far = [[x + 1000.0, y, z] for x, y, z in corners]
+  shape = p.createVisualShape(p.GEOM_MESH, vertices=far, indices=faces, rgbaColor=[0.9, 0.9, 0.2, 1])
+  bodies.append((p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape), [-1000.0, 4.0, 0.6], [0, 0, 0, 1]))
+  p.getCameraImage(16, 16, p.computeViewMatrix([0, -6, 4], [0, 0, 0], [0, 0, 1]), proj, renderer=p.ER_TINY_RENDERER, flags=flags)
+  for body, place, turn in bodies:
+    p.resetBasePositionAndOrientation(body, place, turn)
+
+
+def grazing_hashes(warm):
+  """Prints one hash per low camera place along the rows, each frame drawn first or right after a nearby one."""
+  p.connect(p.DIRECT)
+  rng = np.random.default_rng(11)
+  flags = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX | p.ER_SWARM_RAYCAST | getattr(p, "ER_EDGE_ANTIALIAS", 0)
+  proj = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 60.0)
+  build_grazing(flags, proj)
+  digests = []
+  for _ in range(30):
+    eye = [rng.uniform(-4.0, 4.0), rng.uniform(-8.0, -4.0), rng.uniform(0.3, 1.2)]
+    target = [rng.uniform(-1.0, 1.0), 6.0, 0.4]
+    if warm:
+      p.getCameraImage(SIZE, SIZE, p.computeViewMatrix([eye[0] + 0.2, eye[1] - 0.3, eye[2] + 0.05], target, [0, 0, 1]), proj,
+                       lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+    else:
+      p.resetSimulation()
+      build_grazing(flags, proj)
+    _, _, rgb, depth, seg = p.getCameraImage(SIZE, SIZE, p.computeViewMatrix(eye, target, [0, 0, 1]), proj,
+                                             lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+    blob = np.asarray(rgb, dtype=np.uint8).tobytes() + np.asarray(depth, dtype=np.float32).tobytes() + np.asarray(seg, dtype=np.int32).tobytes()
+    digests.append(hashlib.sha256(blob).hexdigest()[:16])
+  print(" ".join(digests))
+  p.disconnect()
+
+
 if __name__ == '__main__':
   if "--hash" in sys.argv:
     colour_hash()
   elif "--ties" in sys.argv:
     ties_hashes(sys.argv[-1] == "warm")
+  elif "--grazing" in sys.argv:
+    grazing_hashes(sys.argv[-1] == "warm")
   elif "--hint" in sys.argv:
     hint_hash(sys.argv[-1] == "warm")
   else:
