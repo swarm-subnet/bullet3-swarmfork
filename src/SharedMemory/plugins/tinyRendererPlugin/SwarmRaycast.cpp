@@ -1682,16 +1682,16 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree);
 }
 
-void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
+bool SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 {
 	// A batch's mesh tree is shared by every placement and never rewritten.
 	if (!renderObj->m_placements.empty())
-		return;
+		return false;
 	if (renderObj->m_renderInstanced)
 		m_data->m_objects[renderObj].m_deformed = true;
 	std::map<TinyRenderObjectData*, ObjectState>::iterator found = m_data->m_objects.find(renderObj);
 	if (found == m_data->m_objects.end())
-		return;
+		return false;
 	if (renderObj->m_renderInstanced)
 	{
 		// A rewritten mesh must never refit the immutable tree used by its other placements.
@@ -1699,13 +1699,15 @@ void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 			m_data->dropInstance(found->second.m_instance);
 		found->second.m_instance = 0;
 		found->second.m_deformed = true;
-		return;
+		return false;
 	}
 	// A rewritten static member counts as moved at the next sync; a mover refits its tree.
 	if (found->second.m_member && !found->second.m_member->m_retired)
 		found->second.m_member->m_transform[15] = -1.0f;
-	if (found->second.m_instance && found->second.m_instance->m_tree)
-		found->second.m_instance->m_tree->m_dirty = true;
+	if (!found->second.m_instance || !found->second.m_instance->m_tree)
+		return false;
+	found->second.m_instance->m_tree->m_dirty = true;
+	return found->second.m_instance->m_tree->m_refs > 1;
 }
 
 void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)

@@ -90,8 +90,9 @@ public:
 
 	// Creates or refreshes the instance for renderObj from its model, world transform and scaling.
 	void syncObject(TinyRenderObjectData* renderObj, const btTransform& worldTransform, const btVector3& localScaling);
-	// Records that renderObj's vertices were rewritten in place; its tree is refitted at the next commit.
-	void meshChanged(TinyRenderObjectData* renderObj);
+	// Records that renderObj's vertices were rewritten in place; its tree is refitted at the next commit. True when that
+	// tree also serves other render objects, which then refit it at their next sync.
+	bool meshChanged(TinyRenderObjectData* renderObj);
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
 	// Rebuilds the top-level tree after a batch of sync calls. The mover tree, read only by mover shadows, is rebuilt

@@ -181,6 +181,8 @@ struct TinyRendererVisualShapeConverterInternalData
 #ifdef SWARM_RAYCAST
 	// Created on the first ER_SWARM_RAYCAST render and kept in step with the render objects from then on.
 	SwarmRaycast* m_raycast;
+	// Set when a rewritten mesh tree also serves other render objects, so the next sync takes every object.
+	bool m_raycastSyncAll;
 #endif
 
 	TinyRendererVisualShapeConverterInternalData()
@@ -229,7 +231,7 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_batchCameraCount(1),
 		m_batchReadCamera(0)
 #ifdef SWARM_RAYCAST
-		, m_raycast(0)
+		, m_raycast(0), m_raycastSyncAll(false)
 #endif
 	{
 		m_depthBuffer.resize(m_swWidth * m_swHeight);
@@ -255,13 +257,14 @@ struct TinyRendererVisualShapeConverterInternalData
 		for (int n = 0; n < m_swRenderInstances.size(); n++)
 		{
 			TinyRendererObjectArray** visualArrayPtr = m_swRenderInstances.getAtIndex(n);
-			if (0 == visualArrayPtr || !(*visualArrayPtr)->m_raycastDirty)
+			if (0 == visualArrayPtr || !(m_raycastSyncAll || (*visualArrayPtr)->m_raycastDirty))
 				continue;
 			TinyRendererObjectArray* visualArray = *visualArrayPtr;
 			visualArray->m_raycastDirty = false;
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
 		}
+		m_raycastSyncAll = false;
 		m_raycast->commit(moverShadows);
 		return *m_raycast;
 	}
@@ -1665,8 +1668,8 @@ void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVe
 			{
 				visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-				if (m_data->m_raycast)
-					m_data->m_raycast->meshChanged(renderObj);
+				if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+					m_data->m_raycastSyncAll = true;
 #endif
 				TinyRender::Vec3f* verts = renderObj->m_model->readWriteVertices();
 				//just do a sync
@@ -2784,8 +2787,8 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 			renderObj->computeLocalAABB();
 			visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-			if (m_data->m_raycast)
-				m_data->m_raycast->meshChanged(renderObj);
+			if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+				m_data->m_raycastSyncAll = true;
 #endif
 			updated++;
 		}
