@@ -809,6 +809,20 @@ struct HitMemory
 	unsigned long long m_lastUse;
 };
 
+// The movers seen from the light: a grid across the light's direction whose cells are set where a mover's box, widened
+// for rounding, lies. A shadow ray runs along the light, so one leaving a point under a clear cell cannot meet a mover.
+struct MoverShade
+{
+	float m_axisU[3];
+	float m_axisV[3];
+	float m_u0;
+	float m_v0;
+	float m_perCell;
+	int m_cols;
+	int m_rows;
+	std::vector<unsigned char> m_cells;
+};
+
 // Lenses remembered at once (the wide feed, the zoom, the thermal camera), and the smallest frame that keeps a memory:
 // the laser's few pixels gain nothing from one.
 const int kHitMemories = 4;
@@ -859,6 +873,7 @@ struct SwarmRaycast::Data
 	// Per pixel of the current frame: the depth along the camera's axis of the farthest remembered hit landing on it, -1
 	// where none does.
 	std::vector<float> m_hintFar;
+	MoverShade m_moverShade;
 
 	// The memory of the lens with this frame size and projection, or the one used longest ago, emptied for it.
 	HitMemory* hitMemory(int width, int height, const float projMat[16])
@@ -2447,6 +2462,8 @@ struct TileJob
 	float m_hintRounding;
 	// Where every first ray lands this frame, kept for the next; each pixel writes only its own.
 	float* m_hitPoints;
+	// Where the movers can shade, when the movers answer the shadow rays; null otherwise.
+	const MoverShade* m_moverShade;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -2492,6 +2509,86 @@ const float kEdgeTolerance = 1e-3f;
 const double kCoverageEpsilon = 1.0 / 512.0;
 
 // One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// Cell of the mover grid under a point, or -1 off the grid.
+inline int moverCell(const MoverShade& shade, const float point[3])
+{
+	const float u = (dot3(point, shade.m_axisU) - shade.m_u0) * shade.m_perCell;
+	const float v = (dot3(point, shade.m_axisV) - shade.m_v0) * shade.m_perCell;
+	if (!(u >= 0.0f) || !(v >= 0.0f) || u >= (float)shade.m_cols || v >= (float)shade.m_rows)
+		return -1;
+	return (int)v * shade.m_cols + (int)u;
+}
+
+// Lays the grid over the enabled movers for a light direction: each mover's tree bounds, carried into world space by its
+// instance, put across the light and widened well past the rounding of these sums and of the ray's own.
+void castMoverShade(const std::vector<Instance*>& instances, const float lightDir[3], MoverShade& shade)
+{
+	const float ax = fabsf(lightDir[0]), ay = fabsf(lightDir[1]), az = fabsf(lightDir[2]);
+	float helper[3] = {0.0f, 0.0f, 0.0f};
+	helper[ax <= ay && ax <= az ? 0 : (ay <= az ? 1 : 2)] = 1.0f;
+	cross3(lightDir, helper, shade.m_axisU);
+	normalize3(shade.m_axisU);
+	cross3(lightDir, shade.m_axisU, shade.m_axisV);
+	normalize3(shade.m_axisV);
+	std::vector<float> rects;
+	float lowU = INFINITY, highU = -INFINITY, lowV = INFINITY, highV = -INFINITY;
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const Instance* inst = instances[i];
+		if (!inst || inst->m_staticShared || !inst->m_enabled)
+			continue;
+		RTCBounds bounds;
+		rtcGetSceneBounds(inst->m_tree->m_scene, &bounds);
+		if (!(bounds.lower_x <= bounds.upper_x && bounds.lower_y <= bounds.upper_y && bounds.lower_z <= bounds.upper_z))
+			continue;
+		float rect[4] = {INFINITY, -INFINITY, INFINITY, -INFINITY}, size = 0.0f;
+		for (int k = 0; k < 8; k++)
+		{
+			const float corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+			float world[3];
+			transformPoint(inst->m_transform, corner, world);
+			const float u = dot3(world, shade.m_axisU), v = dot3(world, shade.m_axisV);
+			rect[0] = u < rect[0] ? u : rect[0];
+			rect[1] = u > rect[1] ? u : rect[1];
+			rect[2] = v < rect[2] ? v : rect[2];
+			rect[3] = v > rect[3] ? v : rect[3];
+			for (int j = 0; j < 3; j++)
+				size = fabsf(world[j]) > size ? fabsf(world[j]) : size;
+		}
+		const float margin = 0.05f + size * 1e-4f;
+		rects.push_back(rect[0] - margin);
+		rects.push_back(rect[1] + margin);
+		rects.push_back(rect[2] - margin);
+		rects.push_back(rect[3] + margin);
+		lowU = rects[rects.size() - 4] < lowU ? rects[rects.size() - 4] : lowU;
+		highU = rects[rects.size() - 3] > highU ? rects[rects.size() - 3] : highU;
+		lowV = rects[rects.size() - 2] < lowV ? rects[rects.size() - 2] : lowV;
+		highV = rects[rects.size() - 1] > highV ? rects[rects.size() - 1] : highV;
+	}
+	shade.m_cols = shade.m_rows = 0;
+	shade.m_cells.clear();
+	if (rects.empty())
+		return;
+	// At most 64 cells a side, none under 25 cm.
+	const float span = highU - lowU > highV - lowV ? highU - lowU : highV - lowV;
+	const float cell = span / 64.0f > 0.25f ? span / 64.0f : 0.25f;
+	shade.m_u0 = lowU;
+	shade.m_v0 = lowV;
+	shade.m_perCell = 1.0f / cell;
+	shade.m_cols = (int)((highU - lowU) * shade.m_perCell) + 1;
+	shade.m_rows = (int)((highV - lowV) * shade.m_perCell) + 1;
+	shade.m_cells.assign((size_t)shade.m_cols * shade.m_rows, 0);
+	for (size_t r = 0; r < rects.size(); r += 4)
+	{
+		// Cell indices grow with u and v, so the cells under a rectangle's corners bound every cell under it.
+		const int col0 = (int)((rects[r] - lowU) * shade.m_perCell), col1 = (int)((rects[r + 1] - lowU) * shade.m_perCell);
+		const int row0 = (int)((rects[r + 2] - lowV) * shade.m_perCell), row1 = (int)((rects[r + 3] - lowV) * shade.m_perCell);
+		for (int row = row0; row <= row1 && row < shade.m_rows; row++)
+			for (int col = col0; col <= col1 && col < shade.m_cols; col++)
+				shade.m_cells[(size_t)row * shade.m_cols + col] = 1;
+	}
+}
+
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
 // A leaf card with leaf shadows off asks from its sunward side, since its back-light is not its own shadow.
 float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
@@ -2513,12 +2610,19 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	else
 		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
 	const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
-	if (!blocked && occluders)
+	const float origin[3] = {point[0] + unitNormal[0] * kShadowBias, point[1] + unitNormal[1] * kShadowBias, point[2] + unitNormal[2] * kShadowBias};
+	bool reachable = true;
+	if (!blocked && occluders == job.m_movers && job.m_moverShade)
+	{
+		const int cell = moverCell(*job.m_moverShade, origin);
+		reachable = cell >= 0 && job.m_moverShade->m_cells[(size_t)cell];
+	}
+	if (!blocked && occluders && reachable)
 	{
 		RTCRay ray;
-		ray.org_x = point[0] + unitNormal[0] * kShadowBias;
-		ray.org_y = point[1] + unitNormal[1] * kShadowBias;
-		ray.org_z = point[2] + unitNormal[2] * kShadowBias;
+		ray.org_x = origin[0];
+		ray.org_y = origin[1];
+		ray.org_z = origin[2];
 		ray.dir_x = shading->m_lightDir[0];
 		ray.dir_y = shading->m_lightDir[1];
 		ray.dir_z = shading->m_lightDir[2];
@@ -3447,6 +3551,12 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		// With no mover attached the mover tree is empty, and a ray into it can only say lit.
 		if (shading->m_moverShadow && m_data->m_moverCount > 0)
 			job.m_movers = m_data->m_movers;
+	}
+	job.m_moverShade = 0;
+	if (job.m_movers)
+	{
+		castMoverShade(m_data->m_byGeomId, shading->m_lightDir, m_data->m_moverShade);
+		job.m_moverShade = &m_data->m_moverShade;
 	}
 	if (job.m_filtered)
 	{
