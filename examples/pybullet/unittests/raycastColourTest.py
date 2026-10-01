@@ -215,6 +215,16 @@ class TestRaycastColourThreads(unittest.TestCase):
       digests.add(out.strip())
     self.assertEqual(len(digests), 1)
 
+  def test_frame_after_a_nearby_one_same_bytes_for_one_two_and_four_threads(self):
+    """A frame drawn after a nearby view, its depth hint put onto the frame by every render thread, has the same bytes
+    at 1, 2 and 4 threads."""
+    digests = set()
+    for threads in ("1", "2", "4"):
+      env = dict(os.environ, SWARM_RENDER_THREADS=threads)
+      out = subprocess.check_output([sys.executable, __file__, "--hint", "warm"], env=env, text=True)
+      digests.add(out.strip())
+    self.assertEqual(len(digests), 1)
+
 
 def colour_hash():
   """Prints the sha256 of one shadowed, filtered colour frame on the ray-cast path."""
