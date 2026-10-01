@@ -2394,7 +2394,12 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		}
 	}
 	const bool sky = (sunSky || m_data->m_hasSky) && !depthOnly && !thermal;
-	if (sky && (m_data->m_flags & ER_SWARM_RAYCAST) == 0)
+	// The ray caster paints its own sky; a build without it keeps the painted one on the warning path below.
+	bool raycastSky = false;
+#ifdef SWARM_RAYCAST
+	raycastSky = (m_data->m_flags & ER_SWARM_RAYCAST) != 0;
+#endif
+	if (sky && !raycastSky)
 	{
 		paintSky(viewMat, projMat, sunSky, daylight);
 	}
