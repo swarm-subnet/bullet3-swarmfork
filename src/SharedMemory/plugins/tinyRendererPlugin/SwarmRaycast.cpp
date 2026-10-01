@@ -2028,9 +2028,10 @@ inline float spotIrradiance(const SwarmRaycastShading& shading, const float poin
 }
 
 // Segmentation id of a hit, plus the surface when asked for; false for a hit the scene does not know.
+// `cornersOnly` leaves out the corner normals, for a caller that only needs where the triangle is.
 bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMember*>& members,
 				const std::vector<Instance*>& instances, const std::vector<Batch*>& batches, unsigned forestId,
-				int& segmentation, HitSurface* surface)
+				int& segmentation, HitSurface* surface, bool cornersOnly = false)
 {
 	const float* vertices;
 	const unsigned* indices;
@@ -2113,7 +2114,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 	{
 		const unsigned id = indices[(size_t)hit.primID * 3 + j];
 		surface->m_vertexIds[j] = id;
-		if (surface->m_transformedNormals)
+		if (surface->m_transformedNormals && !cornersOnly)
 		{
 			const float* n = surface->m_normals + (size_t)id * 3;
 			float* out = surface->m_cornerNormals + j * 3;
@@ -3133,7 +3134,7 @@ bool projectTriangle(const TileJob& job, const Camera& cam, const HitId& hit, do
 	rtcHit.instPrimID[1] = hit.m_instPrim1;
 	int segmentation;
 	HitSurface surface;
-	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface))
+	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface, true))
 		return false;
 	for (int j = 0; j < 3; j++)
 	{
@@ -3154,35 +3155,31 @@ inline bool sameTriangle(const HitId& a, const HitId& b)
 	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim && a.m_inst1 == b.m_inst1 && a.m_instPrim1 == b.m_instPrim1;
 }
 
-// The last few triangles a thread put onto the frame: an edge runs through several pixels that all
-// ask for the same triangle, so each is projected once per run instead of once per pixel.
+// The triangles a thread put onto the frame, one slot per hash of the triangle, kept for the whole
+// frame: an edge runs through several pixels that all ask for the same few triangles, so each is
+// projected about once instead of once per pixel.
+const int kProjectionSlots = 256;
 struct ProjectionCache
 {
-	HitId m_key[8];
-	double m_x[8][3];
-	double m_y[8][3];
-	bool m_ok[8];
-	int m_next;
-	int m_count;
+	HitId m_key[kProjectionSlots];
+	double m_x[kProjectionSlots][3];
+	double m_y[kProjectionSlots][3];
+	bool m_ok[kProjectionSlots];
+	bool m_used[kProjectionSlots];
 };
 
 bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam, const HitId& hit, const double*& x, const double*& y)
 {
-	for (int i = 0; i < cache.m_count; i++)
-		if (sameTriangle(cache.m_key[i], hit))
-		{
-			x = cache.m_x[i];
-			y = cache.m_y[i];
-			return cache.m_ok[i];
-		}
-	const int slot = cache.m_next;
-	cache.m_next = (slot + 1) % 8;
-	if (cache.m_count < 8)
-		cache.m_count++;
-	cache.m_key[slot] = hit;
-	cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
+	const unsigned mix = (hit.m_prim * 0x9E3779B1u) ^ (hit.m_instPrim1 * 0x85EBCA77u) ^ (hit.m_inst * 0xC2B2AE3Du) ^ (hit.m_geom * 0x27D4EB2Fu) ^ hit.m_inst1;
+	const int slot = (int)(mix >> 24);
 	x = cache.m_x[slot];
 	y = cache.m_y[slot];
+	if (!cache.m_used[slot] || !sameTriangle(cache.m_key[slot], hit))
+	{
+		cache.m_used[slot] = true;
+		cache.m_key[slot] = hit;
+		cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
+	}
 	return cache.m_ok[slot];
 }
 
@@ -3586,8 +3583,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
 		const int passes = scratch.empty() ? 1 : 2;
 		ProjectionCache cache;
-		cache.m_next = 0;
-		cache.m_count = 0;
+		memset(cache.m_used, 0, sizeof(cache.m_used));
 		for (int pass = 0; pass < passes; pass++)
 		{
 			if (pass == 1)
