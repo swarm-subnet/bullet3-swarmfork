@@ -1840,14 +1840,19 @@ void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 	for (int i = 0; i < numPixels; ++i)
 		depth[i] = -farPlane;
 
-	if (!depthOnly)
+	if (!depthOnly && numPixels)
 	{
-		for (int y = 0; y < m_data->m_swHeight; ++y)
-			for (int x = 0; x < m_data->m_swWidth; ++x)
-				m_data->m_rgbColorBuffer.set(x, y, clearColor);
+		// The first row is set pixel by pixel, then copied into every other row.
+		for (int x = 0; x < m_data->m_swWidth; ++x)
+			m_data->m_rgbColorBuffer.set(x, 0, clearColor);
+		unsigned char* rgb = m_data->m_rgbColorBuffer.buffer();
+		const size_t rowBytes = (size_t)m_data->m_swWidth * m_data->m_rgbColorBuffer.get_bytespp();
+		for (int y = 1; y < m_data->m_swHeight; ++y)
+			memcpy(rgb + y * rowBytes, rgb, rowBytes);
 
-		float* shadow = numPixels ? &m_data->m_shadowBuffer[0] : 0;
-		for (int i = 0; i < numPixels; ++i)
+		// Only the rasterised path draws into the shadow buffer.
+		float* shadow = (m_data->m_flags & ER_SWARM_RAYCAST) == 0 ? &m_data->m_shadowBuffer[0] : 0;
+		for (int i = 0; shadow && i < numPixels; ++i)
 			shadow[i] = -1e30f;
 	}
 
@@ -2655,7 +2660,9 @@ void TinyRendererVisualShapeConverter::setWidthAndHeight(int width, int height)
 	m_data->m_depthBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_shadowBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_segmentationMaskBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
-	m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
+	// Every frame writes each colour pixel before it is read, so a buffer of the right size is kept.
+	if (m_data->m_rgbColorBuffer.get_width() != width || m_data->m_rgbColorBuffer.get_height() != height)
+		m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
 }
 
 void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixelsRGBA, int rgbaBufferSizeInPixels,
@@ -2707,10 +2714,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 
 		if (segmentationMaskBuffer)
 		{
+			const int* src = &m_data->m_segmentationMaskBuffer[startPixelIndex];
+			const bool objectOnly = (m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				int segMask = m_data->m_segmentationMaskBuffer[i + startPixelIndex];
-				if ((m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0)
+				int segMask = src[i];
+				if (objectOnly)
 				{
 					//if we don't explicitly request link index, clear it out
 					//object index are the lower 24bits
@@ -2726,11 +2735,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 		// In depth-only mode nothing was shaded, so the color buffer holds no image.
 		if (pixelsRGBA && !depthOnly)
 		{
+			const unsigned char* rgb = m_data->m_rgbColorBuffer.buffer() + (size_t)startPixelIndex * 3;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				pixelsRGBA[i * numBytesPerPixel] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 0];
-				pixelsRGBA[i * numBytesPerPixel + 1] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 1];
-				pixelsRGBA[i * numBytesPerPixel + 2] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 2];
+				pixelsRGBA[i * numBytesPerPixel] = rgb[i * 3 + 0];
+				pixelsRGBA[i * numBytesPerPixel + 1] = rgb[i * 3 + 1];
+				pixelsRGBA[i * numBytesPerPixel + 2] = rgb[i * 3 + 2];
 				pixelsRGBA[i * numBytesPerPixel + 3] = 255;
 			}
 		}
