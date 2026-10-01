@@ -186,6 +186,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `textureFilterTest.py` | `ER_TEXTURE_FILTER` |
 | `skyTest.py` | `skyHorizonColor`, `skyZenithColor`, gradient orientation, depth untouched |
 | `raycastColourTest.py` | `ER_SWARM_RAYCAST` colour: agreement with TinyRenderer, shadow ray, sky, filter, thread counts |
+| `raycastSyncTest.py` | ray-cast frames after a change: a moved body, a turned link, transparency, a new texture, the double-sided flag and a new body all reach the next frame |
 | `shadowMapTest.py` | `ER_SWARM_SHADOW_MAP` against the shadow ray, recasts, thread counts |
 | `moverShadowTest.py` | `ER_SWARM_MOVER_SHADOW` |
 | `edgeAntialiasTest.py` | `ER_EDGE_ANTIALIAS`, depth and mask unchanged |
