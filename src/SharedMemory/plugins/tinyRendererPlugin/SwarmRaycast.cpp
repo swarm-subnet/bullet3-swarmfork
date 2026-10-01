@@ -141,6 +141,8 @@ struct StaticMember
 	bool m_glass;
 	// The texture carries an alpha plane, so hits may be cut out.
 	bool m_hasAlpha;
+	// The render object's texture revision the shadow maps last saw.
+	unsigned m_textureRevision;
 	int m_segmentation;
 };
 
@@ -1125,6 +1127,7 @@ struct SwarmRaycast::Data
 		StaticMember* member = new StaticMember;
 		member->m_obj = obj;
 		member->m_meshKey = obj->m_model->meshKey();
+		member->m_textureRevision = obj->m_textureRevision;
 		memcpy(member->m_transform, transform, sizeof(member->m_transform));
 		copyRotation(worldTransform, member->m_rotation);
 		member->m_retired = false;
@@ -1735,8 +1738,11 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 		const bool moved = memcmp(transform, member->m_transform, sizeof(transform)) != 0 || member->m_meshKey != model->meshKey();
 		if (!moved)
 		{
-			if (member->m_visible != visible)
+			// A new texture or face setting changes what the member lets through, as hiding it does.
+			if (member->m_visible != visible || member->m_doubleSided != doubleSided || member->m_hasAlpha != hasAlpha ||
+				member->m_textureRevision != renderObj->m_textureRevision)
 				m_data->shadowChanged(member);
+			member->m_textureRevision = renderObj->m_textureRevision;
 			member->m_visible = visible;
 			member->m_doubleSided = doubleSided;
 			member->m_hasAlpha = hasAlpha;
