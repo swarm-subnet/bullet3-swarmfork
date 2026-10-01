@@ -2540,8 +2540,9 @@ inline int moverCell(const MoverShade& shade, const float point[3])
 }
 
 // Lays the grid over the enabled movers for a light direction: each mover's tree bounds, carried into world space by its
-// instance, put across the light and widened well past the rounding of these sums and of the ray's own.
-void castMoverShade(const std::vector<Instance*>& instances, const float lightDir[3], MoverShade& shade)
+// instance, put across the light and widened well past the rounding of these sums and of the ray's own. False, and no
+// grid, when a mover or the light leaves the finite range: every lit point then asks the movers, as without the grid.
+bool castMoverShade(const std::vector<Instance*>& instances, const float lightDir[3], MoverShade& shade)
 {
 	const float ax = fabsf(lightDir[0]), ay = fabsf(lightDir[1]), az = fabsf(lightDir[2]);
 	float helper[3] = {0.0f, 0.0f, 0.0f};
@@ -2576,6 +2577,9 @@ void castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 				size = fabsf(world[j]) > size ? fabsf(world[j]) : size;
 		}
 		const float margin = 0.05f + size * 1e-4f;
+		for (int j = 0; j < 4; j++)
+			if (!(fabsf(rect[j]) + margin < INFINITY))
+				return false;
 		rects.push_back(rect[0] - margin);
 		rects.push_back(rect[1] + margin);
 		rects.push_back(rect[2] - margin);
@@ -2588,9 +2592,11 @@ void castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 	shade.m_cols = shade.m_rows = 0;
 	shade.m_cells.clear();
 	if (rects.empty())
-		return;
+		return true;
 	// At most 64 cells a side, none under 25 cm.
 	const float span = highU - lowU > highV - lowV ? highU - lowU : highV - lowV;
+	if (!(span < INFINITY))
+		return false;
 	const float cell = span / 64.0f > 0.25f ? span / 64.0f : 0.25f;
 	shade.m_u0 = lowU;
 	shade.m_v0 = lowV;
@@ -2607,6 +2613,7 @@ void castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 			for (int col = col0; col <= col1 && col < shade.m_cols; col++)
 				shade.m_cells[(size_t)row * shade.m_cols + col] = 1;
 	}
+	return true;
 }
 
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
@@ -3590,11 +3597,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			job.m_movers = m_data->m_movers;
 	}
 	job.m_moverShade = 0;
-	if (job.m_movers)
-	{
-		castMoverShade(m_data->m_byGeomId, shading->m_lightDir, m_data->m_moverShade);
+	if (job.m_movers && castMoverShade(m_data->m_byGeomId, shading->m_lightDir, m_data->m_moverShade))
 		job.m_moverShade = &m_data->m_moverShade;
-	}
 	if (job.m_filtered)
 	{
 		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
