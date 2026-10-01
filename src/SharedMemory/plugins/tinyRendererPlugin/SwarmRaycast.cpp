@@ -2529,7 +2529,6 @@ const float kEdgeTolerance = 1e-3f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
 
-// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
 // Cell of the mover grid under a point, or -1 off the grid.
 inline int moverCell(const MoverShade& shade, const float point[3])
 {
@@ -2879,6 +2878,7 @@ void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArgume
 	rtcIntersect1(scene, &rayhit, args);
 }
 
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
 // `reach`, when finite, is the depth hint for this ray along the camera's axis; `landed`, when given, takes where the ray
 // landed (NaN on a miss).
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
