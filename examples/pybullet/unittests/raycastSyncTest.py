@@ -1,10 +1,16 @@
 """Ray-cast frames between changes: whatever changes a body between two frames shows in the second one."""
 import os
+import shutil
 import struct
 import tempfile
 import unittest
 import numpy as np
 import pybullet as p
+
+from daylightTest import write_obj
+from forestBatchTest import forest_world
+from instancedStaticTest import INSTANCED, frame
+from visualMeshTest import grid
 
 SIZE = 64
 NEEDS_BACKEND = unittest.skipUnless(hasattr(p, "ER_SWARM_RAYCAST"), "wheel built without the ray-cast backend")
@@ -107,6 +113,123 @@ class TestRaycastSync(unittest.TestCase):
     vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3, 0.3, 0.3], rgbaColor=[0, 0, 1, 1])
     body = p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis, basePosition=[-2, -1, 0])
     self.assertGreater(int((self.render()[1] == body).sum()), 0)
+
+
+@NEEDS_BACKEND
+class TestRaycastSyncPaths(unittest.TestCase):
+  """The other ways a world changes between two ray-cast frames, seen from straight above."""
+
+  def setUp(self):
+    """Connects a DIRECT client and makes a folder for mesh files."""
+    p.connect(p.DIRECT)
+    self.folder = tempfile.mkdtemp(prefix="raycastsync_")
+
+  def tearDown(self):
+    """Drops the client and the folder."""
+    p.disconnect()
+    shutil.rmtree(self.folder)
+
+  def colour(self):
+    """(rgb, depth, seg) of a ray-cast colour frame."""
+    return frame(flags=p.ER_SWARM_RAYCAST, shadow=0)
+
+  def depth_only(self):
+    """The depth of a ray-cast depth-only frame, which brings the scene up to date as well."""
+    return frame(flags=p.ER_SWARM_RAYCAST | p.ER_DEPTH_ONLY, shadow=0)[1]
+
+  def grid_body(self, position=(0, 0, 0)):
+    """A flat grid body built from arrays; every body built from the same arrays shares one mesh."""
+    vertices, normals, uvs, triangles = grid(9, 1.0)
+    shape = p.createVisualShape(p.GEOM_MESH, vertices=vertices, indices=[i for t in triangles for i in t], normals=normals,
+                                uvs=uvs, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0])
+    return p.createMultiBody(0, -1, shape, basePosition=list(position)), vertices
+
+  def test_rewritten_mesh_follows(self):
+    """A mesh rewritten between frames is drawn in its new shape, also after a depth-only frame took the change first."""
+    body, vertices = self.grid_body()
+    before = self.colour()
+    raised = [list(v) for v in vertices]
+    raised[len(raised) // 2][2] = 0.8
+    p.resetMeshData(body, raised)
+    depth = self.depth_only()
+    after = self.colour()
+    self.assertNotEqual(before[1].tobytes(), after[1].tobytes())
+    self.assertEqual(depth.tobytes(), after[1].tobytes())
+
+  def test_change_survives_a_depth_only_frame(self):
+    """A body moved before a depth-only frame is still moved in the colour frame after it."""
+    box = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5] * 3))
+    self.assertGreater(int((self.colour()[2] == box).sum()), 0)
+    p.resetBasePositionAndOrientation(box, [0, 0, 50], [0, 0, 0, 1])
+    self.depth_only()
+    self.assertEqual(int((self.colour()[2] == box).sum()), 0)
+
+  def test_removed_body_and_its_successor(self):
+    """A removed body is gone from the next frame, and a body created after it is drawn where it was put."""
+    first = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5] * 3), basePosition=[-1.5, 0, 0])
+    self.colour()
+    p.removeBody(first)
+    second = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5] * 3), basePosition=[1.5, 0, 0])
+    _, _, seg = self.colour()
+    columns = np.nonzero((seg == second).any(axis=0))[0]
+    self.assertGreater(len(columns), 0)
+    self.assertGreater(columns.min(), seg.shape[1] // 2)
+    self.assertEqual(int((seg >= 0).sum()), int((seg == second).sum()))
+
+  def test_reset_simulation_starts_a_new_scene(self):
+    """After resetSimulation only the bodies of the new world are drawn."""
+    p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[2, 2, 0.1]))
+    self.colour()
+    p.resetSimulation()
+    box = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3] * 3))
+    _, _, seg = self.colour()
+    self.assertGreater(int((seg == box).sum()), 0)
+    self.assertEqual(int((seg >= 0).sum()), int((seg == box).sum()))
+
+  def test_instanced_body_moves_and_hides(self):
+    """An instanced body moved between frames is drawn where it went, and made transparent it is gone."""
+    path = os.path.join(self.folder, "card.obj")
+    write_obj(path, 0.5)
+    body = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_MESH, fileName=path, flags=INSTANCED), basePosition=[-1.5, 0, 0])
+    before = self.colour()[2] == body
+    p.resetBasePositionAndOrientation(body, [1.5, 0, 0], [0, 0, 0, 1])
+    after = self.colour()[2] == body
+    self.assertGreater(int(after.sum()), 0)
+    self.assertFalse((before & after).any())
+    p.changeVisualShape(body, -1, rgbaColor=[1, 1, 1, 0])
+    self.assertEqual(int((self.colour()[2] == body).sum()), 0)
+
+  def test_forest_moves_with_its_body(self):
+    """Every placement of a forest follows its body when the body moves between frames."""
+    body = forest_world(self.folder)
+    before = self.colour()[2] == body
+    p.resetBasePositionAndOrientation(body, [0.5, 0, 0], [0, 0, 0, 1])
+    after = self.colour()[2] == body
+    self.assertGreater(int(before.sum()), 0)
+    self.assertFalse(np.array_equal(before, after))
+
+  def shared_mesh_frame(self, touch_untouched):
+    """Two movers sharing one mesh, one of them rewritten: the frame after, with the other body's colour set again or not."""
+    p.resetSimulation()
+    p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.2] * 3), basePosition=[0, 2.5, 0])
+    self.colour()
+    rewritten, vertices = self.grid_body((-1.2, 0, 0))
+    untouched, _ = self.grid_body((1.2, 0, 0))
+    before = self.colour()
+    raised = [list(v) for v in vertices]
+    raised[len(raised) // 2][2] = 0.8
+    p.resetMeshData(rewritten, raised)
+    if touch_untouched:
+      p.changeVisualShape(untouched, -1, rgbaColor=[1, 1, 1, 1])
+    return before, self.colour()
+
+  def test_shared_mesh_rewrite_draws_as_a_full_sync(self):
+    """Rewriting one of two movers that share a mesh draws the same bytes as when the other one is synced too."""
+    before, plain = self.shared_mesh_frame(False)
+    _, synced = self.shared_mesh_frame(True)
+    self.assertNotEqual(before[1].tobytes(), plain[1].tobytes())
+    for a, b in zip(plain, synced):
+      self.assertEqual(a.tobytes(), b.tobytes())
 
 
 if __name__ == '__main__':
