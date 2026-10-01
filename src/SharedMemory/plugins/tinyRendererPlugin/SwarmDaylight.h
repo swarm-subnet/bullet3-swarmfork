@@ -10,7 +10,10 @@
 inline double swarmExp(double x)
 {
 	const double ln2 = 0.6931471805599453;
-	int n = (int)(x / ln2 + (x < 0.0 ? -0.5 : 0.5));
+	// Within 0.345 of zero the reduction always rounds to n = 0 (x / ln2 stays inside +-0.4978), so it needs no division.
+	int n = 0;
+	if (!(x > -0.345 && x < 0.345))
+		n = (int)(x / ln2 + (x < 0.0 ? -0.5 : 0.5));
 	if (n < -1000)
 		return 0.0;
 	if (n > 1000)
