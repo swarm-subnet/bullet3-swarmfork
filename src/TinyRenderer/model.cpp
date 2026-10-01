@@ -758,8 +758,16 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	return c;
 }
 
-// One trilinear read at the level a footprint radius squared of rho2 texels asks for, log2 from the float's own bits.
-static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2)
+// The level a footprint radius squared of rho2 texels asks for, log2 from the float's own bits, and the next coarser
+// one with its 8-bit weight; the coarser level is read only when that weight is not zero.
+struct MipPick
+{
+	TGAImage* m_a;
+	TGAImage* m_b;
+	int m_weight;
+};
+
+static MipPick pickLevels(SharedTexture& tex, float rho2)
 {
 	float lambda = 0.f;
 	if (rho2 > 1.f)
@@ -782,12 +790,21 @@ static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2
 		level = last;
 		frac = 0.f;
 	}
-	TGAImage& imgA = level == 0 ? tex.img_ : *mips[level - 1];
-	TGAColor a = sampleBilinear(imgA, u, v);
-	const int wl = (int)(frac * 256.f);
+	MipPick pick;
+	pick.m_a = level == 0 ? &tex.img_ : mips[level - 1];
+	pick.m_weight = (int)(frac * 256.f);
+	pick.m_b = pick.m_weight == 0 ? 0 : mips[level];
+	return pick;
+}
+
+// One trilinear read from the levels pickLevels chose.
+static TGAColor sampleLevels(const MipPick& pick, float u, float v)
+{
+	TGAColor a = sampleBilinear(*pick.m_a, u, v);
+	const int wl = pick.m_weight;
 	if (wl == 0)
 		return a;
-	TGAColor b = sampleBilinear(*mips[level], u, v);
+	TGAColor b = sampleBilinear(*pick.m_b, u, v);
 	for (int i = 0; i < (int)a.bytespp; i++)
 		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
 	return a;
@@ -823,7 +840,7 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	const float ry2 = sy * sy + ty * ty;
 	const float rho2 = rx2 > ry2 ? rx2 : ry2;
 	if (maxTaps <= 1)
-		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+		return sampleLevels(pickLevels(*m_diffuse, rho2), uvf[0], uvf[1]);
 
 	const bool xMajor = rx2 >= ry2;
 	const float major2 = xMajor ? rx2 : ry2, minor2 = xMajor ? ry2 : rx2;
@@ -838,16 +855,17 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 		taps = taps > maxTaps ? maxTaps : (taps < 1 ? 1 : taps);
 	}
 	if (taps <= 1)
-		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+		return sampleLevels(pickLevels(*m_diffuse, rho2), uvf[0], uvf[1]);
 	const float perTap2 = major2 / ((float)taps * (float)taps);
 	const float tapRho2 = perTap2 > minor2 ? perTap2 : minor2;
 	const Vec2f along = xMajor ? duvdx : duvdy;
+	const MipPick pick = pickLevels(*m_diffuse, tapRho2);
 	int sum[4] = {0, 0, 0, 0};
 	unsigned char bytespp = 3;
 	for (int k = 0; k < taps; k++)
 	{
 		const float f = ((float)k + 0.5f) / (float)taps - 0.5f;
-		const TGAColor c = sampleTrilinear(*m_diffuse, wrapUnit(uvf[0] + along[0] * f), wrapUnit(uvf[1] + along[1] * f), tapRho2);
+		const TGAColor c = sampleLevels(pick, wrapUnit(uvf[0] + along[0] * f), wrapUnit(uvf[1] + along[1] * f));
 		bytespp = c.bytespp;
 		for (int i = 0; i < (int)c.bytespp; i++)
 			sum[i] += c.bgra[i];
