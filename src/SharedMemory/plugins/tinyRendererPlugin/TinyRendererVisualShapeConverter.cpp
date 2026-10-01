@@ -23,6 +23,7 @@ subject to the following restrictions:
 #include "Bullet3Common/b3FileUtils.h"
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstdio>
 #include "../../../../examples/Utils/b3ResourcePath.h"
@@ -54,6 +55,10 @@ struct MyTexture2
 	std::string m_name;
 };
 
+// File textures the renderer keeps decoded for the life of the process, so the next world that names one borrows
+// the copy instead of reading and decoding the file again.
+static std::set<std::string> gPinnedTextures;
+
 // Hands a file-backed texture to the renderer for good: a reference by name replaces the texels, which
 // no later reader needs, because the name finds the one copy the renderer keeps from here on.
 static void handOverTexture(MyTexture2& texData)
@@ -66,6 +71,8 @@ static void handOverTexture(MyTexture2& texData)
 		texData.m_name.clear();
 		return;
 	}
+	if (gPinnedTextures.insert(texData.m_name).second)
+		TinyRender::retainSharedTexture(texData.m_name.c_str());
 	if (texData.m_isCached)
 		b3ImportMeshUtility::releaseCachedTexture(texData.m_name.c_str());
 	else
@@ -2798,11 +2805,9 @@ void TinyRendererVisualShapeConverter::resetAll()
 	m_data->m_sunSky.forgetPhoto();
 	for (int i = 0; i < m_data->m_textures.size(); i++)
 	{
+		// A named texture is pinned, so the renderer's copy outlives this world and the loader keeps handing out its name.
 		if (!m_data->m_textures[i].m_name.empty())
-		{
 			TinyRender::releaseSharedTexture(m_data->m_textures[i].m_name.c_str());
-			b3ImportMeshUtility::forgetCachedTexture(m_data->m_textures[i].m_name.c_str());
-		}
 		if (!m_data->m_textures[i].m_isCached)
 		{
 			free(m_data->m_textures[i].textureData1);

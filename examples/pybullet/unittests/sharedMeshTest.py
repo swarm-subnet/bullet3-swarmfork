@@ -2,8 +2,11 @@
 import hashlib
 import json
 import os
+import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -68,6 +71,24 @@ def scene_hashes():
   return phases
 
 
+def write_tga(path, rgb):
+  """Writes an uncompressed 24-bit TGA from an HxWx3 uint8 array."""
+  header = struct.pack('<BBBHHBHHHHBB', 0, 0, 2, 0, 0, 0, 0, 0, rgb.shape[1], rgb.shape[0], 24, 0)
+  with open(path, 'wb') as out:
+    out.write(header + np.ascontiguousarray(rgb).tobytes())
+
+
+def textured_quad(folder):
+  """A quad OBJ whose material names tex.tga in the same folder; returns its body."""
+  with open(os.path.join(folder, "quad.mtl"), "w") as out:
+    out.write("newmtl skin\nKd 1 1 1\nmap_Kd tex.tga\n")
+  with open(os.path.join(folder, "quad.obj"), "w") as out:
+    out.write("mtllib quad.mtl\nusemtl skin\n" + "".join("v %f %f %f\n" % tuple(v) for v in QUAD_VERTICES) +
+              "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0 0 1\nf 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
+  shape = p.createVisualShape(p.GEOM_MESH, fileName=os.path.join(folder, "quad.obj"))
+  return p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape)
+
+
 def run_scene(share):
   """Runs scene_hashes in a fresh interpreter with sharing switched on or off."""
   env = dict(os.environ, SWARM_SHARE_MESH="1" if share else "0")
@@ -99,6 +120,24 @@ class TestSharedMesh(unittest.TestCase):
     _, _, seg = render([1.0, 0, 4.0], [1.0, 0, 0])
     self.assertEqual(sorted(set(seg[seg >= 0].tolist())), quads[1:])
     p.disconnect()
+
+  def test_a_file_texture_is_decoded_once_per_process(self):
+    """A later client borrows the texture the first decoded, so a file rewritten in between still draws the first image."""
+    folder = tempfile.mkdtemp()
+    checker = (((np.arange(16)[:, None] // 4 + np.arange(16)[None, :] // 4) % 2) * 255).astype(np.uint8)
+    write_tga(os.path.join(folder, "tex.tga"), np.repeat(checker[..., None], 3, axis=2))
+    p.connect(p.DIRECT)
+    textured_quad(folder)
+    first = render([0, 0, 1.5], [0, 0, 0])
+    p.disconnect()
+    write_tga(os.path.join(folder, "tex.tga"), np.full((16, 16, 3), 90, dtype=np.uint8))
+    p.connect(p.DIRECT)
+    textured_quad(folder)
+    second = render([0, 0, 1.5], [0, 0, 0])
+    p.disconnect()
+    shutil.rmtree(folder)
+    self.assertGreater(len(np.unique(first[0])), 2)
+    self.assertEqual(digest(first), digest(second))
 
 
 if __name__ == "__main__":

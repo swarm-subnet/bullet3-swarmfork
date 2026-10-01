@@ -135,6 +135,7 @@ Two related behaviours without a flag:
 - `temperature`, `emissivity`, `thermalTextureUniqueId` and `temperatureRange` on `changeVisualShape` reach only `ER_SWARM_THERMAL`: a temperature in degrees Celsius fixes the shape's surface (`float('nan')` makes it passive again), an emissivity replaces the default 0.95 (0.84 for a `VISUAL_SHAPE_GLASS` pane), and a texture from `loadTexture` is a heat map whose red byte runs from the range's low to its high over the shape's own uvs (`-1` removes it; it wins over the temperature). `shapeIndex` picks one material group. A part painted with a single uv point cannot hold a map and takes a temperature instead.
 - `specularColor` on `createVisualShape` and `changeVisualShape`, and `Ks` in an MTL, now reach the software renderer; they are read only by `ER_SPECULAR_GLINT`. Without a value `createVisualShape` sends white ([#18](https://github.com/swarm-subnet/bullet3-swarmfork/pull/18)).
 - A PNG or TGA texture with an alpha channel keeps its alpha plane at decode, in `loadTexture` and in `map_Kd`; a texture without alpha, or with alpha 255 everywhere, stores none. Only `ER_ALPHA_CUTOUT` reads it ([#17](https://github.com/swarm-subnet/bullet3-swarmfork/pull/17)).
+- A `map_Kd` texture is decoded once per process: the renderer keeps its copy after the client that loaded it disconnects, and a later client that names the same file borrows it instead of reading and decoding the image again, so a file rewritten on disk while the process runs keeps its first image. A validator worker that builds seed after seed no longer decodes every texture of the world for each one.
 
 ## 4. Collision shape flags
 
@@ -182,7 +183,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `doubleSidedTest.py` | `VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY`, front and back, colour, depth and mask |
 | `materialGroupsTest.py` | `VISUAL_SHAPE_MATERIALS_FROM_MTL`, `URDF_USE_MATERIALS_FROM_MTL` |
 | `bvhCacheTest.py` | `GEOM_CONCAVE_BVH_CACHE`: no file without flag or folder, identical hits from a loaded tree, corrupt file rebuilt |
-| `sharedMeshTest.py` | mesh and texture sharing gives the same bytes as private copies |
+| `sharedMeshTest.py` | mesh and texture sharing gives the same bytes as private copies, a file texture decoded once per process |
 | `textureFilterTest.py` | `ER_TEXTURE_FILTER` |
 | `skyTest.py` | `skyHorizonColor`, `skyZenithColor`, gradient orientation, depth untouched |
 | `raycastColourTest.py` | `ER_SWARM_RAYCAST` colour: agreement with TinyRenderer, shadow ray, sky, filter, thread counts |
