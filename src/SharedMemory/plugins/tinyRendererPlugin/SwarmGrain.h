@@ -50,6 +50,15 @@ inline std::vector<float> gaussianKernel(float sigma)
 	return taps;
 }
 
+// `buffer` grown to at least `size` floats and kept for the next frame, so a frame pays no allocation, zero fill or
+// page faults. Callers write every element before reading it, and keep the buffer to the calling thread.
+inline float* reuse(std::vector<float>& buffer, size_t size)
+{
+	if (buffer.size() < size)
+		buffer.resize(size);
+	return &buffer[0];
+}
+
 // Separable blur with the edge pixel repeated, rows then columns; each output pixel sums its taps in one fixed order.
 // Pixels a full radius from the border skip the clamp, which reads the same samples in the same order, and take their
 // taps a whole run of pixels at a time, each pixel still adding its taps from -radius up.
@@ -59,7 +68,8 @@ inline void blur(const float* in, float* out, int width, int height, const std::
 	const float* tap = &taps[(size_t)radius];
 	const int inner0 = radius < width ? radius : width;
 	const int inner1 = width - radius > inner0 ? width - radius : inner0;
-	std::vector<float> rows((size_t)width * height);
+	static thread_local std::vector<float> rowsBuffer;
+	float* rows = reuse(rowsBuffer, (size_t)width * height);
 #pragma omp parallel for num_threads(threads) schedule(static)
 	for (int y = 0; y < height; y++)
 	{
