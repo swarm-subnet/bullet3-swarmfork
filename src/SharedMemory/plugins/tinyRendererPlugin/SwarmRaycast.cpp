@@ -4014,10 +4014,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		camera.m_seed = shading->m_sensorSeed;
 		for (int k = 0; k < 3; k++)
 			camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
-		// One thread: the chain is a dozen short passes, and on a busy box the barriers between them cost more than the
-		// passes; the bytes are the same at any count.
+		// Every pass splits its rows over the render threads; the bytes are the same at any count.
 		for (int i = 0; i < numTargets; i++)
 			if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, 1);
+				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, threads);
 	}
 }
