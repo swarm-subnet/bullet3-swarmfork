@@ -323,11 +323,21 @@ inline float placementSign(const float* t)
 	return det < 0.0f ? -1.0f : 1.0f;
 }
 
+// While a hinted search runs on this thread: the nearest distance a hit was kept at, and whether a second hit was kept at
+// exactly that distance. Which of two such hits wins depends on the order the boxes are visited in, and a search cut
+// short can visit them in another order, so a tie sends the ray to the full search.
+struct TieWatch
+{
+	float m_nearest;
+	bool m_tied;
+};
+thread_local TieWatch* t_tieWatch = 0;
+
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
 // filter does the same in object space, where Embree hands over both the ray and the hit. Static
 // members also drop out here when retired or fully transparent, so the static tree is never rebuilt.
 // With cut-outs on, a hit on a see-through texel drops out too and the ray carries on behind it.
-void hitFilter(const RTCFilterFunctionNArguments* args)
+void keepHit(const RTCFilterFunctionNArguments* args)
 {
 	if (args->N != 1)
 		return;
@@ -412,6 +422,20 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
+}
+
+void hitFilter(const RTCFilterFunctionNArguments* args)
+{
+	keepHit(args);
+	if (args->N != 1 || !args->valid[0])
+		return;
+	TieWatch* watch = t_tieWatch;
+	if (watch)
+	{
+		const float t = ((const RTCRay*)args->ray)->tfar;
+		watch->m_tied = t == watch->m_nearest;
+		watch->m_nearest = t;
+	}
 }
 
 void reportError(void* userPtr, RTCError code, const char* message)
@@ -773,6 +797,22 @@ bool setupCamera(const float viewMat[16], const float projMat[16], Camera& cam)
 	cam.m_p23 = projMat[14];
 	return true;
 }
+
+// Where a lens's first rays landed on its last frame, in world space (x, y, z per pixel, NaN for a miss). The next frame
+// from the same lens puts them back onto its own pixels to know about how far each ray has to search.
+struct HitMemory
+{
+	int m_width;
+	int m_height;
+	float m_proj[16];
+	std::vector<float> m_points;
+	unsigned long long m_lastUse;
+};
+
+// Lenses remembered at once (the wide feed, the zoom, the thermal camera), and the smallest frame that keeps a memory:
+// the laser's few pixels gain nothing from one.
+const int kHitMemories = 4;
+const size_t kHintMinPixels = 64 * 64;
 }  // namespace
 
 struct SwarmRaycast::Data
@@ -814,6 +854,35 @@ struct SwarmRaycast::Data
 	std::vector<StaticMember*> m_shelterDirty;
 	// Mover instances attached to the mover scene, so a frame with none skips their shadow ray.
 	int m_moverCount;
+	HitMemory m_hitMemories[kHitMemories];
+	unsigned long long m_frameCount;
+	// Per pixel of the current frame: the depth along the camera's axis of the farthest remembered hit landing on it, -1
+	// where none does.
+	std::vector<float> m_hintFar;
+
+	// The memory of the lens with this frame size and projection, or the one used longest ago, emptied for it.
+	HitMemory* hitMemory(int width, int height, const float projMat[16])
+	{
+		HitMemory* oldest = &m_hitMemories[0];
+		for (int i = 0; i < kHitMemories; i++)
+		{
+			HitMemory* memory = &m_hitMemories[i];
+			if (!memory->m_points.empty() && memory->m_width == width && memory->m_height == height &&
+				memcmp(memory->m_proj, projMat, sizeof(memory->m_proj)) == 0)
+			{
+				memory->m_lastUse = ++m_frameCount;
+				return memory;
+			}
+			if (memory->m_lastUse < oldest->m_lastUse)
+				oldest = memory;
+		}
+		oldest->m_points.clear();
+		oldest->m_width = width;
+		oldest->m_height = height;
+		memcpy(oldest->m_proj, projMat, sizeof(oldest->m_proj));
+		oldest->m_lastUse = ++m_frameCount;
+		return oldest;
+	}
 
 	void shadowChanged(StaticMember* member)
 	{
@@ -1593,6 +1662,9 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_shelterMap.m_built = false;
 	m_data->m_coreRadius = 0.0f;
 	m_data->m_moverCount = 0;
+	m_data->m_frameCount = 0;
+	for (int i = 0; i < kHitMemories; i++)
+		m_data->m_hitMemories[i].m_lastUse = 0;
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
 	m_data->m_cacheDir = cacheDir ? cacheDir : "";
 	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
@@ -1752,6 +1824,8 @@ void SwarmRaycast::removeAll()
 	m_data->m_byGeomId.clear();
 	m_data->m_freeGeomIds.clear();
 	m_data->createStaticScene();
+	for (int i = 0; i < kHitMemories; i++)
+		m_data->m_hitMemories[i].m_points.clear();
 }
 
 void SwarmRaycast::commit()
@@ -2366,6 +2440,12 @@ struct TileJob
 	bool m_filtered;
 	// Angle one pixel spans, for the cut-out footprint; 0 unless textures are filtered under daylight.
 	float m_pixelSpread;
+	// The depth hint, when the lens remembers its last frame: per pixel the farthest remembered hit landing on it, and
+	// the box rounding a hinted search allows for, over the smallest ray direction component.
+	const float* m_hintFar;
+	float m_hintRounding;
+	// Where every first ray lands this frame, kept for the next; each pixel writes only its own.
+	float* m_hitPoints;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -2592,12 +2672,81 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	return (1.0f - reflectance) * SwarmThermal::radiance(temperature) + reflectance * environment;
 }
 
+// A hinted ray searches this far past the farthest known hit around its pixel, as a share and in metres, for the step
+// from one pixel to the next on a slanted surface; a surface found farther costs a second, full search.
+const float kHintSlack = 1.0f / 32.0f;
+const float kHintSlackMetres = 0.25f;
+
+// The depth along the camera's axis the ray of pixel (row, col) has to search to: past the farthest remembered hit on it
+// and its eight neighbours; no limit where none of them remembers one.
+inline float hintReach(const float* hintFar, int width, int height, int row, int col)
+{
+	float farthest = -1.0f;
+	for (int r = row > 0 ? row - 1 : row; r <= row + 1 && r < height; r++)
+		for (int c = col > 0 ? col - 1 : col; c <= col + 1 && c < width; c++)
+		{
+			const float far = hintFar[(size_t)r * width + c];
+			farthest = far > farthest ? far : farthest;
+		}
+	return farthest < 0.0f ? INFINITY : farthest + farthest * kHintSlack + kHintSlackMetres;
+}
+
+// The same for an edge pixel's probe ray, from this frame's first rays: their 1/zEye, the far plane's for a miss.
+inline float probeReach(const float* inverseEyeDepth, int width, int height, int row, int col)
+{
+	float nearest = -INFINITY;
+	for (int r = row > 0 ? row - 1 : row; r <= row + 1 && r < height; r++)
+		for (int c = col > 0 ? col - 1 : col; c <= col + 1 && c < width; c++)
+		{
+			const float w = inverseEyeDepth[(size_t)r * width + c];
+			nearest = w > nearest ? w : nearest;
+		}
+	if (!(nearest < 0.0f))
+		return INFINITY;
+	const float farthest = -1.0f / nearest;
+	return farthest + farthest * kHintSlack + kHintSlackMetres;
+}
+
+// The first hit of a camera ray, searched first only up to `reach` and a guard past it, when that falls short of the ray's
+// end. A search cut short keeps every surface up to its end, so its nearest hit is the full search's, except within the
+// guard, where a box tested with rounding against the end may have hidden a nearer surface, and at a tie, which the two
+// searches may break apart. A miss, a hit past `reach` or a tie searches again over the whole ray, so a wrong hint costs
+// time and never changes the hit.
+void firstHit(const TileJob& job, RTCRayHit& rayhit, float reach, RTCIntersectArguments* args)
+{
+	const float end = rayhit.ray.tfar;
+	if (reach < end)
+	{
+		const float x = fabsf(rayhit.ray.dir_x), y = fabsf(rayhit.ray.dir_y), z = fabsf(rayhit.ray.dir_z);
+		const float smallest = x < y ? (x < z ? x : z) : (y < z ? y : z);
+		const float limit = reach + (reach * (1.0f / 1024.0f) + job.m_hintRounding / smallest);
+		if (limit < end)
+		{
+			TieWatch watch = {INFINITY, false};
+			rayhit.ray.tfar = limit;
+			t_tieWatch = &watch;
+			rtcIntersect1(job.m_top, &rayhit, args);
+			t_tieWatch = 0;
+			if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID && rayhit.ray.tfar <= reach && !watch.m_tied)
+				return;
+			rayhit.ray.tfar = end;
+			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+		}
+	}
+	rtcIntersect1(job.m_top, &rayhit, args);
+}
+
+// `reach`, when finite, is the depth hint for this ray along the camera's axis; `landed`, when given, takes where the ray
+// landed (NaN on a miss).
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
-			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out)
+			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
+	if (landed)
+		landed[0] = landed[1] = landed[2] = NAN;
 
 	float nearPoint[3], farPoint[3];
 	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
@@ -2635,7 +2784,9 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.ray.flags = 0;
 	rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-	rtcIntersect1(job.m_top, &rayhit, args);
+	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
+	const float facing = -dot3(cam.m_viewRow2, dir);
+	firstHit(job, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 		return false;
 
@@ -2643,6 +2794,12 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	const float hx = cam.m_origin[0] + dir[0] * t;
 	const float hy = cam.m_origin[1] + dir[1] * t;
 	const float hz = cam.m_origin[2] + dir[2] * t;
+	if (landed)
+	{
+		landed[0] = hx;
+		landed[1] = hy;
+		landed[2] = hz;
+	}
 	const float zEye = ((cam.m_viewRow2[0] * hx + cam.m_viewRow2[1] * hy) + cam.m_viewRow2[2] * hz) + cam.m_viewRow2[3];
 	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
 	out.m_inverseEyeDepth = 1.0f / zEye;
@@ -2910,7 +3067,9 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			Sample sample;
 			sample.m_radiance = 0.0f;
 			const size_t offset = (size_t)row * width + col;
-			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample);
+			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (!hit)
@@ -3215,7 +3374,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
-					restColour = (traceRay(job, setup, px, py, args, shadowArgs, probe) && probe.m_shaded)
+					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
+					restColour = (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
 									 ? probe.m_rgb
 									 : &scratch.m_background[offset * 3];
 				}
@@ -3326,6 +3486,57 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			centre += axis * axis;
 		}
 		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
+	}
+
+	// A hinted search ends a guard past its hint. The boxes above the triangle trees are tested in world space by a fused
+	// multiply against the origin over the direction, which rounds by about 2^-24 of the larger of the origin and the box
+	// corner over each direction component; the guard allows sixteen times that.
+	RTCBounds bounds;
+	rtcGetSceneBounds(m_data->m_top, &bounds);
+	const float corners[6] = {bounds.lower_x, bounds.lower_y, bounds.lower_z, bounds.upper_x, bounds.upper_y, bounds.upper_z};
+	float extent = 0.0f;
+	for (int k = 0; k < 6; k++)
+		extent = fabsf(corners[k]) > extent ? fabsf(corners[k]) : extent;
+	for (int i = 0; i < numTargets; i++)
+		for (int k = 0; setups[(size_t)i].m_valid && k < 3; k++)
+			extent = fabsf(setups[(size_t)i].m_cam.m_origin[k]) > extent ? fabsf(setups[(size_t)i].m_cam.m_origin[k]) : extent;
+	job.m_hintRounding = extent * (2.0f / 1048576.0f);
+
+	// The depth hint, for a lone camera with a frame big enough: the last frame of the same lens, its hits put onto this
+	// frame's pixels, tells each ray about how far it has to search.
+	job.m_hintFar = 0;
+	job.m_hitPoints = 0;
+	if (numTargets == 1 && setups[0].m_valid && numPixels >= kHintMinPixels)
+	{
+		HitMemory* memory = m_data->hitMemory(width, height, projMat);
+		const Camera& cam = setups[0].m_cam;
+		if (memory->m_points.size() == numPixels * 3)
+		{
+			float viewProj[4][4];
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 4; c++)
+					viewProj[r][c] = (float)cam.m_viewProj[r][c];
+			std::vector<float>& hintFar = m_data->m_hintFar;
+			hintFar.assign(numPixels, -1.0f);
+			for (size_t i = 0; i < numPixels; i++)
+			{
+				const float* q = &memory->m_points[i * 3];
+				const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
+				if (!(w > 1e-6f))
+					continue;
+				const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
+				const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
+				const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
+				const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
+				if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
+					continue;
+				float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
+				far = w > far ? w : far;
+			}
+			job.m_hintFar = &hintFar[0];
+		}
+		memory->m_points.resize(numPixels * 3);
+		job.m_hitPoints = &memory->m_points[0];
 	}
 
 	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
