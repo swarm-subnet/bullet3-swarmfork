@@ -719,6 +719,16 @@ static void buildMips(SharedTexture& tex)
 	}
 }
 
+// (i % n + n) % n; a wrapped coordinate floors to -1 .. n - 1, which needs no division.
+static inline int wrapTexel(int i, int n)
+{
+	if (i >= 0 && i < n)
+		return i;
+	if (i == -1)
+		return n - 1;
+	return (i % n + n) % n;
+}
+
 // Four-texel blend inside one level with 8-bit fixed-point weights, repeat wrap.
 // u and v are already in [0, 1).
 static TGAColor sampleBilinear(TGAImage& img, float u, float v)
@@ -730,8 +740,8 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	const float fy = std::floor(y);
 	const int wx = (int)((x - fx) * 256.f);
 	const int wy = (int)((y - fy) * 256.f);
-	int x0 = ((int)fx % w + w) % w;
-	int y0 = ((int)fy % h + h) % h;
+	int x0 = wrapTexel((int)fx, w);
+	int y0 = wrapTexel((int)fy, h);
 	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1;
 	const int y1 = (y0 + 1 == h) ? 0 : y0 + 1;
 	const unsigned char* s = img.buffer();
@@ -783,11 +793,13 @@ static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2
 	return a;
 }
 
-// Wraps a texture coordinate into [0, 1).
+// Wraps a texture coordinate into [0, 1). A float's fraction is exact in float, so this is modf's value without the
+// double round trip; an infinity has no fraction, as modf says.
 static float wrapUnit(float value)
 {
-	double integral;
-	float f = (float)std::modf(value, &integral);
+	float f = value - std::trunc(value);
+	if (f != f)
+		f = value != value ? value : 0.f;
 	return f < 0.f ? f + 1.f : f;
 }
 
@@ -866,7 +878,7 @@ unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged
 	const float x = wrapUnit(uvf[0]) * w - 0.5f, y = wrapUnit(uvf[1]) * h - 0.5f;
 	const float fx = std::floor(x), fy = std::floor(y);
 	const float ax = x - fx, ay = y - fy;
-	const int x0 = ((int)fx % w + w) % w, y0 = ((int)fy % h + h) % h;
+	const int x0 = wrapTexel((int)fx, w), y0 = wrapTexel((int)fy, h);
 	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1, y1 = (y0 + 1 == h) ? 0 : y0 + 1;
 	const float top = plane[(size_t)y0 * w + x0] * (1.f - ax) + plane[(size_t)y0 * w + x1] * ax;
 	const float bottom = plane[(size_t)y1 * w + x0] * (1.f - ax) + plane[(size_t)y1 * w + x1] * ax;
