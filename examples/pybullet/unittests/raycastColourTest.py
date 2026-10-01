@@ -176,6 +176,17 @@ class TestRaycastColour(unittest.TestCase):
 
 
 @NEEDS_BACKEND
+class TestRaycastDepthHint(unittest.TestCase):
+  """The last frame of a lens only tells each ray how far to search; it never changes a byte."""
+
+  def test_frame_after_a_nearby_one_equals_a_first_frame(self):
+    """A frame drawn after a nearby view, with a body moved in between, has the bytes of the same frame drawn first."""
+    first = subprocess.check_output([sys.executable, __file__, "--hint", "first"], text=True)
+    warm = subprocess.check_output([sys.executable, __file__, "--hint", "warm"], text=True)
+    self.assertEqual(first, warm)
+
+
+@NEEDS_BACKEND
 class TestRaycastColourThreads(unittest.TestCase):
   """The colour bytes do not depend on how many render threads are used."""
 
@@ -203,8 +214,34 @@ def colour_hash():
   os.rmdir(tmp)
 
 
+def hint_hash(warm):
+  """Prints the sha256 of the colour, depth and mask of one frame, drawn first or right after a nearby view."""
+  p.connect(p.DIRECT)
+  tmp = tempfile.mkdtemp()
+  tex_path = os.path.join(tmp, 'checker.tga')
+  write_checker_tga(tex_path)
+  build_world(tex_path)
+  flags = (p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX | p.ER_SWARM_RAYCAST | p.ER_TEXTURE_FILTER |
+           getattr(p, "ER_EDGE_ANTIALIAS", 0) | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER_SWARM_MOVER_SHADOW", 0))
+  if warm:
+    render(flags, shadow=1)
+  else:
+    # The same opening frame at another size is another lens, so the frame compared below has no last frame to use.
+    view = p.computeViewMatrix([3.0, -3.0, 2.5], [0, 0, 0.4], [0, 0, 1])
+    proj = p.computeProjectionMatrixFOV(70, 1.0, 0.1, 30.0)
+    p.getCameraImage(SIZE // 2, SIZE // 2, view, proj, shadow=1, lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+  p.resetBasePositionAndOrientation(2, [1.2, 1.4, 0.6], [0, 0, 0, 1])
+  rgb, depth, seg = render(flags, shadow=1, eye=(3.3, -2.7, 2.3))
+  print(hashlib.sha256(rgb.astype(np.uint8).tobytes() + depth.tobytes() + seg.tobytes()).hexdigest())
+  p.disconnect()
+  os.remove(tex_path)
+  os.rmdir(tmp)
+
+
 if __name__ == '__main__':
   if "--hash" in sys.argv:
     colour_hash()
+  elif "--hint" in sys.argv:
+    hint_hash(sys.argv[-1] == "warm")
   else:
     unittest.main()
