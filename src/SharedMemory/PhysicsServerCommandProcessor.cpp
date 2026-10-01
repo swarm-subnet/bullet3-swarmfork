@@ -16348,6 +16348,11 @@ b3Notification createSoftBodyChangedNotification(int bodyUniqueId, int linkIndex
 
 void PhysicsServerCommandProcessor::addBodyChangedNotifications()
 {
+	// Without a plugin that reads notifications every one is dropped, so the walk over all bodies is skipped.
+	if (!m_data->m_pluginManager.hasNotificationPlugins())
+	{
+		return;
+	}
 	b3Notification notification;
 	notification.m_notificationType = SIMULATION_STEPPED;
 	m_data->m_pluginManager.addNotification(notification);
