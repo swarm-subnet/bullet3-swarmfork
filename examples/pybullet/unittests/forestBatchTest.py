@@ -27,15 +27,23 @@ def write_meshes(folder):
   return ["flat.obj", "stand.obj"]
 
 
-def write_forest(folder, meshes, placements):
-  """Write a forest file naming the meshes and listing each placement as index, xyz, quaternion and scale."""
+def write_forest(folder, meshes, placements, binary=False):
+  """Write a forest file naming the meshes and listing each placement as index, xyz, quaternion and scale.
+
+  binary writes the rows as doubles after a "binary" line, each the number its text form would parse to.
+  """
   lines = ["# a comment line is skipped"] + ["mesh %s" % name for name in meshes]
+  rows = []
   for index, position, yaw, scale in placements:
-    lines.append("%d %f %f %f 0 0 %f %f %f %f %f" % ((index,) + tuple(position) + (math.sin(yaw / 2), math.cos(yaw / 2))
-                                                     + tuple(scale)))
+    rows.append("%d %f %f %f 0 0 %f %f %f %f %f" % ((index,) + tuple(position) + (math.sin(yaw / 2), math.cos(yaw / 2))
+                                                    + tuple(scale)))
   path = os.path.join(folder, "forest.fst")
-  with open(path, "w") as out:
-    out.write("\n".join(lines) + "\n")
+  with open(path, "wb") as out:
+    if binary:
+      out.write(("\n".join(lines + ["binary %d" % len(rows)]) + "\n").encode())
+      out.write(np.array([[float(v) for v in row.split()] for row in rows], dtype="<f8").tobytes())
+    else:
+      out.write(("\n".join(lines + rows) + "\n").encode())
   return path
 
 
@@ -45,11 +53,11 @@ def ground():
   p.createMultiBody(0, -1, shape, basePosition=[0, 0, -0.05])
 
 
-def forest_world(folder, base=(0, 0, 0), flags=INSTANCED):
+def forest_world(folder, base=(0, 0, 0), flags=INSTANCED, binary=False):
   """The placements as one forest body; returns its body id."""
   p.resetSimulation()
   ground()
-  path = write_forest(folder, write_meshes(folder), PLACEMENTS)
+  path = write_forest(folder, write_meshes(folder), PLACEMENTS, binary)
   shape = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=flags | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY,
                               specularColor=[0, 0, 0])
   return p.createMultiBody(0, -1, shape, basePosition=list(base))
@@ -105,6 +113,15 @@ class TestForestBatch(unittest.TestCase):
       separate_world(self.folder)
       apart = frame(flags=flags, eye=(0, -6, 6))
       self.assertPixelsEqual(together, apart)
+
+  def test_binary_rows_draw_the_text_rows_bytes(self):
+    """Rows given as doubles draw the same colour, depth and mask as the same rows given as text."""
+    forest_world(self.folder)
+    text = frame(flags=RAY | MAP | DAY | CUTOUT, eye=(0, -6, 6))
+    forest_world(self.folder, binary=True)
+    binary = frame(flags=RAY | MAP | DAY | CUTOUT, eye=(0, -6, 6))
+    for left, right in zip(text, binary):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
 
   def test_body_pose_carries_the_placements(self):
     """A forest body placed off the origin moves every placement with it."""
