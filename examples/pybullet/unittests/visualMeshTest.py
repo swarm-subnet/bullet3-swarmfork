@@ -1,6 +1,7 @@
 """resetMeshData on a visual mesh: a body's drawn surface takes new vertex positions each frame, keeping its faces,
 uvs and texture, with normals rebuilt from the new shape. One body stays one surface, so an animal never has to be
 cut into rigid pieces. Both colour paths, and the ray caster's tree follows the change."""
+import json
 import math
 import os
 import subprocess
@@ -162,6 +163,16 @@ class TestVisualMesh(unittest.TestCase):
     after, _ = self.render(PICTURE)
     self.assertNotEqual(moved.tobytes(), after.tobytes())
 
+  def test_a_rewrite_leaves_the_kept_tree_alone(self):
+    """Private twins share a kept tree: rewriting one leaves the other and a later world unchanged."""
+    env = dict(os.environ, SWARM_SHARE_MESH="0")
+    out = subprocess.check_output([sys.executable, os.path.abspath(__file__), "--kept"], env=env, text=True,
+                                  cwd=os.path.dirname(os.path.abspath(__file__)))
+    result = json.loads(out.strip().splitlines()[-1])
+    self.assertTrue(result["rewritten_changed"])
+    self.assertTrue(result["twin_same"])
+    self.assertTrue(result["later_same"])
+
   def test_the_same_upload_twice_gives_the_same_bytes(self):
     """Rewriting with the same positions twice renders the same frame, so nothing accumulates."""
     uid = self.body()
@@ -268,8 +279,51 @@ def save_frame(path):
   p.disconnect()
 
 
+def kept_tree_check():
+  """Rewrites one of two moved twins whose equal meshes are private but share the kept tree, and reports what changed."""
+  p.connect(p.DIRECT)
+  vertices, normals, uvs, triangles = grid(9, 1.0)
+  view = p.computeViewMatrix([0, -3.6, 2.4], [0, 0, 0], [0, 0, 1])
+  proj = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 100.0)
+
+  def render():
+    """Colour of one frame, left half holding the first twin and right half the second."""
+    _, _, rgb, _, _ = p.getCameraImage(SIZE, SIZE, view, proj, shadow=0, lightDirection=SUN, renderer=p.ER_TINY_RENDERER,
+                                       flags=PICTURE)
+    return np.asarray(rgb).reshape(SIZE, SIZE, 4)[:, :, :3]
+
+  def twins():
+    """A fresh world with two equal grid bodies, moved apart after a first frame so both are drawn through mesh trees."""
+    p.resetSimulation()
+    bodies = []
+    for _ in range(2):
+      shape = p.createVisualShape(p.GEOM_MESH, vertices=vertices, indices=[i for t in triangles for i in t], normals=normals,
+                                  uvs=uvs, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0])
+      bodies.append(p.createMultiBody(0, -1, shape))
+    render()
+    p.resetBasePositionAndOrientation(bodies[0], [-1.2, 0, 0], [0, 0, 0, 1])
+    p.resetBasePositionAndOrientation(bodies[1], [1.2, 0, 0], [0, 0, 0, 1])
+    return bodies
+
+  bodies = twins()
+  before = render()
+  raised = np.array(vertices)
+  raised[len(raised) // 2, 2] = 0.9
+  p.resetMeshData(bodies[0], raised)
+  after = render()
+  twins()
+  later = render()
+  p.disconnect()
+  half = SIZE // 2
+  print(json.dumps({"rewritten_changed": bool((before[:, :half] != after[:, :half]).any()),
+                    "twin_same": bool((before[:, half:] == after[:, half:]).all()),
+                    "later_same": bool((before == later).all())}))
+
+
 if __name__ == '__main__':
   if len(sys.argv) == 3 and sys.argv[1] == "--frame":
     save_frame(sys.argv[2])
+  elif len(sys.argv) == 2 and sys.argv[1] == "--kept":
+    kept_tree_check()
   else:
     unittest.main()

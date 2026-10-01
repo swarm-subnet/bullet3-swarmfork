@@ -6,11 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+#include <xmmintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -148,6 +150,24 @@ struct StaticMember
 	int m_segmentation;
 };
 
+struct CachedTree;
+// The process's mesh trees by vertex and triangle count, and the idle ones, least recently used first.
+typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
+typedef std::list<CachedTree*> IdleTrees;
+
+// A mesh tree committed over its own copy of the vertex and index arrays and kept for the life of the process. A build
+// runs the same steps on the same arrays, so a later world handing over equal arrays is given the tree it would build.
+struct CachedTree
+{
+	RTCScene m_scene;
+	RTCGeometry m_geometry;
+	size_t m_triangles;
+	// Worlds drawing the tree now; at zero the tree waits at m_idle for a later world.
+	int m_users;
+	TreeCache::iterator m_entry;
+	IdleTrees::iterator m_idle;
+};
+
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
 // instead holds one static body's triangles in world space, drawn through an identity instance,
 // so its tree can be kept on disk under the body's mesh and pose.
@@ -155,6 +175,8 @@ struct MeshTree
 {
 	RTCScene m_scene;
 	RTCGeometry m_geometry;
+	// The process-wide tree m_scene and m_geometry belong to, until the mesh is rewritten; 0 when they are this tree's own.
+	CachedTree* m_cached;
 	std::vector<float> m_vertices;
 	std::vector<unsigned> m_indices;
 	// Per-vertex unit normals in the mesh's own frame, and uv pairs, indexed like m_vertices.
@@ -727,6 +749,100 @@ RTCGeometry newTriangles(RTCDevice device, std::vector<float>& vertices, std::ve
 	rtcSetGeometryIntersectFilterFunction(geometry, hitFilter);
 	rtcSetGeometryOccludedFilterFunction(geometry, shadowFilter);
 	return geometry;
+}
+
+// One Embree device for the process: a cached tree outlives the world that built it, and an instance can only draw a
+// scene of its own device. threads=1: Embree starts no thread of its own, so a build runs only on the threads that
+// commit it. Never released, since the cached trees live as long as the process.
+RTCDevice processDevice()
+{
+	static const RTCDevice device = rtcNewDevice("threads=1,set_affinity=0");
+	return device;
+}
+
+// Commits a scene on up to two render threads. Embree cuts a build into the same tasks however many threads run them,
+// and each task's result depends only on its own primitives, so the tree is the one a single thread builds.
+void joinCommit(RTCScene scene)
+{
+	// The internal scheduler of a one-thread device has room for two threads in a build.
+	const int threads = b3GetSwarmRenderThreads() < 2 ? 1 : 2;
+	// A joining thread builds with the caller's MXCSR (rounding, flush to zero, denormals are zero), then gets its own back.
+	const unsigned int callerCsr = _mm_getcsr();
+#pragma omp parallel num_threads(threads)
+	{
+		const unsigned int ownCsr = _mm_getcsr();
+		_mm_setcsr(callerCsr);
+		rtcJoinCommitScene(scene);
+		_mm_setcsr(ownCsr);
+	}
+}
+
+// Idle cached trees are kept up to this weight, the least recently used dropped first. A tree weighs its triangles plus
+// a fixed share for its scene, geometry and allocator blocks, so many tiny trees cannot pile up either.
+const size_t kTreeCacheIdleWeight = 2000000;
+const size_t kTreeCacheEntryWeight = 1000;
+
+TreeCache gTreeCache;
+IdleTrees gIdleTrees;
+size_t gIdleWeight = 0;
+
+// The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
+CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
+{
+	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
+	const std::pair<size_t, size_t> key(numVertices, numTriangles);
+	const std::pair<TreeCache::iterator, TreeCache::iterator> range = gTreeCache.equal_range(key);
+	for (TreeCache::iterator it = range.first; it != range.second; ++it)
+	{
+		CachedTree* tree = it->second;
+		if (memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
+			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
+			continue;
+		if (tree->m_users++ == 0)
+		{
+			gIdleTrees.erase(tree->m_idle);
+			gIdleWeight -= numTriangles + kTreeCacheEntryWeight;
+		}
+		return tree;
+	}
+	CachedTree* tree = new CachedTree;
+	tree->m_triangles = numTriangles;
+	tree->m_users = 1;
+	tree->m_scene = rtcNewScene(device);
+	rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
+	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
+	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
+	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3 * sizeof(float), numVertices),
+		   &vertices[0], numVertices * 3 * sizeof(float));
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, 3 * sizeof(unsigned), numTriangles),
+		   &indices[0], indices.size() * sizeof(unsigned));
+	rtcSetGeometryIntersectFilterFunction(tree->m_geometry, hitFilter);
+	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
+	rtcCommitGeometry(tree->m_geometry);
+	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
+	joinCommit(tree->m_scene);
+	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
+	return tree;
+}
+
+// A world stops drawing the tree; once idle it stays for a later world while the idle ones fit the bound.
+void releaseCachedTree(CachedTree* tree)
+{
+	if (--tree->m_users > 0)
+		return;
+	tree->m_idle = gIdleTrees.insert(gIdleTrees.end(), tree);
+	gIdleWeight += tree->m_triangles + kTreeCacheEntryWeight;
+	while (gIdleWeight > kTreeCacheIdleWeight)
+	{
+		CachedTree* drop = gIdleTrees.front();
+		gIdleTrees.pop_front();
+		gIdleWeight -= drop->m_triangles + kTreeCacheEntryWeight;
+		gTreeCache.erase(drop->m_entry);
+		rtcReleaseGeometry(drop->m_geometry);
+		rtcReleaseScene(drop->m_scene);
+		delete drop;
+	}
 }
 
 // Rotation part of the body transform, row-major, for turning a model normal into world space.
@@ -1319,9 +1435,18 @@ struct SwarmRaycast::Data
 		return tree;
 	}
 
-	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build.
+	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build. A mesh tree is taken from the
+	// process cache, so a mesh another world already drew costs no build.
 	void buildTree(MeshTree& tree, const std::vector<char>* image)
 	{
+		tree.m_cached = 0;
+		if (!tree.m_world)
+		{
+			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices);
+			tree.m_scene = tree.m_cached->m_scene;
+			tree.m_geometry = tree.m_cached->m_geometry;
+			return;
+		}
 		tree.m_scene = rtcNewScene(m_device);
 		rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST);
 		rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_MEDIUM);
@@ -1404,8 +1529,13 @@ struct SwarmRaycast::Data
 				m_sharedTrees.erase(it);
 				break;
 			}
-		rtcReleaseGeometry(tree->m_geometry);
-		rtcReleaseScene(tree->m_scene);
+		if (tree->m_cached)
+			releaseCachedTree(tree->m_cached);
+		else
+		{
+			rtcReleaseGeometry(tree->m_geometry);
+			rtcReleaseScene(tree->m_scene);
+		}
 		delete tree;
 	}
 
@@ -1419,8 +1549,15 @@ struct SwarmRaycast::Data
 		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
 		if (!tree.m_refitting)
 		{
-			rtcReleaseGeometry(tree.m_geometry);
-			rtcReleaseScene(tree.m_scene);
+			// A cached tree is never rewritten: the mesh leaves it for a scene of its own.
+			if (tree.m_cached)
+				releaseCachedTree(tree.m_cached);
+			else
+			{
+				rtcReleaseGeometry(tree.m_geometry);
+				rtcReleaseScene(tree.m_scene);
+			}
+			tree.m_cached = 0;
 			tree.m_scene = rtcNewScene(m_device);
 			rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC);
 			rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_LOW);
@@ -1833,8 +1970,7 @@ SwarmRaycast::SwarmRaycast()
 		m_data->m_hitMemories[i].m_lastUse = 0;
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
 	m_data->m_cacheDir = cacheDir ? cacheDir : "";
-	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
-	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
+	m_data->m_device = processDevice();
 	if (!m_data->m_device)
 	{
 		b3Warning("SwarmRaycast: cannot create the Embree device (a CPU with AVX2 and FMA is required)");
@@ -1859,8 +1995,6 @@ SwarmRaycast::~SwarmRaycast()
 		rtcReleaseScene(m_data->m_movers);
 		rtcReleaseScene(m_data->m_top);
 	}
-	if (m_data->m_device)
-		rtcReleaseDevice(m_data->m_device);
 	delete m_data;
 }
 
@@ -2005,14 +2139,14 @@ void SwarmRaycast::commit(bool moverShadows)
 		return;
 	if (!m_data->m_staticBuilt)
 	{
-		rtcCommitScene(m_data->m_static);
+		joinCommit(m_data->m_static);
 		m_data->m_staticBuilt = true;
 		m_data->m_topDirty = true;
 	}
 	// The forest is committed before the instance that reaches it, and both parents after it.
 	if (m_data->m_forestDirty)
 	{
-		rtcCommitScene(m_data->m_forest);
+		joinCommit(m_data->m_forest);
 		rtcCommitGeometry(m_data->m_forestInstance);
 		m_data->m_forestDirty = false;
 		m_data->m_topDirty = true;
