@@ -550,12 +550,22 @@ RTCGeometry newTriangles(RTCDevice device, std::vector<float>& vertices, std::ve
 }
 
 // One Embree device for the process: a cached tree outlives the world that built it, and an instance can only draw a
-// scene of its own device. threads=1 keeps every tree build on the calling thread, so the same input gives the same
-// tree everywhere. Never released, since the cached trees live as long as the process.
+// scene of its own device. threads=1: Embree starts no thread of its own, so a build runs only on the threads that
+// commit it. Never released, since the cached trees live as long as the process.
 RTCDevice processDevice()
 {
 	static const RTCDevice device = rtcNewDevice("threads=1,set_affinity=0");
 	return device;
+}
+
+// Commits a scene on up to two render threads. Embree cuts a build into the same tasks however many threads run them,
+// and each task's result depends only on its own primitives, so the tree is the one a single thread builds.
+void joinCommit(RTCScene scene)
+{
+	// The internal scheduler of a one-thread device has room for two threads in a build.
+	const int threads = b3GetSwarmRenderThreads() < 2 ? 1 : 2;
+#pragma omp parallel num_threads(threads)
+	rtcJoinCommitScene(scene);
 }
 
 // Idle cached trees are kept up to this many triangles, the least recently used dropped first.
@@ -599,7 +609,7 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
 	rtcCommitGeometry(tree->m_geometry);
 	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
-	rtcCommitScene(tree->m_scene);
+	joinCommit(tree->m_scene);
 	gTreeCache.insert(std::make_pair(key, tree));
 	return tree;
 }
@@ -1858,14 +1868,14 @@ void SwarmRaycast::commit()
 		return;
 	if (!m_data->m_staticBuilt)
 	{
-		rtcCommitScene(m_data->m_static);
+		joinCommit(m_data->m_static);
 		m_data->m_staticBuilt = true;
 		m_data->m_topDirty = true;
 	}
 	// The forest is committed before the instance that reaches it, and both parents after it.
 	if (m_data->m_forestDirty)
 	{
-		rtcCommitScene(m_data->m_forest);
+		joinCommit(m_data->m_forest);
 		rtcCommitGeometry(m_data->m_forestInstance);
 		m_data->m_forestDirty = false;
 		m_data->m_topDirty = true;
