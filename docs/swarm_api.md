@@ -22,7 +22,7 @@ The distribution is `swarm-bullet3` and the module is still `import pybullet`. A
 ## Rules every change keeps
 
 - Validators are CPU only. Nothing here needs a GPU.
-- The bytes of an image, and so a score, must be the same on every validator: one binary, one code path, no runtime CPU dispatch, no fast-math, `-ffp-contract=off`, hardware reciprocals in Embree replaced by IEEE division, tree builds on one thread, pixels dealt to threads in fixed 16 x 16 tiles (tile k goes to thread k mod T), no maths-library transcendental in a per-pixel path (the sky and the gamma table use polynomials and literal tables).
+- The bytes of an image, and so a score, must be the same on every validator: one binary, one code path, no runtime CPU dispatch, no fast-math, `-ffp-contract=off`, hardware reciprocals in Embree replaced by IEEE division, tree builds on one thread, pixels traced in fixed 16 x 16 tiles that each thread takes as it frees up (a tile comes out the same on any thread), no maths-library transcendental in a per-pixel path (the sky and the gamma table use polynomials and literal tables).
 - Every switch is off by default and every existing challenge family renders the same bytes as before. The proof is `validator/scripts/verify_render_identity.py` in the swarm repository (7 scenes, orbit and episode hashes) run on the wheel before and after a change.
 - A new render flag takes the next free power of two; the next free value is 262144.
 
@@ -148,7 +148,7 @@ Two related behaviours without a flag:
 
 | Variable | Default | Read by | What it does |
 |---|---|---|---|
-| `SWARM_RENDER_THREADS` | 2 | `b3GetSwarmRenderThreads` in `TinyRenderer.cpp`, once per process | OpenMP threads for the depth face loop and the ray-cast tiles, clamped to 1..16. The bytes do not depend on it: the rasteriser's depth loop writes each pixel once and the ray caster deals fixed tiles |
+| `SWARM_RENDER_THREADS` | 2 | `b3GetSwarmRenderThreads` in `TinyRenderer.cpp`, once per process | OpenMP threads for the depth face loop and the ray-cast tiles, clamped to 1..16. The bytes do not depend on it: the rasteriser's depth loop writes each pixel once and the ray caster traces fixed tiles, each whole on one thread |
 | `SWARM_BVH_CACHE_DIR` | unset | the server (`.bvh`) and the ray caster (`.rtree`) | Folder for the two disk caches; unset means no file is read or written whatever the flags say |
 | `SWARM_SHARE_MESH` | on | `model.cpp` | `0` gives every render object private copies of its mesh and texture (the behaviour before [#8](https://github.com/swarm-subnet/bullet3-swarmfork/pull/8)); on, identical data is shared with reference counts and copy on write, warehouse RSS 658 MB to 228 MB, images identical |
 

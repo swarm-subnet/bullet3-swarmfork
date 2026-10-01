@@ -112,8 +112,9 @@ public:
 	// writes -z_clip into m_depth, objectIndex + ((linkIndex + 1) << 24) into m_seg when given,
 	// and the shaded colour into m_rgb when shading is given.
 	// Every camera shares projMat, the frame size and the light. The pixels of all cameras are cut
-	// into fixed tiles before the frame starts and tile k always goes to thread k mod threads, so the
-	// bytes never depend on the thread count or on the order threads finish. With edge anti-aliasing
+	// into fixed tiles before the frame starts and each thread takes the next untraced tile; a tile's
+	// pixels depend on nothing else, so the bytes never depend on the thread count or on which thread
+	// traced which tile. With edge anti-aliasing
 	// the same tiles are walked a second time once every first ray has landed.
 	// With alphaCutout a hit on a texel whose texture alpha is below the cut-out threshold is not a hit:
 	// the ray, and a shadow ray, carry on behind it, so colour, depth and shadow share the same holes.

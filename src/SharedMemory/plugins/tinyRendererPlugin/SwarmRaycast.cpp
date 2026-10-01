@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #include <map>
 #include <string>
 #include <vector>
@@ -3340,21 +3341,18 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	}
 
 	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera
-	// whatever the thread count, and thread t traces tiles t, t + threads, t + 2 threads, ...
+	// whatever the thread count. Each thread takes the next untraced tile, so none idles while another is left
+	// with the slow ones; whichever thread traces a tile, its pixels come out the same.
 	const int tilesX = (width + kTileSize - 1) / kTileSize;
 	const int tilesY = (height + kTileSize - 1) / kTileSize;
 	const int tilesPerCamera = tilesX * tilesY;
 	const int numTiles = tilesPerCamera * numTargets;
+	std::atomic<int> nextTile[2];
+	nextTile[0] = 0;
+	nextTile[1] = 0;
 
 #pragma omp parallel num_threads(threads)
 	{
-#ifdef _OPENMP
-		const int tid = omp_get_thread_num();
-		const int cnt = omp_get_num_threads();
-#else
-		const int tid = 0;
-		const int cnt = 1;
-#endif
 		QueryContext ctx;
 		rtcInitRayQueryContext(&ctx.m_context);
 		ctx.m_instances = job.m_instances;
@@ -3387,7 +3385,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 					if (!scratch[i].m_ids.empty())
 						scratch[i].m_rgb1.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 			}
-			for (int tile = tid; tile < numTiles; tile += cnt)
+			for (int tile = nextTile[pass]++; tile < numTiles; tile = nextTile[pass]++)
 			{
 				const int camIndex = tile / tilesPerCamera;
 				if (!setups[(size_t)camIndex].m_valid)
