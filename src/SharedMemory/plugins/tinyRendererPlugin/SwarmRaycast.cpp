@@ -3720,7 +3720,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
 		const int passes = scratch.empty() ? 1 : 2;
 		ProjectionCache cache;
-		memset(cache.m_used, 0, sizeof(cache.m_used));
+		int cacheCamera = -1;
 		for (int pass = 0; pass < passes; pass++)
 		{
 			if (pass == 1)
@@ -3746,7 +3746,15 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 				if (pass == 0)
 					renderTile(job, setups[(size_t)camIndex], targets[camIndex], edge, cameraRadiance, row0, row1, col0, col1, &args, &shadowArgs);
 				else if (edge)
+				{
+					// A projection belongs to one camera, so the cache starts over when this thread moves to another.
+					if (camIndex != cacheCamera)
+					{
+						memset(cache.m_used, 0, sizeof(cache.m_used));
+						cacheCamera = camIndex;
+					}
 					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache);
+				}
 			}
 		}
 	}
