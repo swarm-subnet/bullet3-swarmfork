@@ -197,6 +197,8 @@ struct Batch
 	MeshTree* m_tree;
 	// One 3x4 column-major world transform per placement, shared with Embree.
 	std::vector<float> m_transforms;
+	// Row-major inverse transpose of each placement's 3x3 part, which carries the mesh normals into world space.
+	std::vector<float> m_normalRotations;
 	float m_bodyTransform[16];
 	bool m_enabled;
 	bool m_doubleSided;
@@ -1405,6 +1407,7 @@ struct SwarmRaycast::Data
 			batch->m_obj = obj;
 			batch->m_tree = acquireSharedTree(obj->m_model, false);
 			batch->m_transforms.assign(count * 12, 0.0f);
+			batch->m_normalRotations.assign(count * 9, 0.0f);
 			batch->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE_ARRAY);
 			rtcSetGeometryInstancedScene(batch->m_geometry, batch->m_tree->m_scene);
 			rtcSetSharedGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0, RTC_FORMAT_FLOAT3X4_COLUMN_MAJOR,
@@ -1439,6 +1442,13 @@ struct SwarmRaycast::Data
 							sum += frame[k * 4 + r] * local[c * 3 + k];
 						world[c * 3 + r] = sum;
 					}
+				// Inverse transpose keeps normals perpendicular under a non-uniform or mirrored placement.
+				const btMatrix3x3 basis(world[0], world[3], world[6], world[1], world[4], world[7], world[2], world[5], world[8]);
+				const btMatrix3x3 normal = basis.determinant() != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
+				float* rotation = &batch->m_normalRotations[p * 9];
+				for (int r = 0; r < 3; r++)
+					for (int c = 0; c < 3; c++)
+						rotation[r * 3 + c] = (float)normal[r][c];
 			}
 			if (!fresh)
 				rtcUpdateGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0);
@@ -1953,7 +1963,6 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 	const float* transform = 0;
 	const float* cornerRotation = 0;
 	float placement[16];
-	float normalRotation[9];
 	if (surface)
 		surface->m_transformedNormals = false;
 	if (forestId != RTC_INVALID_GEOMETRY_ID && hit.instID[0] == forestId)
@@ -1971,13 +1980,6 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 				placement[c * 4 + r] = t[c * 3 + r];
 			placement[c * 4 + 3] = c == 3 ? 1.0f : 0.0f;
 		}
-		// Inverse transpose keeps normals perpendicular under a non-uniform or mirrored placement.
-		btMatrix3x3 basis(t[0], t[3], t[6], t[1], t[4], t[7], t[2], t[5], t[8]);
-		const btScalar det = basis.determinant();
-		const btMatrix3x3 normal = det != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
-		for (int r = 0; r < 3; r++)
-			for (int c = 0; c < 3; c++)
-				normalRotation[r * 3 + c] = (float)normal[r][c];
 		surface->m_model = batch->m_obj->m_model;
 		surface->m_doubleSided = batch->m_doubleSided;
 		surface->m_hasAlpha = batch->m_hasAlpha;
@@ -1989,7 +1991,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		vertices = &batch->m_tree->m_vertices[0];
 		indices = &batch->m_tree->m_indices[0];
 		transform = placement;
-		cornerRotation = normalRotation;
+		cornerRotation = &batch->m_normalRotations[(size_t)hit.instPrimID[1] * 9];
 		surface->m_transformedNormals = surface->m_normals != 0;
 	}
 	else if (hit.instID[0] == staticId)
