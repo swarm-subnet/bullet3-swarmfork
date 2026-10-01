@@ -1203,16 +1203,23 @@ static bool readForestFile(const std::string& fileName, CommonFileIOInterface* f
 		}
 		if (line.compare(0, 7, "binary ") == 0)
 		{
-			const size_t rows = (size_t)strtoull(line.c_str() + 7, 0, 10);
-			std::vector<double> values(rows * 11);
+			// The rows the line names must all be in the file, so a damaged count cannot ask for more memory than that.
+			const std::streampos start = in.tellg();
+			in.seekg(0, std::ios::end);
+			const unsigned long long left = (unsigned long long)(in.tellg() - start);
+			in.seekg(start);
+			const unsigned long long rows = strtoull(line.c_str() + 7, 0, 10);
+			if (rows > left / (11 * sizeof(double)))
+				return false;
+			std::vector<double> values((size_t)rows * 11);
 			if (rows && !in.read((char*)&values[0], (std::streamsize)(values.size() * sizeof(double))))
 				return false;
-			for (size_t i = 0; i < rows; i++)
+			for (size_t i = 0; i < (size_t)rows; i++)
 			{
 				const double* row = &values[i * 11];
-				const int index = (int)row[0];
-				if (row[0] == (double)index && index >= 0 && index < (int)out.m_meshes.size())
-					addForestPlacement(out, index, row + 1);
+				// Range first, so a NaN or a huge value is never cast to int.
+				if (row[0] >= 0.0 && row[0] < (double)out.m_meshes.size() && row[0] == (double)(int)row[0])
+					addForestPlacement(out, (int)row[0], row + 1);
 			}
 			break;
 		}

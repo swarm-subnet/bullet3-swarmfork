@@ -123,6 +123,22 @@ class TestForestBatch(unittest.TestCase):
     for left, right in zip(text, binary):
       self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
 
+  def test_a_damaged_binary_file_draws_nothing_and_fails_nothing(self):
+    """A row count past the end of the file refuses it, and rows whose mesh index is NaN or out of range are skipped."""
+    self.assertTrue(p.FOREST_FILE_BINARY)
+    meshes = write_meshes(self.folder)
+    rows = np.array([[0, 0, 0, 0.5, 0, 0, 0, 1, 1, 1, 1]] * 3, dtype="<f8")
+    rows[1, 0], rows[2, 0] = np.nan, 7.0
+    for count, body in ((10 ** 15, rows), (2, rows[1:])):
+      p.resetSimulation()
+      path = os.path.join(self.folder, "damaged.fst")
+      with open(path, "wb") as out:
+        out.write(("".join("mesh %s\n" % name for name in meshes) + "binary %d\n" % count).encode() + body.tobytes())
+      shape = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=INSTANCED | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+      p.createMultiBody(0, -1, shape)
+      _, _, mask = frame(flags=RAY, shadow=0, eye=(0, -6, 6))
+      self.assertEqual(int((mask >= 0).sum()), 0)
+
   def test_body_pose_carries_the_placements(self):
     """A forest body placed off the origin moves every placement with it."""
     forest_world(self.folder, base=(1.0, -0.5, 0.25))
