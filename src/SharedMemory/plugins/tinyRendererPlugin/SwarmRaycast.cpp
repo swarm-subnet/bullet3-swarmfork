@@ -3844,7 +3844,10 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			}
 
 			const double rest = 1.0 - covered;
-			if (rest > kCoverageEpsilon)
+			bool crease = job.m_shading->m_creaseFill && hasOwn && covered > 0.0;
+			for (int n = 0; n < 4 && crease; n++)
+				crease = neighbours[n] != offset && ids[neighbours[n]] == id && hits[neighbours[n]].m_prim != RTC_INVALID_GEOMETRY_ID;
+			if (rest > kCoverageEpsilon && !crease)
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
 				Sample probe;
@@ -3871,6 +3874,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					colour[i] += rest * (linear ? kSwarmSrgbToLinear[restColour[i]] : (double)restColour[i]);
 			}
 			else if (covered < 1.0)
+				// Also a crease under ER_SWARM_CREASE_FILL: what shows through between its neighbours' triangles is
+				// taken to look like them, which spares a probe ray on nearly every pixel of a crown at full smoothing.
 				for (int i = 0; i < 3; i++)
 					colour[i] /= covered;
 

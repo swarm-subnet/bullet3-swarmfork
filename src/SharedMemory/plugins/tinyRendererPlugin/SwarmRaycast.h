@@ -42,6 +42,9 @@ struct SwarmRaycastShading
 	bool m_edgeAntialias;
 	// ER_SWARM_EDGE_OUTLINE: with m_edgeAntialias, a pixel inside one body is an edge only where the depth jumps.
 	bool m_edgeOutline;
+	// ER_SWARM_CREASE_FILL: with m_edgeAntialias, an edge pixel inside one body fills its uncovered share from its
+	// neighbours' triangles instead of a probe ray.
+	bool m_creaseFill;
 	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
 	// encoded bytes as TinyRenderer's shader does.
