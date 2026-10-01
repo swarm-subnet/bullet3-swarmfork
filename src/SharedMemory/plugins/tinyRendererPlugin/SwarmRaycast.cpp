@@ -1743,7 +1743,7 @@ void SwarmRaycast::removeAll()
 	m_data->createStaticScene();
 }
 
-void SwarmRaycast::commit()
+void SwarmRaycast::commit(bool moverShadows)
 {
 	if (!m_data->m_top)
 		return;
@@ -1772,7 +1772,7 @@ void SwarmRaycast::commit()
 		rtcCommitScene(m_data->m_top);
 		m_data->m_topDirty = false;
 	}
-	if (m_data->m_moversDirty)
+	if (m_data->m_moversDirty && moverShadows)
 	{
 		rtcCommitScene(m_data->m_movers);
 		m_data->m_moversDirty = false;

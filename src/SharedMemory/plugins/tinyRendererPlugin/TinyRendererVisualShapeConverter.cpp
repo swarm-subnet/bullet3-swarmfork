@@ -246,8 +246,9 @@ struct TinyRendererVisualShapeConverterInternalData
 
 #ifdef SWARM_RAYCAST
 	// Brings every render object that changed since the last call into the ray-cast scene, in the same order as a
-	// full sync, and rebuilds the top-level tree; an unchanged object would leave the scene as it is.
-	SwarmRaycast& syncRaycast()
+	// full sync, and rebuilds the top-level tree; an unchanged object would leave the scene as it is. The mover tree
+	// is brought up to date only for a frame that casts mover shadows.
+	SwarmRaycast& syncRaycast(bool moverShadows)
 	{
 		if (!m_raycast)
 			m_raycast = new SwarmRaycast();
@@ -261,7 +262,7 @@ struct TinyRendererVisualShapeConverterInternalData
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
 		}
-		m_raycast->commit();
+		m_raycast->commit(moverShadows);
 		return *m_raycast;
 	}
 
@@ -2090,7 +2091,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 #ifdef SWARM_RAYCAST
-		const SwarmRaycast& raycast = m_data->syncRaycast();
+		const SwarmRaycast& raycast = m_data->syncRaycast(false);
 		// All cameras go into one tile schedule, so the threads share the whole batch, not one camera each.
 		btAlignedObjectArray<SwarmRaycast::Target> targets;
 		targets.resize(numCameras);
@@ -2443,7 +2444,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
 		target.m_background = (sky && numPixels) ? &background : 0;
-		m_data->syncRaycast().render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
+		m_data->syncRaycast(shading.m_moverShadow).render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
 									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else

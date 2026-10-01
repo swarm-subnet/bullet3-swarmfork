@@ -94,8 +94,9 @@ public:
 	void meshChanged(TinyRenderObjectData* renderObj);
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
-	// Rebuilds the top-level tree after a batch of sync calls.
-	void commit();
+	// Rebuilds the top-level tree after a batch of sync calls. The mover tree, read only by mover shadows, is rebuilt
+	// when moverShadows asks for it, from whatever the movers are by then.
+	void commit(bool moverShadows);
 
 	// What a colour pixel shows where no drawn surface is shaded, asked for that pixel alone; row in output order.
 	struct Background
