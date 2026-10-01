@@ -323,15 +323,23 @@ inline float placementSign(const float* t)
 	return det < 0.0f ? -1.0f : 1.0f;
 }
 
-// While a hinted search runs on this thread: the nearest distance a hit was kept at, and whether a second hit was kept at
-// exactly that distance. Which of two such hits wins depends on the order the boxes are visited in, and a search cut
-// short can visit them in another order, so a tie sends the ray to the full search.
-struct TieWatch
+// A hinted search on this thread. Embree drops a box once its rounded entry distance passes the nearest hit so far, so
+// of two hits closer than that rounding the full search keeps whichever it met first, and a search cut short may meet
+// them in another order. The filter therefore notes the nearest kept hit and the next one, and keeps the search going a
+// window past the nearest, wide enough that every surface that rounding could put first is met; the ray goes to the
+// full search when the next hit lies inside the window or the nearest is seen too obliquely for the window to hold.
+struct HintedSearch
 {
+	float m_limit;
+	float m_window;
 	float m_nearest;
-	bool m_tied;
+	float m_next;
+	bool m_oblique;
+	RTCHit m_hit;
 };
-thread_local TieWatch* t_tieWatch = 0;
+thread_local HintedSearch* t_hintedSearch = 0;
+// Below this cosine between the ray and a face the face's own distance rounds beyond the window.
+const float kHintMinFacing = 1.0f / 16.0f;
 
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
 // filter does the same in object space, where Embree hands over both the ray and the hit. Static
@@ -424,18 +432,33 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 }
 
+// The camera rays' filter: keepHit, and under a hinted search the note of each kept hit.
 void hitFilter(const RTCFilterFunctionNArguments* args)
 {
 	keepHit(args);
 	if (args->N != 1 || !args->valid[0])
 		return;
-	TieWatch* watch = t_tieWatch;
-	if (watch)
+	HintedSearch* search = t_hintedSearch;
+	if (!search)
+		return;
+	RTCRay* ray = (RTCRay*)args->ray;
+	const RTCHit* hit = (const RTCHit*)args->hit;
+	const float t = ray->tfar;
+	if (t < search->m_nearest)
 	{
-		const float t = ((const RTCRay*)args->ray)->tfar;
-		watch->m_tied = t == watch->m_nearest;
-		watch->m_nearest = t;
+		search->m_next = search->m_nearest;
+		search->m_nearest = t;
+		search->m_hit = *hit;
+		// The ray and the normal in the frame Embree tested them in, the hit's own instance.
+		const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
+		const float normal[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
+		const float facing = fabsf(dot3(dir, normal));
+		search->m_oblique = !(facing >= kHintMinFacing * sqrtf(dot3(dir, dir) * dot3(normal, normal)));
 	}
+	else if (t < search->m_next)
+		search->m_next = t;
+	const float end = search->m_nearest + 2.0f * search->m_window;
+	ray->tfar = end < search->m_limit ? end : search->m_limit;
 }
 
 void reportError(void* userPtr, RTCError code, const char* message)
@@ -2456,10 +2479,8 @@ struct TileJob
 	bool m_filtered;
 	// Angle one pixel spans, for the cut-out footprint; 0 unless textures are filtered under daylight.
 	float m_pixelSpread;
-	// The depth hint, when the lens remembers its last frame: per pixel the farthest remembered hit landing on it, and
-	// the box rounding a hinted search allows for, over the smallest ray direction component.
+	// The depth hint, when the lens remembers its last frame: per pixel the farthest remembered hit landing on it.
 	const float* m_hintFar;
-	float m_hintRounding;
 	// Where every first ray lands this frame, kept for the next; each pixel writes only its own.
 	float* m_hitPoints;
 	// Where the movers can shade, when the movers answer the shadow rays; null otherwise.
@@ -2812,34 +2833,50 @@ inline float probeReach(const float* inverseEyeDepth, int width, int height, int
 	return farthest + farthest * kHintSlack + kHintSlackMetres;
 }
 
-// The first hit of a camera ray, searched first only up to `reach` and a guard past it, when that falls short of the ray's
-// end. A search cut short keeps every surface up to its end, so its nearest hit is the full search's, except within the
-// guard, where a box tested with rounding against the end may have hidden a nearer surface, and at a tie, which the two
-// searches may break apart. A miss, a hit past `reach` or a tie searches again over the whole ray, so a wrong hint costs
-// time and never changes the hit.
-void firstHit(const TileJob& job, RTCRayHit& rayhit, float reach, RTCIntersectArguments* args)
+// The first hit of a camera ray, searched first only up to `reach` and two windows past it when that falls short of the
+// ray's end; the window is what Embree's rounding can move a box or a hit by: about 2^-24 of each coordinate over the
+// direction component it is divided by, and of the distance, with eight times that allowed. The hinted search meets
+// every surface within its reach (none is cut by the end) and around the nearest (see HintedSearch), so its nearest hit
+// is the full search's when no second hit is within a window of it. A miss, a hit past `reach`, a second hit that close
+// or a face seen nearly edge-on searches again over the whole ray, so a wrong hint costs time and never changes the hit.
+void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArguments* args)
 {
 	const float end = rayhit.ray.tfar;
 	if (reach < end)
 	{
-		const float x = fabsf(rayhit.ray.dir_x), y = fabsf(rayhit.ray.dir_y), z = fabsf(rayhit.ray.dir_z);
-		const float smallest = x < y ? (x < z ? x : z) : (y < z ? y : z);
-		const float limit = reach + (reach * (1.0f / 1024.0f) + job.m_hintRounding / smallest);
-		if (limit < end)
+		const float org[3] = {rayhit.ray.org_x, rayhit.ray.org_y, rayhit.ray.org_z};
+		const float dir[3] = {rayhit.ray.dir_x, rayhit.ray.dir_y, rayhit.ray.dir_z};
+		float largest = 0.0f, spread = 0.0f;
+		for (int k = 0; k < 3; k++)
 		{
-			TieWatch watch = {INFINITY, false};
-			rayhit.ray.tfar = limit;
-			t_tieWatch = &watch;
-			rtcIntersect1(job.m_top, &rayhit, args);
-			t_tieWatch = 0;
-			if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID && rayhit.ray.tfar <= reach && !watch.m_tied)
+			const float size = fabsf(org[k]) + reach;
+			largest = size > largest ? size : largest;
+			const float step = size / fabsf(dir[k]);
+			spread = step > spread ? step : spread;
+		}
+		HintedSearch search;
+		search.m_window = (spread + largest / kHintMinFacing + reach) * (8.0f / 16777216.0f);
+		search.m_limit = reach + 2.0f * search.m_window;
+		if (search.m_limit < end)
+		{
+			search.m_nearest = search.m_next = INFINITY;
+			search.m_oblique = false;
+			rayhit.ray.tfar = search.m_limit;
+			t_hintedSearch = &search;
+			rtcIntersect1(scene, &rayhit, args);
+			t_hintedSearch = 0;
+			if (search.m_nearest <= reach && !search.m_oblique && search.m_next - search.m_nearest > search.m_window)
+			{
+				rayhit.ray.tfar = search.m_nearest;
+				rayhit.hit = search.m_hit;
 				return;
+			}
 			rayhit.ray.tfar = end;
 			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 		}
 	}
-	rtcIntersect1(job.m_top, &rayhit, args);
+	rtcIntersect1(scene, &rayhit, args);
 }
 
 // `reach`, when finite, is the depth hint for this ray along the camera's axis; `landed`, when given, takes where the ray
@@ -2891,7 +2928,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
 	const float facing = -dot3(cam.m_viewRow2, dir);
-	firstHit(job, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
+	firstHit(job.m_top, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 		return false;
 
@@ -3594,20 +3631,6 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		}
 		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
 	}
-
-	// A hinted search ends a guard past its hint. The boxes above the triangle trees are tested in world space by a fused
-	// multiply against the origin over the direction, which rounds by about 2^-24 of the larger of the origin and the box
-	// corner over each direction component; the guard allows sixteen times that.
-	RTCBounds bounds;
-	rtcGetSceneBounds(m_data->m_top, &bounds);
-	const float corners[6] = {bounds.lower_x, bounds.lower_y, bounds.lower_z, bounds.upper_x, bounds.upper_y, bounds.upper_z};
-	float extent = 0.0f;
-	for (int k = 0; k < 6; k++)
-		extent = fabsf(corners[k]) > extent ? fabsf(corners[k]) : extent;
-	for (int i = 0; i < numTargets; i++)
-		for (int k = 0; setups[(size_t)i].m_valid && k < 3; k++)
-			extent = fabsf(setups[(size_t)i].m_cam.m_origin[k]) > extent ? fabsf(setups[(size_t)i].m_cam.m_origin[k]) : extent;
-	job.m_hintRounding = extent * (2.0f / 1048576.0f);
 
 	// The depth hint, for a lone camera with a frame big enough: the last frame of the same lens, its hits put onto this
 	// frame's pixels, tells each ray about how far it has to search.
