@@ -2406,8 +2406,8 @@ struct EdgeScratch
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
-// ER_SWARM_EDGE_OUTLINE's slack: a neighbour must lie about a fifth farther away, so the leaves of one crown, a few
-// per cent apart in depth, are not edges, while a crown against the ground or the trees well behind it is.
+// ER_SWARM_EDGE_OUTLINE's slack: a neighbour more than a quarter farther away (a fifth, seen from the far side) is an
+// edge, so the leaves of one crown, a few per cent apart in depth, are not, while a crown against trees well behind it is.
 const float kOutlineTolerance = 0.2f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
