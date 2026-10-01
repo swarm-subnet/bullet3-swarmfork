@@ -216,8 +216,8 @@ class TestRaycastColourThreads(unittest.TestCase):
     self.assertEqual(len(digests), 1)
 
   def test_frame_after_a_nearby_one_same_bytes_for_one_two_and_four_threads(self):
-    """A frame drawn after a nearby view, its depth hint put onto the frame by every render thread, has the same bytes
-    at 1, 2 and 4 threads."""
+    """A frame drawn after a nearby view, its depth hint put onto the frame by every render thread, draws without fault
+    and has the same bytes at 1, 2 and 4 threads; the hint never changes bytes, so this cannot see a wrong merge."""
     digests = set()
     for threads in ("1", "2", "4"):
       env = dict(os.environ, SWARM_RENDER_THREADS=threads)
