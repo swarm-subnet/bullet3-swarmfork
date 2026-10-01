@@ -604,26 +604,23 @@ void Model::load_texture(std::string filename, const char *suffix, TGAImage &img
 	}
 }
 
+// Wraps a texture coordinate into [0, 1). A float's fraction is exact in float, so this is modf's value without the
+// double round trip; an infinity has no fraction, as modf says.
+static float wrapUnit(float value)
+{
+	float f = value - std::trunc(value);
+	if (f != f)
+		f = value != value ? value : 0.f;
+	return f < 0.f ? f + 1.f : f;
+}
+
 TGAColor Model::diffuse(Vec2f uvf)
 {
 	if (m_diffuse && m_diffuse->img_.get_width() && m_diffuse->img_.get_height())
 	{
 		TGAImage& diffusemap_ = m_diffuse->img_;
-		double val;
-		//		bool repeat = true;
-		//		if (repeat)
-		{
-			uvf[0] = std::modf(uvf[0], &val);
-			if (uvf[0] < 0)
-			{
-				uvf[0] = uvf[0] + 1;
-			}
-			uvf[1] = std::modf(uvf[1], &val);
-			if (uvf[1] < 0)
-			{
-				uvf[1] = uvf[1] + 1;
-			}
-		}
+		uvf[0] = wrapUnit(uvf[0]);
+		uvf[1] = wrapUnit(uvf[1]);
         	Vec2i uv(uvf[0] * diffusemap_.get_width(), uvf[1] * diffusemap_.get_height());
 		return diffusemap_.get(uv[0], uv[1]);
 	}
@@ -641,13 +638,8 @@ unsigned char Model::alpha(Vec2f uvf) const
 	if (!hasAlpha())
 		return 255;
 	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
-	double val;
-	uvf[0] = std::modf(uvf[0], &val);
-	if (uvf[0] < 0)
-		uvf[0] = uvf[0] + 1;
-	uvf[1] = std::modf(uvf[1], &val);
-	if (uvf[1] < 0)
-		uvf[1] = uvf[1] + 1;
+	uvf[0] = wrapUnit(uvf[0]);
+	uvf[1] = wrapUnit(uvf[1]);
 	int x = (int)(uvf[0] * w), y = (int)(uvf[1] * h);
 	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
 	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
@@ -808,16 +800,6 @@ static TGAColor sampleLevels(const MipPick& pick, float u, float v)
 	for (int i = 0; i < (int)a.bytespp; i++)
 		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
 	return a;
-}
-
-// Wraps a texture coordinate into [0, 1). A float's fraction is exact in float, so this is modf's value without the
-// double round trip; an infinity has no fraction, as modf says.
-static float wrapUnit(float value)
-{
-	float f = value - std::trunc(value);
-	if (f != f)
-		f = value != value ? value : 0.f;
-	return f < 0.f ? f + 1.f : f;
 }
 
 // Trilinear sample at the pixel footprint; with more taps the footprint is walked along its long side and the reads averaged.
