@@ -6175,7 +6175,7 @@ bool PhysicsServerCommandProcessor::processCreateVisualShapeCommand(const struct
 		visualShape.m_linkLocalFrame.setIdentity();
 		visualShape.m_geometry.m_hasLocalMaterial = false;
 		// createVisualShape flags arrive in m_collisionFlags; only the multibody double-sided bit is a visual flag
-		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL | eVISUAL_SHAPE_RENDER_TREE_CACHE | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_RENDER_INSTANCED);
+		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL | eVISUAL_SHAPE_RENDER_TREE_CACHE | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED | eVISUAL_SHAPE_RENDER_INSTANCED);
 
 		bool hasRGBA = (clientCmd.m_createUserShapeArgs.m_shapes[userShapeIndex].m_visualFlags & GEOM_VISUAL_HAS_RGBA_COLOR) != 0;
 		;
@@ -14826,7 +14826,7 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 						if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
 						{
 							// multibodies honour only their own bit, so the soft-body flag keeps ignoring them
-							int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS);
+							int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED);
 							if (m_data->m_pluginManager.getRenderInterface())
 							{
 								m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,
@@ -14875,7 +14875,7 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 							}
 							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
 							{
-								int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS);
+								int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED);
 								if (m_data->m_pluginManager.getRenderInterface())
 								{
 									m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,

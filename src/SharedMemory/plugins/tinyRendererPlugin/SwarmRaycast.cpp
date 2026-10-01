@@ -51,6 +51,8 @@ const float kGlassMirrorFromCos = 0.20f;
 const float kPaneF0 = 0.04f;
 const float kPaneBias = 2e-3f;
 const int kPaneDepth = 3;
+// VISUAL_SHAPE_GLASS_BACKED: the white backsheet behind a module's cells, as an sRGB byte, as the solar park's racking paints it.
+const float kPaneBacking = 254.0f;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
 // A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
@@ -1888,6 +1890,7 @@ struct HitSurface
 	bool m_doubleSided;
 	bool m_hasAlpha;
 	bool m_glass;
+	bool m_glassBacked;
 	const TinyRenderThermal* m_thermal;
 };
 
@@ -2074,6 +2077,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = batch->m_doubleSided;
 		surface->m_hasAlpha = batch->m_hasAlpha;
 		surface->m_glass = batch->m_glass;
+		surface->m_glassBacked = batch->m_obj->m_glassBacked;
 		surface->m_thermal = &batch->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
@@ -2096,6 +2100,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = member->m_doubleSided;
 		surface->m_hasAlpha = member->m_hasAlpha;
 		surface->m_glass = member->m_glass;
+		surface->m_glassBacked = member->m_obj->m_glassBacked;
 		surface->m_thermal = &member->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
@@ -2115,6 +2120,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = inst->m_doubleSided;
 		surface->m_hasAlpha = inst->m_hasAlpha;
 		surface->m_glass = inst->m_glass;
+		surface->m_glassBacked = inst->m_obj->m_glassBacked;
 		surface->m_thermal = &inst->m_obj->m_thermal;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
@@ -2471,6 +2477,9 @@ struct EdgeScratch
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
+// ER_SWARM_EDGE_OUTLINE's slack: a neighbour more than a quarter farther away (a fifth, seen from the far side) is an
+// edge, so the leaves of one crown, a few per cent apart in depth, are not, while a crown against trees well behind it is.
+const float kOutlineTolerance = 0.2f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
 
@@ -2893,6 +2902,29 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		HitSurface pane = surface;
 		float paneFace[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
+		if (surface.m_glassBacked)
+		{
+			// A module: its cells over a white backsheet in the pane's own colour, lit as the pane is and shaded by its
+			// shadow, which is what the ray behind it would meet, so no ray goes behind it.
+			float normal[3], base[3], sky[3], skyLight[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			const float through = paneLight(*shading, normal, dir, sky);
+			if (shading->m_sky)
+				shading->m_sky->irradiance(normal, skyLight);
+			else
+				for (int i = 0; i < 3; i++)
+					skyLight[i] = shading->m_ambientColor[i];
+			const float nDotL = dot3(normal, shading->m_lightDir);
+			const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+			const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
+			for (int i = 0; i < 3; i++)
+			{
+				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
+			}
+			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			return true;
+		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
 		{
 			float normal[3], base[3], sky[3];
@@ -3031,8 +3063,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
-// off the straight line through its two neighbours on either axis.
-bool isEdge(const int* ids, const float* w, int width, int height, int row, int col)
+// off the straight line through its two neighbours on either axis by more than `tolerance` of its own.
+bool isEdge(const int* ids, const float* w, int width, int height, int row, int col, float tolerance)
 {
 	const size_t offset = (size_t)row * width + col;
 	const int id = ids[offset];
@@ -3040,7 +3072,7 @@ bool isEdge(const int* ids, const float* w, int width, int height, int row, int 
 	if ((hasLeft && ids[offset - 1] != id) || (hasRight && ids[offset + 1] != id) ||
 		(hasUp && ids[offset - width] != id) || (hasDown && ids[offset + width] != id))
 		return true;
-	const float limit = kEdgeTolerance * fabsf(w[offset]);
+	const float limit = tolerance * fabsf(w[offset]);
 	if (hasLeft && hasRight && fabsf((w[offset - 1] + w[offset + 1]) - 2.0f * w[offset]) > limit)
 		return true;
 	if (hasUp && hasDown && fabsf((w[offset - width] + w[offset + width]) - 2.0f * w[offset]) > limit)
@@ -3218,12 +3250,13 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const double halfX = 1.0 / (double)width;
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
+	const float tolerance = job.m_shading->m_edgeOutline ? kOutlineTolerance : kEdgeTolerance;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
 		for (int col = col0; col < col1; col++)
 		{
-			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col))
+			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, tolerance))
 				continue;
 			const size_t offset = (size_t)row * width + col;
 			const double ndcX = pixelNdcX(col, width);

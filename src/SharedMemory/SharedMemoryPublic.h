@@ -916,6 +916,9 @@ enum EnumRendererAuxFlags
 	// Ray-cast colour path under linear light: the IR-cut filter out, surfaces reflect by their near-infrared albedo
 	// and the frame is written in grey.
 	ER_SWARM_NEAR_INFRARED = 131072,
+	// With ER_EDGE_ANTIALIAS: only outlines are smoothed, where a neighbour landed on another body or on a surface more
+	// than a quarter farther away (a fifth for the far side's pixel), not every crease inside one body, such as a crown's.
+	ER_SWARM_EDGE_OUTLINE = 262144,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.
@@ -1170,6 +1173,7 @@ enum eEnumUpdateVisualShapeFlags
 	eVISUAL_SHAPE_RENDER_TREE_CACHE = 32,//ray-cast tree of a static body saved under SWARM_BVH_CACHE_DIR and loaded when present
 	eVISUAL_SHAPE_GLASS = 64,//thin glass under ER_SWARM_DAYLIGHT: the sky by Fresnel plus the view through, tinted by the colour
 	eVISUAL_SHAPE_RENDER_INSTANCED = 128,//share one local ray-cast mesh tree across poses and scales
+	eVISUAL_SHAPE_GLASS_BACKED = 256,//with VISUAL_SHAPE_GLASS: a solar module, its cells over a white backsheet, no ray behind it
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

@@ -1,6 +1,9 @@
 """Thin glass (VISUAL_SHAPE_GLASS) on the ray-cast daylight path: the sky by the Fresnel of the pane's two
 faces, the surface behind through the tint for the rest, one more ray on glass pixels only. Off by default."""
+import hashlib
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import numpy as np
@@ -18,6 +21,7 @@ PICTURE = (RAYCAST | SKY | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER
            | getattr(p, "ER_TEXTURE_FILTER", 0) | getattr(p, "ER_SPECULAR_GLINT", 0) | getattr(p, "ER_ALPHA_CUTOUT", 0)
            | getattr(p, "ER_SWARM_LINEAR_LIGHT", 0))
 DAY = PICTURE | DAYLIGHT
+BACKED = getattr(p, "VISUAL_SHAPE_GLASS_BACKED", 0)
 
 
 def write_pane(path, half):
@@ -43,10 +47,10 @@ class TestGlass(unittest.TestCase):
     """Drops the client."""
     p.disconnect()
 
-  def render(self, eye=(0, -4, 1), target=(0, 0, 1), flags=DAY, size=SIZE, **kwargs):
-    """Returns (rgb, depth, seg) of one frame looking from eye at target."""
+  def render(self, eye=(0, -4, 1), target=(0, 0, 1), flags=DAY, size=SIZE, sun=SUN, **kwargs):
+    """Returns (rgb, depth, seg) of one frame looking from eye at target, lit from `sun`."""
     view = p.computeViewMatrix(list(eye), list(target), [0, 0, 1])
-    _, _, rgb, depth, seg = p.getCameraImage(size, size, view, self.proj, shadow=1, lightDirection=SUN, lightColor=SUN_COLOR,
+    _, _, rgb, depth, seg = p.getCameraImage(size, size, view, self.proj, shadow=1, lightDirection=sun, lightColor=SUN_COLOR,
                                              lightAmbientCoeff=1.0, lightDiffuseCoeff=3.0, renderer=p.ER_TINY_RENDERER,
                                              flags=flags, shadowLightCoeff=0.0, exposure=1.0, **kwargs)
     rgb = None if rgb is None else np.asarray(rgb).reshape(size, size, 4)[:, :, :3].astype(int)
@@ -176,5 +180,87 @@ class TestGlass(unittest.TestCase):
     self.assertEqual(frames[0], frames[2])
 
 
+@unittest.skipUnless(RAYCAST and DAYLIGHT and SKY and GLASS and BACKED, "wheel without backed glass")
+class TestBackedGlass(unittest.TestCase):
+  """VISUAL_SHAPE_GLASS_BACKED: a pane carrying the bit is a module over a white backsheet in its own colour; glass
+  without it keeps looking through."""
+
+  setUp, tearDown, render, pane, wall, centre = (TestGlass.setUp, TestGlass.tearDown, TestGlass.render, TestGlass.pane,
+                                                 TestGlass.wall, TestGlass.centre)
+
+  def pane_at(self, x, flags):
+    """A still pane of half side 0.6 standing at (x, 0, 0), white, with the given visual flags."""
+    path = os.path.join(self.folder, "pane_at.obj")
+    write_pane(path, 0.6)
+    vis = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=flags, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0])
+    return p.createMultiBody(0, -1, vis, basePosition=[x, 0, 0])
+
+  def test_a_backed_pane_hides_the_wall_while_plain_glass_beside_it_looks_through(self):
+    """Two still panes before a red wall: the backed one is neutral, the plain one beside it red; depth and mask are
+    the same as with the bit cleared."""
+    self.wall()
+    backed = self.pane_at(-0.7, GLASS | TWO_SIDED | BACKED)
+    self.pane_at(0.7, GLASS | TWO_SIDED)
+    rgb, depth, seg = self.render()
+    left = rgb[52:64, 27:39].reshape(-1, 3).mean(axis=0)
+    right = rgb[52:64, 57:69].reshape(-1, 3).mean(axis=0)
+    self.assertLess(abs(left[0] - left[1]), 12)
+    self.assertGreater(right[0], right[1] + 40)
+    p.changeVisualShape(backed, -1, flags=GLASS | TWO_SIDED)
+    rgb_plain, depth_plain, seg_plain = self.render()
+    cleared = rgb_plain[52:64, 27:39].reshape(-1, 3).mean(axis=0)
+    self.assertGreater(cleared[0], cleared[1] + 40)
+    self.assertEqual(depth.tobytes(), depth_plain.tobytes())
+    self.assertEqual(seg.tobytes(), seg_plain.tobytes())
+
+  def test_a_white_sheet_behind_looks_the_same(self):
+    """Over a white sheet in its own colour just behind it, as a module's parts share one, a backed pane looks as the
+    pane that looks through does when the sun is behind both; with the sun in front the backsheet takes it."""
+    behind = [0.0, 0.5, 0.866]
+    self.wall(rgba=(0.5, 0.6, 0.9, 1), position=(0, 0.22, 1))
+    uid = self.pane(rgba=(0.5, 0.6, 0.9, 1))
+    through = self.centre(self.render(sun=behind)[0])
+    p.changeVisualShape(uid, -1, flags=GLASS | TWO_SIDED | BACKED)
+    backed = self.centre(self.render(sun=behind)[0])
+    self.assertLess(np.abs(through - backed).max(), 2)
+    lit = self.centre(self.render()[0])
+    self.assertGreater(lit.mean(), backed.mean() + 15)
+
+  def test_nothing_changes_without_glass_or_daylight(self):
+    """The bit on an opaque pane, or on glass drawn without the daylight model, leaves every byte as it was."""
+    self.wall()
+    uid = self.pane(flags=TWO_SIDED)
+    plain = self.render()[0]
+    p.changeVisualShape(uid, -1, flags=TWO_SIDED | BACKED)
+    self.assertEqual(plain.tobytes(), self.render()[0].tobytes())
+    p.changeVisualShape(uid, -1, flags=TWO_SIDED | GLASS)
+    glass = self.render(flags=PICTURE)[0]
+    p.changeVisualShape(uid, -1, flags=TWO_SIDED | GLASS | BACKED)
+    self.assertEqual(glass.tobytes(), self.render(flags=PICTURE)[0].tobytes())
+
+  def test_threads_give_the_same_bytes(self):
+    """A backed pane beside a plain one is byte-identical at 1, 2 and 4 render threads, each in its own process."""
+    digests = set()
+    for threads in ("1", "2", "4"):
+      env = dict(os.environ, SWARM_RENDER_THREADS=threads)
+      digests.add(subprocess.check_output([sys.executable, os.path.abspath(__file__), "--backed-hash"], env=env, text=True).strip())
+    self.assertEqual(len(digests), 1)
+
+
+def backed_hash():
+  """Prints the sha256 of one anti-aliased daylight frame of a backed and a plain pane before a wall."""
+  test = TestBackedGlass("test_threads_give_the_same_bytes")
+  test.setUp()
+  test.wall()
+  test.pane_at(-0.7, GLASS | TWO_SIDED | BACKED)
+  test.pane_at(0.7, GLASS | TWO_SIDED)
+  rgb, _, _ = test.render(flags=DAY | getattr(p, "ER_EDGE_ANTIALIAS", 0), hazeDistance=30.0)
+  print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
+  test.tearDown()
+
+
 if __name__ == '__main__':
-  unittest.main()
+  if "--backed-hash" in sys.argv:
+    backed_hash()
+  else:
+    unittest.main()

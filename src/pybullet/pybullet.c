@@ -13740,6 +13740,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_THERMAL", ER_SWARM_THERMAL);
 	PyModule_AddIntConstant(m, "ER_SWARM_LOW_LIGHT", ER_SWARM_LOW_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_NEAR_INFRARED", ER_SWARM_NEAR_INFRARED);
+	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);
@@ -13786,6 +13787,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_TREE_CACHE", eVISUAL_SHAPE_RENDER_TREE_CACHE);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_INSTANCED", eVISUAL_SHAPE_RENDER_INSTANCED);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS", eVISUAL_SHAPE_GLASS);
+	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS_BACKED", eVISUAL_SHAPE_GLASS_BACKED);
 	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
 	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
 
