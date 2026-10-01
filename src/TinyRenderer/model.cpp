@@ -859,6 +859,15 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	return out;
 }
 
+TGAColor Model::diffuseMean(Vec2f uvf)
+{
+	if (!m_diffuse || !m_diffuse->img_.get_width() || !m_diffuse->img_.get_height())
+		return TGAColor(255, 255, 255, 255);
+	if (!m_diffuse->mipsBuilt_)
+		buildMips(*m_diffuse);
+	return sampleBilinear(m_diffuse->mips_.empty() ? m_diffuse->img_ : *m_diffuse->mips_.back(), wrapUnit(uvf[0]), wrapUnit(uvf[1]));
+}
+
 unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged) const
 {
 	if (averaged)
