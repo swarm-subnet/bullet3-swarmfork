@@ -64,6 +64,11 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void setAirTemperature(float celsius);
 	virtual void setSkyTemperature(float celsius);
 	virtual void setThermalSeed(int seed);
+	virtual void setSensorPhotons(float photons);
+	virtual void setSensorReadNoise(float electrons);
+	virtual void setSensorGainCap(float gainCap);
+	virtual void setSensorSeed(int seed);
+	virtual void setSpotLight(bool enabled, const float spot[9]);
 	virtual void setShadow(bool hasShadow);
 	virtual void setFlags(int flags);
 

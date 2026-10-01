@@ -110,6 +110,21 @@ struct UrdfRenderingInterface
 	///ER_SWARM_THERMAL: seed of the frame's sensor grain
 	virtual void setThermalSeed(int seed) {}
 
+	///ER_SWARM_LOW_LIGHT: photo-electrons a pixel collects in one exposure for linear light 1.0
+	virtual void setSensorPhotons(float photons) {}
+
+	///ER_SWARM_LOW_LIGHT: read noise of one pixel, in electrons
+	virtual void setSensorReadNoise(float electrons) {}
+
+	///ER_SWARM_LOW_LIGHT: the largest gain the auto exposure may put on linear light
+	virtual void setSensorGainCap(float gainCap) {}
+
+	///ER_SWARM_LOW_LIGHT: seed of the frame's grain
+	virtual void setSensorSeed(int seed) {}
+
+	///a spot light for this render only: position, unit direction, full cone angle in degrees, range and intensity at 1 m
+	virtual void setSpotLight(bool enabled, const float spot[9]) {}
+
 	///ER_SWARM_DAYLIGHT: scale on the linear light before the film curve; 1 is the sky as built
 	virtual void setExposure(float exposure) {}
 

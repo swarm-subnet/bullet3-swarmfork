@@ -280,6 +280,12 @@ extern "C"
 	B3_SHARED_API void b3RequestCameraImageSetAirTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius);
 	B3_SHARED_API void b3RequestCameraImageSetSkyTemperature(b3SharedMemoryCommandHandle commandHandle, float celsius);
 	B3_SHARED_API void b3RequestCameraImageSetThermalSeed(b3SharedMemoryCommandHandle commandHandle, int seed);
+	B3_SHARED_API void b3RequestCameraImageSetSensorPhotons(b3SharedMemoryCommandHandle commandHandle, float photons);
+	B3_SHARED_API void b3RequestCameraImageSetSensorReadNoise(b3SharedMemoryCommandHandle commandHandle, float electrons);
+	B3_SHARED_API void b3RequestCameraImageSetSensorGainCap(b3SharedMemoryCommandHandle commandHandle, float gainCap);
+	B3_SHARED_API void b3RequestCameraImageSetSensorSeed(b3SharedMemoryCommandHandle commandHandle, int seed);
+	B3_SHARED_API void b3RequestCameraImageSetSpotLight(b3SharedMemoryCommandHandle commandHandle, const float position[3], const float direction[3],
+														 float angleDegrees, float range, float intensity);
 	B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow);
 	B3_SHARED_API void b3RequestCameraImageSelectRenderer(b3SharedMemoryCommandHandle commandHandle, int renderer);
 	B3_SHARED_API void b3RequestCameraImageSetFlags(b3SharedMemoryCommandHandle commandHandle, int flags);

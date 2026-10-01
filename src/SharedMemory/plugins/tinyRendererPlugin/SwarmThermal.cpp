@@ -4,9 +4,15 @@
 #include <vector>
 
 #include "SwarmDaylight.h"
+#include "SwarmGrain.h"
 
 namespace
 {
+using SwarmGrain::blur;
+using SwarmGrain::gaussian;
+using SwarmGrain::gaussianKernel;
+using SwarmGrain::mix32;
+
 // The radiance table: every quarter degree from -120 C to 240 C, read with a linear blend.
 const float kTableMinC = -120.0f;
 const float kTableStepC = 0.25f;
@@ -64,79 +70,6 @@ struct RadianceTable
 };
 
 const RadianceTable kRadiance;
-
-// A 32-bit integer mix with full avalanche, so neighbouring pixels draw unrelated grain.
-inline unsigned int mix32(unsigned int x)
-{
-	x ^= x >> 16;
-	x *= 0x7feb352du;
-	x ^= x >> 15;
-	x *= 0x846ca68bu;
-	x ^= x >> 16;
-	return x;
-}
-
-// A unit Gaussian drawn from (seed, index): four uniforms summed, centred and scaled to unit variance.
-inline float gaussian(unsigned int seed, unsigned int index)
-{
-	unsigned int h = mix32(seed ^ mix32(index + 0x9e3779b9u));
-	float sum = 0.0f;
-	for (int k = 0; k < 4; k++)
-	{
-		sum += (float)(h >> 8) * (1.0f / 16777216.0f);
-		h = mix32(h + 0x632be5abu);
-	}
-	return (sum - 2.0f) * 1.7320508f;
-}
-
-// Normalised Gaussian taps for `sigma`, out to three sigma.
-std::vector<float> gaussianKernel(float sigma)
-{
-	const int radius = (int)(3.0f * sigma + 0.999f);
-	std::vector<float> taps((size_t)(2 * radius + 1));
-	double total = 0.0;
-	for (int i = -radius; i <= radius; i++)
-	{
-		taps[(size_t)(i + radius)] = (float)swarmExp(-0.5 * (double)(i * i) / ((double)sigma * sigma));
-		total += taps[(size_t)(i + radius)];
-	}
-	for (size_t i = 0; i < taps.size(); i++)
-		taps[i] = (float)(taps[i] / total);
-	return taps;
-}
-
-// Separable blur with the edge pixel repeated, rows then columns; each output pixel sums its taps in one fixed order.
-void blur(const float* in, float* out, int width, int height, const std::vector<float>& taps, int threads)
-{
-	const int radius = (int)taps.size() / 2;
-	std::vector<float> rows((size_t)width * height);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
-		for (int x = 0; x < width; x++)
-		{
-			float acc = 0.0f;
-			for (int k = -radius; k <= radius; k++)
-			{
-				int sx = x + k;
-				sx = sx < 0 ? 0 : (sx >= width ? width - 1 : sx);
-				acc += taps[(size_t)(k + radius)] * in[(size_t)y * width + sx];
-			}
-			rows[(size_t)y * width + x] = acc;
-		}
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
-		for (int x = 0; x < width; x++)
-		{
-			float acc = 0.0f;
-			for (int k = -radius; k <= radius; k++)
-			{
-				int sy = y + k;
-				sy = sy < 0 ? 0 : (sy >= height ? height - 1 : sy);
-				acc += taps[(size_t)(k + radius)] * rows[(size_t)sy * width + x];
-			}
-			out[(size_t)y * width + x] = acc;
-		}
-}
 
 // The lens: the Gaussian spot, and a share of glow blurred at quarter resolution and read back bilinearly.
 void lens(const float* in, float* out, int width, int height, int threads)

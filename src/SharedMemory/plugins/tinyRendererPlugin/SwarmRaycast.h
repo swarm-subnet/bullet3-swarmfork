@@ -58,6 +58,25 @@ struct SwarmRaycastShading
 	float m_airTemperature;
 	float m_skyTemperature;
 	unsigned int m_thermalSeed;
+	// A spot light at m_spotPosition along the unit m_spotDirection, under linear light off the daylight path: half its
+	// intensity at the edge of its cone, none past m_spotCosOuter, falling with the square of the distance and ending
+	// smoothly at m_spotRange. It casts no shadow, since a lamp beside the lens lights what the lens sees.
+	bool m_spot;
+	float m_spotPosition[3];
+	float m_spotDirection[3];
+	float m_spotCosInner;
+	float m_spotCosOuter;
+	float m_spotRange;
+	float m_spotIntensity;
+	// ER_SWARM_NEAR_INFRARED: surfaces reflect by their near-infrared albedo, the lights are grey, the frame is grey.
+	bool m_nearInfrared;
+	// ER_SWARM_LOW_LIGHT: the camera chain on the finished frame (SwarmLowLight), with the white balance of the light.
+	bool m_lowLight;
+	float m_sensorPhotons;
+	float m_sensorReadNoise;
+	float m_sensorGainCap;
+	unsigned int m_sensorSeed;
+	float m_whiteBalance[3];
 };
 
 // Ray-cast backend beside TinyRenderer. Every render object is an instance of a shared mesh

@@ -541,7 +541,8 @@ if _platform == "linux" or _platform == "linux2":
     subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
     CXX_FLAGS += '-DSWARM_RAYCAST '
     sources = sources + ['src/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp',
-                         'src/SharedMemory/plugins/tinyRendererPlugin/SwarmThermal.cpp']
+                         'src/SharedMemory/plugins/tinyRendererPlugin/SwarmThermal.cpp',
+                         'src/SharedMemory/plugins/tinyRendererPlugin/SwarmLowLight.cpp']
     include_dirs += [os.path.join(_EMBREE_PREFIX, 'include')]
     LINK_FLAGS += ' ' + ' '.join(os.path.join(_EMBREE_PREFIX, 'lib', 'lib%s.a' % name)
                                  for name in ('embree4', 'embree_avx2', 'sys', 'math', 'simd', 'lexers', 'tasking'))

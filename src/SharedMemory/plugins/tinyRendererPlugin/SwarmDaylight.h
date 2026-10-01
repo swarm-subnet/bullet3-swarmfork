@@ -65,6 +65,19 @@ inline double swarmAsin(double z)
 	return swarmAtan2(z, sqrt(1.0 - z * z));
 }
 
+// cos(x) for x in [-pi, pi], the Taylor series to the x^20 term, below 1e-12 over the range.
+inline double swarmCos(double x)
+{
+	const double x2 = x * x;
+	double term = 1.0, sum = 1.0;
+	for (int k = 1; k <= 10; k++)
+	{
+		term *= -x2 / (double)((2 * k - 1) * (2 * k));
+		sum += term;
+	}
+	return sum;
+}
+
 // The AgX film curve as its public polynomial approximation: inset matrix, log2 over 16.5 stops, sigmoid, outset matrix, display 0..1 out.
 struct SwarmAgx
 {

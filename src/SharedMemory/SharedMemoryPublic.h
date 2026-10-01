@@ -910,6 +910,12 @@ enum EnumRendererAuxFlags
 	// Ray-cast path: an 8-bit White Hot frame from surface temperatures, through a long-wave camera's lens, grain and
 	// per-frame contrast, written as R = G = B; the colour terms are not read.
 	ER_SWARM_THERMAL = 32768,
+	// Ray-cast colour path: the finished frame goes through a camera in low light: white balance to the frame's light,
+	// auto exposure up to a gain cap, photon and read noise from the light each pixel collected, colour fading with it.
+	ER_SWARM_LOW_LIGHT = 65536,
+	// Ray-cast colour path under linear light: the IR-cut filter out, surfaces reflect by their near-infrared albedo
+	// and the frame is written in grey.
+	ER_SWARM_NEAR_INFRARED = 131072,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.
