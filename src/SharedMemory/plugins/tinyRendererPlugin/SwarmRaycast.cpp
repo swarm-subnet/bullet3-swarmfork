@@ -46,6 +46,8 @@ const float kGlassMirrorFromCos = 0.20f;
 const float kPaneF0 = 0.04f;
 const float kPaneBias = 2e-3f;
 const int kPaneDepth = 3;
+// ER_SWARM_BACKED_GLASS: the white backsheet behind a module's cells, as an sRGB byte, as the solar park's racking paints it.
+const float kPaneBacking = 254.0f;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
 // A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
@@ -2800,6 +2802,29 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		HitSurface pane = surface;
 		float paneFace[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
+		if (shading->m_backedGlass && rayhit.hit.instID[0] == job.m_staticId)
+		{
+			// A still pane is a module: its cells over a white backsheet in the pane's own colour, lit as the pane is and
+			// shaded by its shadow, which is what the ray behind it would meet, so no ray goes behind it.
+			float normal[3], base[3], sky[3], skyLight[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			const float through = paneLight(*shading, normal, dir, sky);
+			if (shading->m_sky)
+				shading->m_sky->irradiance(normal, skyLight);
+			else
+				for (int i = 0; i < 3; i++)
+					skyLight[i] = shading->m_ambientColor[i];
+			const float nDotL = dot3(normal, shading->m_lightDir);
+			const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+			const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
+			for (int i = 0; i < 3; i++)
+			{
+				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
+			}
+			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			return true;
+		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
 		{
 			float normal[3], base[3], sky[3];

@@ -919,6 +919,9 @@ enum EnumRendererAuxFlags
 	// With ER_EDGE_ANTIALIAS: only outlines are smoothed, where a neighbour landed on another body or on a surface at
 	// least a fifth farther away, not every crease inside one body, such as between the leaves of a crown.
 	ER_SWARM_EDGE_OUTLINE = 262144,
+	// Ray-cast daylight: a glass pane among the static bodies is a module, its cells over a white backsheet in the
+	// pane's colour, with no ray behind it; a pane that moves, such as a cab window, still shows what lies behind it.
+	ER_SWARM_BACKED_GLASS = 524288,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.

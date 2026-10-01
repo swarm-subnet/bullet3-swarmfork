@@ -1,6 +1,9 @@
 """Thin glass (VISUAL_SHAPE_GLASS) on the ray-cast daylight path: the sky by the Fresnel of the pane's two
 faces, the surface behind through the tint for the rest, one more ray on glass pixels only. Off by default."""
+import hashlib
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import numpy as np
@@ -18,6 +21,7 @@ PICTURE = (RAYCAST | SKY | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER
            | getattr(p, "ER_TEXTURE_FILTER", 0) | getattr(p, "ER_SPECULAR_GLINT", 0) | getattr(p, "ER_ALPHA_CUTOUT", 0)
            | getattr(p, "ER_SWARM_LINEAR_LIGHT", 0))
 DAY = PICTURE | DAYLIGHT
+BACKED = getattr(p, "ER_SWARM_BACKED_GLASS", 0)
 
 
 def write_pane(path, half):
@@ -43,10 +47,10 @@ class TestGlass(unittest.TestCase):
     """Drops the client."""
     p.disconnect()
 
-  def render(self, eye=(0, -4, 1), target=(0, 0, 1), flags=DAY, size=SIZE, **kwargs):
-    """Returns (rgb, depth, seg) of one frame looking from eye at target."""
+  def render(self, eye=(0, -4, 1), target=(0, 0, 1), flags=DAY, size=SIZE, sun=SUN, **kwargs):
+    """Returns (rgb, depth, seg) of one frame looking from eye at target, lit from `sun`."""
     view = p.computeViewMatrix(list(eye), list(target), [0, 0, 1])
-    _, _, rgb, depth, seg = p.getCameraImage(size, size, view, self.proj, shadow=1, lightDirection=SUN, lightColor=SUN_COLOR,
+    _, _, rgb, depth, seg = p.getCameraImage(size, size, view, self.proj, shadow=1, lightDirection=sun, lightColor=SUN_COLOR,
                                              lightAmbientCoeff=1.0, lightDiffuseCoeff=3.0, renderer=p.ER_TINY_RENDERER,
                                              flags=flags, shadowLightCoeff=0.0, exposure=1.0, **kwargs)
     rgb = None if rgb is None else np.asarray(rgb).reshape(size, size, 4)[:, :, :3].astype(int)
@@ -176,5 +180,77 @@ class TestGlass(unittest.TestCase):
     self.assertEqual(frames[0], frames[2])
 
 
+@unittest.skipUnless(RAYCAST and DAYLIGHT and SKY and GLASS and BACKED, "wheel without backed glass")
+class TestBackedGlass(unittest.TestCase):
+  """ER_SWARM_BACKED_GLASS: a still pane is lit over a white backsheet in its own colour instead of looking through."""
+
+  setUp, tearDown, render, pane, wall, centre = (TestGlass.setUp, TestGlass.tearDown, TestGlass.render, TestGlass.pane,
+                                                 TestGlass.wall, TestGlass.centre)
+
+  def test_a_still_pane_no_longer_shows_the_wall(self):
+    """The red wall behind a still pane is gone with the flag; depth and mask keep their bytes."""
+    self.wall()
+    self.pane()
+    through, depth, seg = self.render()
+    backed, depth_b, seg_b = self.render(flags=DAY | BACKED)
+    self.assertGreater(self.centre(through)[0], self.centre(through)[1] + 40)
+    self.assertLess(abs(self.centre(backed)[0] - self.centre(backed)[1]), 12)
+    self.assertEqual(depth.tobytes(), depth_b.tobytes())
+    self.assertEqual(seg.tobytes(), seg_b.tobytes())
+
+  def test_a_white_sheet_behind_looks_the_same(self):
+    """Over a white sheet in its own colour just behind it, as a module's parts share one, a backed pane looks as the
+    pane that looks through does when the sun is behind both; with the sun in front the backsheet takes it."""
+    self.wall(rgba=(0.5, 0.6, 0.9, 1), position=(0, 0.22, 1))
+    self.pane(rgba=(0.5, 0.6, 0.9, 1))
+    behind = [0.0, 0.5, 0.866]
+    through = self.centre(self.render(sun=behind)[0])
+    backed = self.centre(self.render(flags=DAY | BACKED, sun=behind)[0])
+    self.assertLess(np.abs(through - backed).max(), 2)
+    lit = self.centre(self.render(flags=DAY | BACKED)[0])
+    self.assertGreater(lit.mean(), backed.mean() + 15)
+
+  def test_nothing_changes_off_glass_or_off_daylight(self):
+    """An opaque pane, or the picture path without the daylight model, draws the same bytes with the flag."""
+    self.wall()
+    self.pane(flags=TWO_SIDED)
+    self.assertEqual(self.render()[0].tobytes(), self.render(flags=DAY | BACKED)[0].tobytes())
+    p.resetSimulation()
+    self.wall()
+    self.pane()
+    self.assertEqual(self.render(flags=PICTURE)[0].tobytes(), self.render(flags=PICTURE | BACKED)[0].tobytes())
+
+  def test_a_moving_pane_still_looks_through(self):
+    """A pane that moved after the first frame, such as a cab window, shows the wall behind it with the flag."""
+    self.wall()
+    uid = self.pane()
+    self.render(flags=DAY | BACKED)
+    p.resetBasePositionAndOrientation(uid, [0.2, 0.3, 0], [0, 0, 0, 1])
+    moved = self.centre(self.render(flags=DAY | BACKED)[0])
+    self.assertGreater(moved[0], moved[1] + 40)
+
+  def test_threads_give_the_same_bytes(self):
+    """A backed pane is byte-identical at 1, 2 and 4 render threads, each in its own process."""
+    digests = set()
+    for threads in ("1", "2", "4"):
+      env = dict(os.environ, SWARM_RENDER_THREADS=threads)
+      digests.add(subprocess.check_output([sys.executable, os.path.abspath(__file__), "--backed-hash"], env=env, text=True).strip())
+    self.assertEqual(len(digests), 1)
+
+
+def backed_hash():
+  """Prints the sha256 of one anti-aliased daylight frame of a backed pane before a wall."""
+  test = TestBackedGlass("test_threads_give_the_same_bytes")
+  test.setUp()
+  test.wall()
+  test.pane(rgba=(0.8, 0.9, 0.8, 1))
+  rgb, _, _ = test.render(flags=DAY | BACKED | getattr(p, "ER_EDGE_ANTIALIAS", 0), hazeDistance=30.0)
+  print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
+  test.tearDown()
+
+
 if __name__ == '__main__':
-  unittest.main()
+  if "--backed-hash" in sys.argv:
+    backed_hash()
+  else:
+    unittest.main()
