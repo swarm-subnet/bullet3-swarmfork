@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <xmmintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -571,8 +572,15 @@ void joinCommit(RTCScene scene)
 {
 	// The internal scheduler of a one-thread device has room for two threads in a build.
 	const int threads = b3GetSwarmRenderThreads() < 2 ? 1 : 2;
+	// A joining thread builds with the caller's MXCSR (rounding, flush to zero, denormals are zero), then gets its own back.
+	const unsigned int callerCsr = _mm_getcsr();
 #pragma omp parallel num_threads(threads)
-	rtcJoinCommitScene(scene);
+	{
+		const unsigned int ownCsr = _mm_getcsr();
+		_mm_setcsr(callerCsr);
+		rtcJoinCommitScene(scene);
+		_mm_setcsr(ownCsr);
+	}
 }
 
 // Idle cached trees are kept up to this weight, the least recently used dropped first. A tree weighs its triangles plus
