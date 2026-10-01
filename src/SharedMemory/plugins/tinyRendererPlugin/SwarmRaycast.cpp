@@ -2593,11 +2593,11 @@ bool castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 	shade.m_cells.clear();
 	if (rects.empty())
 		return true;
-	// At most 64 cells a side, none under 25 cm.
+	// At most 512 cells a side, none under 25 cm: a few movers far apart still leave most cells clear.
 	const float span = highU - lowU > highV - lowV ? highU - lowU : highV - lowV;
 	if (!(span < INFINITY))
 		return false;
-	const float cell = span / 64.0f > 0.25f ? span / 64.0f : 0.25f;
+	const float cell = span / 512.0f > 0.25f ? span / 512.0f : 0.25f;
 	shade.m_u0 = lowU;
 	shade.m_v0 = lowV;
 	shade.m_perCell = 1.0f / cell;
