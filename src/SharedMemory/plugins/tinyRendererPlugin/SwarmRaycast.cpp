@@ -1156,6 +1156,8 @@ struct SwarmRaycast::Data
 	// Per pixel of the current frame: the depth along the camera's axis of the farthest remembered hit landing on it, -1
 	// where none does.
 	std::vector<float> m_hintFar;
+	// The same for the share of the remembered hits each further render thread puts onto the frame.
+	std::vector<std::vector<float> > m_hintFrames;
 	MoverShade m_moverShade;
 
 	// The memory of the lens with this frame size and projection, or the one used longest ago, emptied for it.
@@ -3092,6 +3094,22 @@ inline float hintReach(const float* hintFar, int width, int height, int row, int
 	return farthest < 0.0f ? INFINITY : farthest + farthest * kHintSlack + kHintSlackMetres;
 }
 
+// A remembered hit put onto this frame's pixels: the pixel it lands on keeps the farthest depth along the camera's axis.
+inline void hintPoint(const float viewProj[4][4], const float* q, int width, int height, float* hintFar)
+{
+	const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
+	if (!(w > 1e-6f))
+		return;
+	const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
+	const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
+	const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
+	const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
+	if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
+		return;
+	float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
+	far = w > far ? w : far;
+}
+
 // The same for an edge pixel's probe ray, from this frame's first rays: their 1/zEye, the far plane's for a miss.
 inline float probeReach(const float* inverseEyeDepth, int width, int height, int row, int col)
 {
@@ -3972,34 +3990,30 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	// frame's pixels, tells each ray about how far it has to search.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
+	float viewProj[4][4];
+	std::vector<float*> hintFrames;
+	const float* lastPoints = 0;
 	if (numTargets == 1 && setups[0].m_valid && numPixels >= kHintMinPixels)
 	{
 		HitMemory* memory = m_data->hitMemory(width, height, projMat);
 		const Camera& cam = setups[0].m_cam;
 		if (memory->m_points.size() == numPixels * 3)
 		{
-			float viewProj[4][4];
 			for (int r = 0; r < 4; r++)
 				for (int c = 0; c < 4; c++)
 					viewProj[r][c] = (float)cam.m_viewProj[r][c];
-			std::vector<float>& hintFar = m_data->m_hintFar;
-			hintFar.assign(numPixels, -1.0f);
-			for (size_t i = 0; i < numPixels; i++)
+			// One frame of farthest hits per render thread, the first being the hint itself; the threads fill them inside
+			// the pixel loop's parallel region.
+			m_data->m_hintFar.resize(numPixels);
+			m_data->m_hintFrames.resize((size_t)threads - 1);
+			hintFrames.push_back(&m_data->m_hintFar[0]);
+			for (int i = 0; i < threads - 1; i++)
 			{
-				const float* q = &memory->m_points[i * 3];
-				const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
-				if (!(w > 1e-6f))
-					continue;
-				const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
-				const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
-				const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
-				const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
-				if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
-					continue;
-				float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
-				far = w > far ? w : far;
+				m_data->m_hintFrames[(size_t)i].resize(numPixels);
+				hintFrames.push_back(&m_data->m_hintFrames[(size_t)i][0]);
 			}
-			job.m_hintFar = &hintFar[0];
+			lastPoints = &memory->m_points[0];
+			job.m_hintFar = &m_data->m_hintFar[0];
 		}
 		memory->m_points.resize(numPixels * 3);
 		job.m_hitPoints = &memory->m_points[0];
@@ -4048,6 +4062,31 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		RTCOccludedArguments shadowArgs;
 		rtcInitOccludedArguments(&shadowArgs);
 		shadowArgs.context = &ctx.m_context;
+
+		if (lastPoints)
+		{
+			// Each thread puts its share of the remembered hits into its own frame, then each pixel takes the farthest of
+			// the frames: a maximum, so the hint is the same whichever thread took which hit.
+#ifdef _OPENMP
+			const int team = omp_get_num_threads(), member = omp_get_thread_num();
+#else
+			const int team = 1, member = 0;
+#endif
+			float* own = hintFrames[(size_t)member];
+			for (size_t i = 0; i < numPixels; i++)
+				own[i] = -1.0f;
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+				hintPoint(viewProj, lastPoints + i * 3, width, height, own);
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+			{
+				float far = hintFrames[0][i];
+				for (int k = 1; k < team; k++)
+					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
+				hintFrames[0][i] = far;
+			}
+		}
 
 		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
 		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
@@ -4109,10 +4148,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		camera.m_seed = shading->m_sensorSeed;
 		for (int k = 0; k < 3; k++)
 			camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
-		// One thread: the chain is a dozen short passes, and on a busy box the barriers between them cost more than the
-		// passes; the bytes are the same at any count.
+		// Every pass splits its rows over the render threads; the bytes are the same at any count.
 		for (int i = 0; i < numTargets; i++)
 			if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, 1);
+				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, threads);
 	}
 }
