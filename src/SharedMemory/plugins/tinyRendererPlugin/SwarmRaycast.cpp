@@ -2058,32 +2058,6 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 	return true;
 }
 
-// Barycentric weights of corners 1 and 2 where the ray origin + s * dir meets the triangle's plane;
-// false when the ray runs along the plane. Used for the texture footprint of the neighbouring pixels.
-// `normal` must be the triangle's normal as wound, since the weights carry its sign.
-bool planeBarycentric(const float origin[3], const float dir[3], const float corners[3][3], const float normal[3], float& u, float& v)
-{
-	float e1[3], e2[3], toCorner[3], w[3], t1[3], t2[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = corners[1][i] - corners[0][i];
-		e2[i] = corners[2][i] - corners[0][i];
-		toCorner[i] = corners[0][i] - origin[i];
-	}
-	const float denom = dot3(dir, normal);
-	const float nn = dot3(normal, normal);
-	if (denom == 0.0f || nn == 0.0f)
-		return false;
-	const float s = dot3(toCorner, normal) / denom;
-	for (int i = 0; i < 3; i++)
-		w[i] = (origin[i] + dir[i] * s) - corners[0][i];
-	cross3(w, e2, t1);
-	cross3(e1, w, t2);
-	u = dot3(t1, normal) / nn;
-	v = dot3(t2, normal) / nn;
-	return true;
-}
-
 // TinyRenderer's fragment shader, term for term: interpolated normal and uv, the texture times the
 // object colour, ambient plus the shadowed diffuse and specular terms, truncated to bytes. A mesh
 // without vertex normals is lit by faceNormal, the triangle's own normal turned towards the camera.
@@ -2454,7 +2428,9 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
 }
 
-// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above.
+// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above: the
+// barycentric weights of corners 1 and 2 where each neighbour's ray meets the triangle's plane, skipped when that ray
+// runs along the plane. woundNormal must be the triangle's normal as wound, since the weights carry its sign.
 void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurface& surface, const float woundNormal[3], const RTCHit& hit,
 				 float duvdx[2], float duvdy[2])
 {
@@ -2464,13 +2440,32 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 	const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
 	const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
 	const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+	const float* origin = setup.m_cam.m_origin;
+	const float(*corners)[3] = surface.m_corners;
+	float e1[3], e2[3], toCorner[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = corners[1][i] - corners[0][i];
+		e2[i] = corners[2][i] - corners[0][i];
+		toCorner[i] = corners[0][i] - origin[i];
+	}
+	const float nn = dot3(woundNormal, woundNormal);
+	const float reach = dot3(toCorner, woundNormal);
 	for (int k = 0; k < 2; k++)
 	{
-		float neighbourDir[3], u, v;
+		float neighbourDir[3], w[3], t1[3], t2[3];
 		for (int i = 0; i < 3; i++)
 			neighbourDir[i] = rawDir[i] + steps[k][i];
-		if (!planeBarycentric(setup.m_cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+		const float denom = dot3(neighbourDir, woundNormal);
+		if (denom == 0.0f || nn == 0.0f)
 			continue;
+		const float s = reach / denom;
+		for (int i = 0; i < 3; i++)
+			w[i] = (origin[i] + neighbourDir[i] * s) - corners[0][i];
+		cross3(w, e2, t1);
+		cross3(e1, w, t2);
+		const float u = dot3(t1, woundNormal) / nn;
+		const float v = dot3(t2, woundNormal) / nn;
 		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
 		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
 	}
@@ -2487,8 +2482,6 @@ const float kSunHeating = 22.0f;
 const float kPassiveDetail = 25.0f;
 const float kSetDetail = 2.0f;
 const float kDetailLimit = 0.2f;
-// A footprint wide enough that the read is the last mip level, the texture's mean.
-const float kMeanFootprint = 1.0e4f;
 
 // Temperature a heat map gives at uv: its red byte from low to high, with the colour texture's wrap and nearest texel.
 float heatAt(const TinyRenderThermal& thermal, const TinyRender::Vec2f& uv)
@@ -2541,7 +2534,7 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	TinyRender::Vec2f uv(0.0f, 0.0f);
 	surfaceAt(surface, hit, faceNormal, true, duvdx, duvdy, normal, base, &uv);
 	const float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
-	TGAColor mean = surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(kMeanFootprint, 0.0f), TinyRender::Vec2f(0.0f, kMeanFootprint));
+	TGAColor mean = surface.m_model->diffuseMean(uv);
 	float detail = albedo - texelLuminance(mean, surface.m_model->getColorRGBA());
 	detail = detail < -kDetailLimit ? -kDetailLimit : (detail > kDetailLimit ? kDetailLimit : detail);
 
@@ -2615,8 +2608,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		toNear[i] = nearPoint[i] - cam.m_origin[i];
 	}
 	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
-	if (shading && shading->m_thermal)
-		out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
+	// The sky along the ray, only for a ray that ends on it: a miss, an unknown body, or what a thermal veil leaves.
+	const bool thermalSky = shading && shading->m_thermal;
 
 	RTCRayHit rayhit;
 	rayhit.ray.org_x = cam.m_origin[0];
@@ -2636,7 +2629,11 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 	rtcIntersect1(job.m_top, &rayhit, args);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+	{
+		if (thermalSky)
+			out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 		return false;
+	}
 
 	const float t = rayhit.ray.tfar;
 	const float hx = cam.m_origin[0] + dir[0] * t;
@@ -2657,7 +2654,11 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	out.m_hit.m_instPrim1 = rayhit.hit.instPrimID[1];
 	out.m_shaded = shading && known;
 	if (!out.m_shaded)
+	{
+		if (thermalSky)
+			out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 		return true;
+	}
 
 	// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
 	// towards the camera for shading and for the side the shadow ray leaves from.
@@ -2692,7 +2693,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		if (averaged && coverage < 0.97f)
 		{
 			// A veil, such as a far fence or a thin crown: its share of the pixel, and the rest from what the ray meets next.
-			float behind = out.m_radiance;
+			float behind;
 			RTCRayHit next = rayhit;
 			next.ray.tnear = t + kPaneBias;
 			next.ray.tfar = tNear + length;
@@ -2720,6 +2721,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
 				behind = thermalHit(job, dir, back, next.hit, backFace, point2, duv2x, duv2y);
 			}
+			else
+				behind = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 			radiance = coverage * radiance + (1.0f - coverage) * behind;
 		}
 		out.m_radiance = radiance;
