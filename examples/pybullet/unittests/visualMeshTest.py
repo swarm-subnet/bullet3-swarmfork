@@ -3,6 +3,8 @@ uvs and texture, with normals rebuilt from the new shape. One body stays one sur
 cut into rigid pieces. Both colour paths, and the ray caster's tree follows the change."""
 import math
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import numpy as np
@@ -193,6 +195,81 @@ class TestVisualMesh(unittest.TestCase):
     self.assertEqual(frames[0], frames[1])
     self.assertEqual(frames[0], frames[2])
 
+  def test_the_upload_is_released_after_the_call(self):
+    """resetMeshData and createVisualShape let go of the lists they read, so a fresh upload every frame is freed."""
+    uid = self.body()
+    upload = self.raised(0.5)
+    indices = [i for t in self.triangles for i in t]
+    lists = (upload, upload[0], self.vertices, self.normals, self.uvs, self.uvs[0], indices)
+    held = [sys.getrefcount(x) for x in lists]
+    p.resetMeshData(uid, upload)
+    p.createVisualShape(p.GEOM_MESH, vertices=self.vertices, indices=indices, normals=self.normals, uvs=self.uvs)
+    self.assertEqual([sys.getrefcount(x) for x in lists], held)
+
+  def test_an_array_upload_draws_the_same_bytes_as_a_list(self):
+    """An N x 3 float64 or float32 array, contiguous or not, draws the colour and depth of the same numbers as a list."""
+    raised = np.array(self.raised(0.8))
+    single = raised.astype(np.float32)
+    strided = np.hstack([raised, raised])[:, :3]
+    groups = ((raised.tolist(), raised, strided), (single.tolist(), single))
+    for flags in (0, PICTURE, RAYCAST | getattr(p, "ER_SWARM_THERMAL", 0)):
+      for group in groups:
+        frames = []
+        for upload in group:
+          p.resetSimulation()
+          uid = self.body()
+          self.render(flags)
+          p.resetMeshData(uid, upload)
+          rgb, depth = self.render(flags)
+          frames.append(rgb.tobytes() + depth.tobytes())
+        with self.subTest(flags=flags, dtype=str(group[1].dtype)):
+          self.assertEqual(len(set(frames)), 1)
+
+  def test_a_wrong_array_is_refused(self):
+    """An array with the wrong vertex count, or two numbers per vertex, raises as the list does."""
+    uid = self.body()
+    with self.assertRaises(p.error):
+      p.resetMeshData(uid, np.array(self.vertices)[:-3])
+    with self.assertRaises(p.error):
+      p.resetMeshData(uid, np.array(self.vertices)[:, :2])
+
+  def test_array_uploads_give_the_same_bytes_at_every_thread_count(self):
+    """Array uploads render byte-identical frames at 1, 2 and 4 render threads, each count in its own process."""
+    frames = []
+    for threads in ("1", "2", "4"):
+      out = os.path.join(self.folder, "frame_%s.npy" % threads)
+      env = dict(os.environ, SWARM_RENDER_THREADS=threads)
+      subprocess.check_call([sys.executable, os.path.abspath(__file__), "--frame", out], env=env,
+                            cwd=os.path.dirname(os.path.abspath(__file__)))
+      frames.append(np.load(out))
+    self.assertTrue(np.array_equal(frames[0], frames[1]))
+    self.assertTrue(np.array_equal(frames[0], frames[2]))
+
+
+def save_frame(path):
+  """Rewrites a grid from a float32 and then a float64 array, rendering each, and saves the frames for the thread test."""
+  p.connect(p.DIRECT)
+  vertices, normals, uvs, triangles = grid(9, 1.0)
+  shape = p.createVisualShape(p.GEOM_MESH, vertices=vertices, indices=[i for t in triangles for i in t],
+                              normals=normals, uvs=uvs, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0])
+  uid = p.createMultiBody(0, -1, shape)
+  view = p.computeViewMatrix([0, -2.6, 1.6], [0, 0, 0], [0, 0, 1])
+  proj = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 100.0)
+  frames = []
+  for height, dtype in ((0.8, np.float32), (0.4, np.float64)):
+    raised = np.array(vertices, dtype=dtype)
+    raised[len(raised) // 2, 2] = height
+    p.resetMeshData(uid, raised)
+    _, _, rgb, depth, _ = p.getCameraImage(SIZE, SIZE, view, proj, shadow=0, lightDirection=SUN,
+                                           renderer=p.ER_TINY_RENDERER,
+                                           flags=PICTURE | getattr(p, "ER_EDGE_ANTIALIAS", 0))
+    frames.append(np.concatenate([np.asarray(rgb, dtype=np.float64).ravel(), np.asarray(depth, dtype=np.float64).ravel()]))
+  np.save(path, np.stack(frames))
+  p.disconnect()
+
 
 if __name__ == '__main__':
-  unittest.main()
+  if len(sys.argv) == 3 and sys.argv[1] == "--frame":
+    save_frame(sys.argv[2])
+  else:
+    unittest.main()
