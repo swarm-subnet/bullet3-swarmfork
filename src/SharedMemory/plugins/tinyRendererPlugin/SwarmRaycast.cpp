@@ -1221,16 +1221,19 @@ struct SwarmRaycast::Data
 	// Takes this request's key, and keeps the frame it drew when the request repeated the lens's last one: a camera that
 	// stays still is asked for it again, a moving one never is. farthest is how far along their rays its rays went.
 	void keepFrame(HitMemory& memory, std::vector<unsigned char>& key, const Camera& cam, const SwarmRaycast::Target& target,
-				   const std::vector<float>& radiance, float farthest, const SwarmRaycastShading* shading, size_t numPixels)
+				   const std::vector<float>& radiance, float farthest, const SwarmRaycastShading* shading, int width, int height)
 	{
+		const size_t numPixels = (size_t)width * height;
 		const bool repeat = memory.m_key == key;
 		memory.m_key.swap(key);
 		memory.m_kept = false;
 		if (!repeat || !(farthest >= 0.0f && farthest < INFINITY))
 			return;
 		// Every ray point lies within its distance along the ray of the eye, so no deeper than the farthest one went.
+		// The sides lie a pixel out: an edge probe on the left column or the bottom row samples up to half a pixel past ndc -1.
 		double corners[4][3], centre[3];
-		const double ndc[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+		const double sideX = 1.0 + 2.0 / width, sideY = 1.0 + 2.0 / height;
+		const double ndc[4][2] = {{-sideX, -sideY}, {sideX, -sideY}, {sideX, sideY}, {-sideX, sideY}};
 		for (int i = 0; i < 3; i++)
 		{
 			memory.m_apex[i] = cam.m_origin[i];
@@ -4286,7 +4289,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			farthest = ctx.m_farthest;
 	}
 	if (memory && reuseKey)
-		m_data->keepFrame(*memory, key, setups[0].m_cam, targets[0], radiance, farthest, shading, numPixels);
+		m_data->keepFrame(*memory, key, setups[0].m_cam, targets[0], radiance, farthest, shading, width, height);
 
 	// The camera chain needs the whole frame, so it runs once every ray has landed.
 	for (int i = 0; i < numTargets; i++)

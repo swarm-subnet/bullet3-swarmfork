@@ -2,6 +2,7 @@
 after a mover goes by out of sight and shade, after one comes into view or throws its shadow in, after a colour change,
 with new grain at night and in thermal, and with the same bytes at any thread count."""
 import hashlib
+import math
 import os
 import subprocess
 import sys
@@ -176,6 +177,72 @@ class TestFrameReuse(unittest.TestCase):
     spent(EYE)
     still = min(spent(EYE) for _ in range(5))
     self.assertLess(still * 3.0, fresh)
+
+
+TAN = math.tan(math.radians(30.0))
+ROW = 48
+ROW_NDC = 1.0 - (2.0 * ROW + 2.0) / SIZE
+# Where the edge pass probes the uncovered fifth of the left column's square at ROW, half a pixel past the frame's side.
+STRIP = [25.0, 25.0 * TAN * (1.0 + 0.8 / SIZE), 1.0 + 25.0 * TAN * ROW_NDC]
+
+
+def border_world():
+  """A plate 2 m ahead of an eye at (0, 0, 1) looking along +x, whose corner covers the right four fifths of the left
+  column's square at ROW and nothing above it, so that pixel's rest is probed past the frame's left side; and a 2 cm
+  cube far away that becomes a mover once it moves. Returns the cube."""
+  edge = 2.0 * TAN * (1.0 + 0.6 / SIZE)
+  top = 1.0 + 2.0 * TAN * (ROW_NDC + 1.5 / SIZE)
+  plate = p.createVisualShape(p.GEOM_MESH, vertices=[[2, edge, -1], [2, -3, -1], [2, -3, top], [2, edge, top]],
+                              indices=[0, 1, 2, 0, 2, 3], normals=[[-1, 0, 0]] * 4, rgbaColor=[0.2, 0.6, 0.2, 1])
+  p.createMultiBody(baseMass=0, baseVisualShapeIndex=plate)
+  cube = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.01, 0.01, 0.01], rgbaColor=[1, 0, 1, 1])
+  return p.createMultiBody(baseMass=0, baseVisualShapeIndex=cube, basePosition=[60, -60, 0])
+
+
+def along_x(flags):
+  """The frame seen from (0, 0, 1) along +x, colour, depth and mask as one bytes string."""
+  view = p.computeViewMatrix([0, 0, 1], [1, 0, 1], [0, 0, 1])
+  proj = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 30.0)
+  _, _, rgb, depth, seg = p.getCameraImage(SIZE, SIZE, view, proj, lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER,
+                                           flags=flags, shadow=1)
+  return (np.asarray(rgb, dtype=np.uint8).tobytes() + np.asarray(depth, dtype=np.float32).tobytes() +
+          np.asarray(seg, dtype=np.int32).tobytes())
+
+
+@NEEDS_FLAG
+class TestFrameReuseBorder(unittest.TestCase):
+  """Edge-pass probes on the left column and bottom row reach half a pixel past the frame's side."""
+
+  def setUp(self):
+    """Connects, builds the plate and the cube, draws once so both join the static tree, and moves the cube once."""
+    p.connect(p.DIRECT)
+    self.cube = border_world()
+    along_x(PICTURE)
+    move(self.cube, [60, -61, 0])
+
+  def tearDown(self):
+    """Disconnects."""
+    p.disconnect()
+
+  def test_mover_met_only_by_a_border_probe(self):
+    """A cube only the left column's probe meets shows in the frame, and leaving takes it out of the frame."""
+    empty = along_x(PICTURE)
+    move(self.cube, STRIP)
+    for _ in range(3):
+      self.assertEqual(along_x(PICTURE | REUSE), along_x(PICTURE))
+    seen = along_x(PICTURE)
+    self.assertNotEqual(seen, empty)
+    move(self.cube, [60, -60, 0])
+    self.assertEqual(along_x(PICTURE | REUSE), along_x(PICTURE))
+
+  def test_mover_crossing_the_side_of_the_frame(self):
+    """A cube stepping a centimetre at a time out through the frame's left side gives the frame drawn without reuse at
+    every step."""
+    along_x(PICTURE | REUSE)
+    for step in range(40):
+      move(self.cube, [STRIP[0], STRIP[1] - 0.2 + 0.01 * step, STRIP[2]])
+      for _ in range(2):
+        self.assertEqual(along_x(PICTURE | REUSE), along_x(PICTURE), step)
 
 
 @NEEDS_FLAG
