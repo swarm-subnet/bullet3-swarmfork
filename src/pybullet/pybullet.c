@@ -13786,6 +13786,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_TREE_CACHE", eVISUAL_SHAPE_RENDER_TREE_CACHE);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_INSTANCED", eVISUAL_SHAPE_RENDER_INSTANCED);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS", eVISUAL_SHAPE_GLASS);
+	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
+	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
 
 	PyModule_AddIntConstant(m, "MAX_RAY_INTERSECTION_BATCH_SIZE", MAX_RAY_INTERSECTION_BATCH_SIZE_STREAMING);
 

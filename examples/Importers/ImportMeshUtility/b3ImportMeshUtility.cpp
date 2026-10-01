@@ -46,13 +46,6 @@ void b3ImportMeshUtility::releaseCachedTexture(const char* textureName)
 	texture->m_handedOver = true;
 }
 
-void b3ImportMeshUtility::forgetCachedTexture(const char* textureName)
-{
-	CachedTextureResult* texture = textureName ? gCachedTextureResults[textureName] : 0;
-	if (texture)
-		texture->m_handedOver = false;
-}
-
 struct CachedTextureManager
 {
 	CachedTextureManager()

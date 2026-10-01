@@ -23,6 +23,7 @@ subject to the following restrictions:
 #include "Bullet3Common/b3FileUtils.h"
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstdio>
 #include "../../../../examples/Utils/b3ResourcePath.h"
@@ -54,6 +55,10 @@ struct MyTexture2
 	std::string m_name;
 };
 
+// File textures the renderer keeps decoded for the life of the process, so the next world that names one borrows
+// the copy instead of reading and decoding the file again.
+static std::set<std::string> gPinnedTextures;
+
 // Hands a file-backed texture to the renderer for good: a reference by name replaces the texels, which
 // no later reader needs, because the name finds the one copy the renderer keeps from here on.
 static void handOverTexture(MyTexture2& texData)
@@ -66,6 +71,8 @@ static void handOverTexture(MyTexture2& texData)
 		texData.m_name.clear();
 		return;
 	}
+	if (gPinnedTextures.insert(texData.m_name).second)
+		TinyRender::retainSharedTexture(texData.m_name.c_str());
 	if (texData.m_isCached)
 		b3ImportMeshUtility::releaseCachedTexture(texData.m_name.c_str());
 	else
@@ -1157,15 +1164,34 @@ struct ForestFile
 	std::vector<std::vector<float> > m_placements;
 };
 
-// Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines;
-// '#' starts a comment. False when the file cannot be read or names no mesh.
+// Adds one placement, "x y z qx qy qz qw sx sy sz", to its mesh: the rotation from the unit quaternion, each column
+// scaled by its axis, then the origin, the placement's 3x4 column-major.
+static void addForestPlacement(ForestFile& out, int index, const double v[10])
+{
+	const double x = v[0], y = v[1], z = v[2], qx = v[3], qy = v[4], qz = v[5], qw = v[6], sx = v[7], sy = v[8], sz = v[9];
+	const double r[3][3] = {{1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)},
+							{2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)},
+							{2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)}};
+	const double scale[3] = {sx, sy, sz};
+	const double origin[3] = {x, y, z};
+	std::vector<float>& placements = out.m_placements[index];
+	for (int c = 0; c < 3; c++)
+		for (int row = 0; row < 3; row++)
+			placements.push_back((float)(r[row][c] * scale[c]));
+	for (int row = 0; row < 3; row++)
+		placements.push_back((float)origin[row]);
+}
+
+// Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines, or one
+// "binary <rows>" line followed by those eleven numbers per row as little-endian doubles, which skips formatting and
+// parsing text for a large forest; '#' starts a comment. False when the file cannot be read or names no mesh.
 static bool readForestFile(const std::string& fileName, CommonFileIOInterface* fileIO, ForestFile& out)
 {
 	char found[1024];
 	std::string path = fileName;
 	if (fileIO && fileIO->findResourcePath(fileName.c_str(), found, sizeof(found)))
 		path = found;
-	std::ifstream in(path.c_str());
+	std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
 	if (!in)
 		return false;
 	const size_t slash = path.find_last_of("/\\");
@@ -1184,23 +1210,34 @@ static bool readForestFile(const std::string& fileName, CommonFileIOInterface* f
 			out.m_placements.push_back(std::vector<float>());
 			continue;
 		}
+		if (line.compare(0, 7, "binary ") == 0)
+		{
+			// The rows the line names must all be in the file, so a damaged count cannot ask for more memory than that.
+			const std::streampos start = in.tellg();
+			in.seekg(0, std::ios::end);
+			const unsigned long long left = (unsigned long long)(in.tellg() - start);
+			in.seekg(start);
+			const unsigned long long rows = strtoull(line.c_str() + 7, 0, 10);
+			if (rows > left / (11 * sizeof(double)))
+				return false;
+			std::vector<double> values((size_t)rows * 11);
+			if (rows && !in.read((char*)&values[0], (std::streamsize)(values.size() * sizeof(double))))
+				return false;
+			for (size_t i = 0; i < (size_t)rows; i++)
+			{
+				const double* row = &values[i * 11];
+				// Range first, so a NaN or a huge value is never cast to int.
+				if (row[0] >= 0.0 && row[0] < (double)out.m_meshes.size() && row[0] == (double)(int)row[0])
+					addForestPlacement(out, (int)row[0], row + 1);
+			}
+			break;
+		}
 		int index = -1;
-		double x, y, z, qx, qy, qz, qw, sx, sy, sz;
-		if (sscanf(line.c_str(), "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &index, &x, &y, &z, &qx, &qy, &qz, &qw, &sx, &sy, &sz) != 11 ||
+		double v[10];
+		if (sscanf(line.c_str(), "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &index, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) != 11 ||
 			index < 0 || index >= (int)out.m_meshes.size())
 			continue;
-		// Rotation from the unit quaternion, each column scaled by its axis: the placement's 3x4, column-major.
-		const double r[3][3] = {{1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)},
-								{2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)},
-								{2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)}};
-		const double scale[3] = {sx, sy, sz};
-		const double origin[3] = {x, y, z};
-		std::vector<float>& placements = out.m_placements[index];
-		for (int c = 0; c < 3; c++)
-			for (int row = 0; row < 3; row++)
-				placements.push_back((float)(r[row][c] * scale[c]));
-		for (int row = 0; row < 3; row++)
-			placements.push_back((float)origin[row]);
+		addForestPlacement(out, index, v);
 	}
 	return !out.m_meshes.empty();
 }
@@ -2857,11 +2894,9 @@ void TinyRendererVisualShapeConverter::resetAll()
 	m_data->m_sunSky.forgetPhoto();
 	for (int i = 0; i < m_data->m_textures.size(); i++)
 	{
+		// A named texture is pinned, so the renderer's copy outlives this world and the loader keeps handing out its name.
 		if (!m_data->m_textures[i].m_name.empty())
-		{
 			TinyRender::releaseSharedTexture(m_data->m_textures[i].m_name.c_str());
-			b3ImportMeshUtility::forgetCachedTexture(m_data->m_textures[i].m_name.c_str());
-		}
 		if (!m_data->m_textures[i].m_isCached)
 		{
 			free(m_data->m_textures[i].textureData1);

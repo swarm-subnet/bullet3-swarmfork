@@ -67,8 +67,6 @@ public:
 	static unsigned char* loadTextureAlpha(const unsigned char* bytes, int size, int width, int height);
 	// Drops the texels cached under this file name once the renderer has taken them over.
 	static void releaseCachedTexture(const char* textureName);
-	// Undoes that, so the next load of this file reads it again.
-	static void forgetCachedTexture(const char* textureName);
 };
 
 #endif  //B3_IMPORT_MESH_UTILITY_H
