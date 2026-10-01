@@ -1330,6 +1330,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			bool renderInstanced = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_INSTANCED) != 0;
 			bool renderTreeCache = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_TREE_CACHE) != 0;
 			bool glass = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS) != 0;
+			bool glassBacked = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS_BACKED) != 0;
 
 			TinyRender::Matrix meshTransform = TinyRender::Matrix::identity();
 			if (renderInstanced)
@@ -1384,6 +1385,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						tinyObj->m_renderInstanced = renderInstanced;
 						tinyObj->m_meshTransform = meshTransform;
 						tinyObj->m_glass = glass;
+						tinyObj->m_glassBacked = glassBacked;
 						tinyObj->m_placements = forest.m_placements[mesh];
 						tinyObj->m_model = new TinyRender::Model();
 						tinyObj->m_model->shareFrom(*prototype.m_models[m]);
@@ -1506,6 +1508,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					tinyObj->m_renderInstanced = renderInstanced;
 					tinyObj->m_meshTransform = meshTransform;
 					tinyObj->m_glass = glass;
+					tinyObj->m_glassBacked = glassBacked;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
 						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
 					float groupSpecular[3] = { (float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2] };
@@ -1538,6 +1541,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 				tinyObj->m_renderInstanced = renderInstanced;
 				tinyObj->m_meshTransform = meshTransform;
 				tinyObj->m_glass = glass;
+				tinyObj->m_glassBacked = glassBacked;
 				unsigned char* textureImage1 = 0;
 				const unsigned char* textureAlpha = 0;
 				int textureWidth = 0;
@@ -1713,6 +1717,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 {
 	bool doubleSided = (flags & (eVISUAL_SHAPE_DOUBLE_SIDED | eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)) != 0;
 	bool glass = (flags & eVISUAL_SHAPE_GLASS) != 0;
+	bool glassBacked = (flags & eVISUAL_SHAPE_GLASS_BACKED) != 0;
 	btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes)
 	{
@@ -1734,6 +1739,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 					{
 						visuals->m_renderObjects[q]->m_doubleSided = doubleSided;
 						visuals->m_renderObjects[q]->m_glass = glass;
+						visuals->m_renderObjects[q]->m_glassBacked = glassBacked;
 					}
 				}
 			}
@@ -2360,7 +2366,6 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
 		shading.m_edgeOutline = (m_data->m_flags & ER_SWARM_EDGE_OUTLINE) != 0;
-		shading.m_backedGlass = (m_data->m_flags & ER_SWARM_BACKED_GLASS) != 0;
 		shading.m_linearLight = (m_data->m_flags & ER_SWARM_LINEAR_LIGHT) != 0;
 		shading.m_daylight = daylight;
 		shading.m_sky = (daylight && sunSky && sunSky->daylightBuilt()) ? sunSky : 0;

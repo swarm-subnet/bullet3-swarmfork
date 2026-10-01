@@ -46,7 +46,7 @@ const float kGlassMirrorFromCos = 0.20f;
 const float kPaneF0 = 0.04f;
 const float kPaneBias = 2e-3f;
 const int kPaneDepth = 3;
-// ER_SWARM_BACKED_GLASS: the white backsheet behind a module's cells, as an sRGB byte, as the solar park's racking paints it.
+// VISUAL_SHAPE_GLASS_BACKED: the white backsheet behind a module's cells, as an sRGB byte, as the solar park's racking paints it.
 const float kPaneBacking = 254.0f;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
@@ -1799,6 +1799,7 @@ struct HitSurface
 	bool m_doubleSided;
 	bool m_hasAlpha;
 	bool m_glass;
+	bool m_glassBacked;
 	const TinyRenderThermal* m_thermal;
 };
 
@@ -1983,6 +1984,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = batch->m_doubleSided;
 		surface->m_hasAlpha = batch->m_hasAlpha;
 		surface->m_glass = batch->m_glass;
+		surface->m_glassBacked = batch->m_obj->m_glassBacked;
 		surface->m_thermal = &batch->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
@@ -2005,6 +2007,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = member->m_doubleSided;
 		surface->m_hasAlpha = member->m_hasAlpha;
 		surface->m_glass = member->m_glass;
+		surface->m_glassBacked = member->m_obj->m_glassBacked;
 		surface->m_thermal = &member->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
@@ -2024,6 +2027,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = inst->m_doubleSided;
 		surface->m_hasAlpha = inst->m_hasAlpha;
 		surface->m_glass = inst->m_glass;
+		surface->m_glassBacked = inst->m_obj->m_glassBacked;
 		surface->m_thermal = &inst->m_obj->m_thermal;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
@@ -2802,10 +2806,10 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		HitSurface pane = surface;
 		float paneFace[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
-		if (shading->m_backedGlass && rayhit.hit.instID[0] == job.m_staticId)
+		if (surface.m_glassBacked)
 		{
-			// A still pane is a module: its cells over a white backsheet in the pane's own colour, lit as the pane is and
-			// shaded by its shadow, which is what the ray behind it would meet, so no ray goes behind it.
+			// A module: its cells over a white backsheet in the pane's own colour, lit as the pane is and shaded by its
+			// shadow, which is what the ray behind it would meet, so no ray goes behind it.
 			float normal[3], base[3], sky[3], skyLight[3];
 			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
 			const float through = paneLight(*shading, normal, dir, sky);

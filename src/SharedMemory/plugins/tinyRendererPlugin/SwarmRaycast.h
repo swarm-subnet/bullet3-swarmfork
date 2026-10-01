@@ -48,8 +48,6 @@ struct SwarmRaycastShading
 	bool m_linearLight;
 	// ER_SWARM_DAYLIGHT: the daylight terms below replace TinyRenderer's formula; m_sky gives radiance, sky light and haze colour, or flat white without one.
 	bool m_daylight;
-	// ER_SWARM_BACKED_GLASS: under m_daylight a static glass pane is lit over a white backsheet instead of tracing behind it.
-	bool m_backedGlass;
 	const SwarmSky* m_sky;
 	float m_exposure;
 	float m_hazeDistance;      // metres at which a hit is 63 % haze; 0 turns the haze off

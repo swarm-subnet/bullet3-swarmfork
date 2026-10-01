@@ -335,7 +335,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_renderInstanced(false),
 	  m_textureRevision(0),
 	  m_renderTreeCache(false),
-	  m_glass(false)
+	  m_glass(false),
+	  m_glassBacked(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -368,7 +369,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_renderInstanced(false),
 	  m_textureRevision(0),
 	  m_renderTreeCache(false),
-	  m_glass(false)
+	  m_glass(false),
+	  m_glassBacked(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -400,7 +402,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_renderInstanced(false),
 	  m_textureRevision(0),
 	  m_renderTreeCache(false),
-	  m_glass(false)
+	  m_glass(false),
+	  m_glassBacked(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
@@ -433,7 +436,8 @@ TinyRenderObjectData::TinyRenderObjectData(TGAImage& rgbColorBuffer, b3AlignedOb
 	  m_renderInstanced(false),
 	  m_textureRevision(0),
 	  m_renderTreeCache(false),
-	  m_glass(false)
+	  m_glass(false),
+	  m_glassBacked(false)
 {
 	Vec3f eye(1, 1, 3);
 	Vec3f center(0, 0, 0);
