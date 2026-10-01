@@ -6398,13 +6398,58 @@ static PyObject* pybullet_addUserDebugLine(PyObject* self, PyObject* args, PyObj
 	}
 }
 
+// A C-contiguous N x 3 array of native float64 or float32 is read from its memory in one pass, with the same
+// doubles the sequence path would produce; returns -1 for anything else, so the caller reads it as a sequence.
+static int extractVertexArray(PyObject* verticesObj, double* vertices, int maxNumVertices)
+{
+	Py_buffer view;
+	const char* format;
+	int numVertices = -1;
+	int i;
+
+	if (!PyObject_CheckBuffer(verticesObj))
+		return -1;
+	if (PyObject_GetBuffer(verticesObj, &view, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
+	{
+		PyErr_Clear();
+		return -1;
+	}
+	format = view.format ? view.format : "B";
+	if (format[0] == '@' || format[0] == '=')
+		format++;
+	if (view.ndim == 2 && view.shape[1] == 3 && format[1] == 0 &&
+		((format[0] == 'd' && view.itemsize == sizeof(double)) || (format[0] == 'f' && view.itemsize == sizeof(float))))
+	{
+		if (view.shape[0] > maxNumVertices)
+		{
+			PyErr_SetString(SpamError, "Number of vertices exceeds the maximum.");
+			numVertices = 0;
+		}
+		else
+		{
+			numVertices = (int)view.shape[0];
+			if (vertices && format[0] == 'd')
+				memcpy(vertices, view.buf, (size_t)numVertices * 3 * sizeof(double));
+			else if (vertices)
+				for (i = 0; i < numVertices * 3; i++)
+					vertices[i] = ((const float*)view.buf)[i];
+		}
+	}
+	PyBuffer_Release(&view);
+	return numVertices;
+}
+
 static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVertices)
 {
 	int numVerticesOut = 0;
 
 	if (verticesObj)
 	{
-		PyObject* seqVerticesObj = PySequence_Fast(verticesObj, "expected a sequence of vertex positions");
+		PyObject* seqVerticesObj;
+		const int numFromArray = extractVertexArray(verticesObj, vertices, maxNumVertices);
+		if (numFromArray >= 0)
+			return numFromArray;
+		seqVerticesObj = PySequence_Fast(verticesObj, "expected a sequence of vertex positions");
 		if (seqVerticesObj)
 		{
 			int numVerticesSrc = PySequence_Size(seqVerticesObj);
@@ -6419,7 +6464,7 @@ static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVe
 				}
 				for (i = 0; i < numVerticesSrc; i++)
 				{
-					PyObject* vertexObj = PySequence_GetItem(seqVerticesObj, i);
+					PyObject* vertexObj = PySequence_Fast_GET_ITEM(seqVerticesObj, i);
 					double vertex[3];
 					if (pybullet_internalSetVectord(vertexObj, vertex))
 					{
@@ -6433,6 +6478,7 @@ static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVe
 					}
 				}
 			}
+			Py_DECREF(seqVerticesObj);
 		}
 	}
 	return numVerticesOut;
@@ -8688,7 +8734,7 @@ static int extractUVs(PyObject* uvsObj, double* uvs, int maxNumVertices)
 				}
 				for (i = 0; i < numVerticesSrc; i++)
 				{
-					PyObject* vertexObj = PySequence_GetItem(seqVerticesObj, i);
+					PyObject* vertexObj = PySequence_Fast_GET_ITEM(seqVerticesObj, i);
 					double uv[2];
 					if (pybullet_internalSetVector2d(vertexObj, uv))
 					{
@@ -8701,6 +8747,7 @@ static int extractUVs(PyObject* uvsObj, double* uvs, int maxNumVertices)
 					}
 				}
 			}
+			Py_DECREF(seqVerticesObj);
 		}
 	}
 	return numUVOut;
@@ -8734,6 +8781,7 @@ static int extractIndices(PyObject* indicesObj, int* indices, int maxNumIndices)
 					numIndicesOut++;
 				}
 			}
+			Py_DECREF(seqIndicesObj);
 		}
 	}
 	return numIndicesOut;

@@ -142,6 +142,8 @@ struct MeshTree
 	int m_refs;
 	bool m_dirty;
 	bool m_world;
+	// Set once the mesh has been rewritten: its tree then lives in a scene that refits instead of rebuilding.
+	bool m_refitting;
 	// The body transform a world tree was built for; the body counts as moved once it differs.
 	float m_pose[16];
 };
@@ -1073,6 +1075,7 @@ struct SwarmRaycast::Data
 		tree->m_refs = 1;
 		tree->m_dirty = false;
 		tree->m_world = false;
+		tree->m_refitting = false;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true);
@@ -1103,6 +1106,7 @@ struct SwarmRaycast::Data
 		tree->m_refs = 1;
 		tree->m_dirty = false;
 		tree->m_world = true;
+		tree->m_refitting = false;
 		memcpy(tree->m_pose, transform, sizeof(tree->m_pose));
 		const unsigned long long key = treeCacheKey(model, worldTransform, localScaling);
 		char path[1024];
@@ -1139,6 +1143,7 @@ struct SwarmRaycast::Data
 		tree->m_refs = 1;
 		tree->m_dirty = false;
 		tree->m_world = false;
+		tree->m_refitting = false;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true, false);
@@ -1175,8 +1180,22 @@ struct SwarmRaycast::Data
 			return;
 		copyLocalVertices(model, tree.m_vertices);
 		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs, true);
-		rtcSetGeometryBuildQuality(tree.m_geometry, RTC_BUILD_QUALITY_REFIT);
-		rtcUpdateGeometryBuffer(tree.m_geometry, RTC_BUFFER_TYPE_VERTEX, 0);
+		// A medium-quality scene ignores the geometry's refit quality and rebuilds its whole tree on every commit,
+		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
+		if (!tree.m_refitting)
+		{
+			rtcReleaseGeometry(tree.m_geometry);
+			rtcReleaseScene(tree.m_scene);
+			tree.m_scene = rtcNewScene(m_device);
+			rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC);
+			rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_LOW);
+			tree.m_geometry = newTriangles(m_device, tree.m_vertices, tree.m_indices);
+			rtcSetGeometryBuildQuality(tree.m_geometry, RTC_BUILD_QUALITY_REFIT);
+			rtcAttachGeometry(tree.m_scene, tree.m_geometry);
+			tree.m_refitting = true;
+		}
+		else
+			rtcUpdateGeometryBuffer(tree.m_geometry, RTC_BUFFER_TYPE_VERTEX, 0);
 		rtcCommitGeometry(tree.m_geometry);
 		rtcCommitScene(tree.m_scene);
 		tree.m_dirty = false;
@@ -1220,6 +1239,8 @@ struct SwarmRaycast::Data
 		else if (inst->m_tree->m_dirty)
 		{
 			refitTree(model, *inst->m_tree);
+			rtcSetGeometryInstancedScene(inst->m_geometry, inst->m_tree->m_scene);
+			rtcSetGeometryInstancedScene(inst->m_shadowGeometry, inst->m_tree->m_scene);
 			changed = true;
 		}
 		// A world tree already sits in world space, so its instance carries the identity.
