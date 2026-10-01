@@ -36,6 +36,11 @@ def render(flags, eye=(3.0, -3.0, 2.5), target=(0, 0, 0.4), **extra):
   return rgb, np.asarray(depth).reshape(SIZE, SIZE), seg
 
 
+def square(x, y, z, r):
+  """Corners of a level square of half side r centred on (x, y, z), anticlockwise from above."""
+  return [[x - r, y - r, z], [x + r, y - r, z], [x + r, y + r, z], [x - r, y + r, z]]
+
+
 def near_a_mask_change(seg, radius):
   """Pixels within radius of a neighbour that belongs to another object."""
   change = np.zeros((SIZE, SIZE), dtype=bool)
@@ -130,12 +135,71 @@ class TestEdgeAntialias(unittest.TestCase):
     self.assertEqual(seg.tobytes(), seg_aa.tobytes())
 
 
+@unittest.skipUnless(hasattr(p, "ER_SWARM_EDGE_OUTLINE"), "wheel built without outline-only edges")
+class TestEdgeOutline(unittest.TestCase):
+  """ER_SWARM_EDGE_OUTLINE: silhouettes and depth jumps blend as before, creases inside one body keep the first ray."""
+
+  BASE = TestEdgeAntialias.BASE
+  AA = TestEdgeAntialias.AA
+  OUTLINE = AA | getattr(p, "ER_SWARM_EDGE_OUTLINE", 0)
+
+  def setUp(self):
+    """Connects and builds the scene."""
+    p.connect(p.DIRECT)
+    build_world()
+
+  def tearDown(self):
+    """Disconnects."""
+    p.disconnect()
+
+  def test_without_edge_antialias_nothing_changes(self):
+    """The flag alone leaves every colour, depth and mask byte as it was."""
+    rgb, depth, seg = render(self.BASE)
+    rgb_o, depth_o, seg_o = render(self.BASE | p.ER_SWARM_EDGE_OUTLINE)
+    self.assertEqual(rgb.tobytes(), rgb_o.tobytes())
+    self.assertEqual(depth.tobytes(), depth_o.tobytes())
+    self.assertEqual(seg.tobytes(), seg_o.tobytes())
+
+  def test_each_pixel_is_the_first_ray_or_the_blend(self):
+    """Depth and mask keep their bytes; every pixel is either the unblended one or the fully blended one, the
+    silhouettes all blended and some creases on the box and the sphere left as the first ray drew them."""
+    rgb, depth, seg = render(self.BASE)
+    rgb_aa, _, _ = render(self.AA)
+    rgb_o, depth_o, seg_o = render(self.OUTLINE)
+    self.assertEqual(depth.tobytes(), depth_o.tobytes())
+    self.assertEqual(seg.tobytes(), seg_o.tobytes())
+    plain = (rgb_o == rgb).all(axis=2)
+    blended = (rgb_o == rgb_aa).all(axis=2)
+    self.assertTrue((plain | blended).all())
+    silhouette = near_a_mask_change(seg, 0)
+    self.assertTrue(blended[silhouette].all())
+    crease = (rgb_aa != rgb).any(axis=2) & ~silhouette & (seg >= 1)
+    self.assertGreater(int(crease.sum()), 10)
+    self.assertGreater(int((crease & plain & ~blended).sum()), 10)
+
+  def test_a_jump_in_depth_inside_one_body_still_blends(self):
+    """A small tilted-lit square floating high over a large one, both in one body, blends its outline as without the
+    flag."""
+    shape = p.createVisualShape(p.GEOM_MESH, vertices=square(0, 0, 0, 6) + square(0.3, 0.2, 2.5, 0.7),
+                                indices=[0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+                                normals=[[0, 0, 1]] * 4 + [[0.6, 0, 0.8]] * 4, rgbaColor=[0.2, 0.8, 0.3, 1])
+    p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape, basePosition=[10, 0, 0])
+    above = {"eye": (10.2, -0.1, 6.0), "target": (10.0, 0.0, 0.0)}
+    rgb, _, seg = render(self.BASE, **above)
+    rgb_aa, _, _ = render(self.AA, **above)
+    rgb_o, _, _ = render(self.OUTLINE, **above)
+    self.assertEqual(len(np.unique(seg)), 1)
+    outline = (rgb_aa != rgb).any(axis=2)
+    self.assertGreater(int(outline.sum()), SIZE // 2)
+    self.assertTrue((rgb_o[outline] == rgb_aa[outline]).all())
+
+
 @NEEDS_FLAG
 class TestEdgeAntialiasThreads(unittest.TestCase):
   """The blended bytes do not depend on how many render threads are used."""
 
   def test_same_bytes_for_one_two_and_four_threads(self):
-    """Renders the scene in a fresh process per thread count and compares the colour hashes."""
+    """Renders the scene, also with outline-only edges, in a fresh process per thread count and compares the hashes."""
     digests = set()
     for threads in ("1", "2", "4"):
       env = dict(os.environ, SWARM_RENDER_THREADS=threads)
@@ -150,6 +214,10 @@ def colour_hash():
   build_world()
   rgb, _, _ = render(p.ER_NO_SEGMENTATION_MASK | p.ER_SWARM_RAYCAST | p.ER_TEXTURE_FILTER | p.ER_EDGE_ANTIALIAS, shadow=1)
   print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
+  if hasattr(p, "ER_SWARM_EDGE_OUTLINE"):
+    rgb, _, _ = render(p.ER_NO_SEGMENTATION_MASK | p.ER_SWARM_RAYCAST | p.ER_TEXTURE_FILTER | p.ER_EDGE_ANTIALIAS |
+                       p.ER_SWARM_EDGE_OUTLINE, shadow=1)
+    print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
   p.disconnect()
 
 

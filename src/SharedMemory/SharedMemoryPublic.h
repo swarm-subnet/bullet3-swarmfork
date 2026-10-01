@@ -916,6 +916,9 @@ enum EnumRendererAuxFlags
 	// Ray-cast colour path under linear light: the IR-cut filter out, surfaces reflect by their near-infrared albedo
 	// and the frame is written in grey.
 	ER_SWARM_NEAR_INFRARED = 131072,
+	// With ER_EDGE_ANTIALIAS: only outlines are smoothed, where a neighbour landed on another body or on a surface at
+	// least a fifth farther away, not every crease inside one body, such as between the leaves of a crown.
+	ER_SWARM_EDGE_OUTLINE = 262144,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.

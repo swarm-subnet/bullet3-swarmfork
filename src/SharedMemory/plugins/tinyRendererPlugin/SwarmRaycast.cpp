@@ -2404,6 +2404,9 @@ struct EdgeScratch
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
+// ER_SWARM_EDGE_OUTLINE's slack: a neighbour must lie about a fifth farther away, so the leaves of one crown, a few
+// per cent apart in depth, are not edges, while a crown against the ground or the trees well behind it is.
+const float kOutlineTolerance = 0.2f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
 
@@ -2933,8 +2936,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
-// off the straight line through its two neighbours on either axis.
-bool isEdge(const int* ids, const float* w, int width, int height, int row, int col)
+// off the straight line through its two neighbours on either axis by more than `tolerance` of its own.
+bool isEdge(const int* ids, const float* w, int width, int height, int row, int col, float tolerance)
 {
 	const size_t offset = (size_t)row * width + col;
 	const int id = ids[offset];
@@ -2942,7 +2945,7 @@ bool isEdge(const int* ids, const float* w, int width, int height, int row, int 
 	if ((hasLeft && ids[offset - 1] != id) || (hasRight && ids[offset + 1] != id) ||
 		(hasUp && ids[offset - width] != id) || (hasDown && ids[offset + width] != id))
 		return true;
-	const float limit = kEdgeTolerance * fabsf(w[offset]);
+	const float limit = tolerance * fabsf(w[offset]);
 	if (hasLeft && hasRight && fabsf((w[offset - 1] + w[offset + 1]) - 2.0f * w[offset]) > limit)
 		return true;
 	if (hasUp && hasDown && fabsf((w[offset - width] + w[offset + width]) - 2.0f * w[offset]) > limit)
@@ -3120,12 +3123,13 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const double halfX = 1.0 / (double)width;
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
+	const float tolerance = job.m_shading->m_edgeOutline ? kOutlineTolerance : kEdgeTolerance;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
 		for (int col = col0; col < col1; col++)
 		{
-			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col))
+			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, tolerance))
 				continue;
 			const size_t offset = (size_t)row * width + col;
 			const double ndcX = pixelNdcX(col, width);
