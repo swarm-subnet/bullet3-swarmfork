@@ -130,8 +130,14 @@ public:
 	// first ray has landed.
 	// With alphaCutout a hit on a texel whose texture alpha is below the cut-out threshold is not a hit:
 	// the ray, and a shadow ray, carry on behind it, so colour, depth and shadow share the same holes.
+	// With reuseKey, the caller's bytes for everything else the frame reads: a lone camera asked again for its last
+	// frame (same key, size, projection, view, shading but the grain seeds, buffers and cut-outs), in a scene where
+	// nothing changed but movers whose boxes, before and after, stay clear of every ray that frame cast and of the
+	// light's way back from what they met, gets that frame's depth, mask and colour (radiance under thermal) again
+	// without tracing; the camera chain still runs with this request's seeds.
 	void render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
-				const SwarmRaycastShading* shading, int threads, bool alphaCutout = false) const;
+				const SwarmRaycastShading* shading, int threads, bool alphaCutout = false,
+				const void* reuseKey = 0, size_t reuseKeyBytes = 0) const;
 
 private:
 	struct Data;
