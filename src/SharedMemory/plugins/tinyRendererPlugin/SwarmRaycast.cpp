@@ -2056,32 +2056,6 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 	return true;
 }
 
-// Barycentric weights of corners 1 and 2 where the ray origin + s * dir meets the triangle's plane;
-// false when the ray runs along the plane. Used for the texture footprint of the neighbouring pixels.
-// `normal` must be the triangle's normal as wound, since the weights carry its sign.
-bool planeBarycentric(const float origin[3], const float dir[3], const float corners[3][3], const float normal[3], float& u, float& v)
-{
-	float e1[3], e2[3], toCorner[3], w[3], t1[3], t2[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = corners[1][i] - corners[0][i];
-		e2[i] = corners[2][i] - corners[0][i];
-		toCorner[i] = corners[0][i] - origin[i];
-	}
-	const float denom = dot3(dir, normal);
-	const float nn = dot3(normal, normal);
-	if (denom == 0.0f || nn == 0.0f)
-		return false;
-	const float s = dot3(toCorner, normal) / denom;
-	for (int i = 0; i < 3; i++)
-		w[i] = (origin[i] + dir[i] * s) - corners[0][i];
-	cross3(w, e2, t1);
-	cross3(e1, w, t2);
-	u = dot3(t1, normal) / nn;
-	v = dot3(t2, normal) / nn;
-	return true;
-}
-
 // TinyRenderer's fragment shader, term for term: interpolated normal and uv, the texture times the
 // object colour, ambient plus the shadowed diffuse and specular terms, truncated to bytes. A mesh
 // without vertex normals is lit by faceNormal, the triangle's own normal turned towards the camera.
@@ -2452,7 +2426,9 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
 }
 
-// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above.
+// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above: the
+// barycentric weights of corners 1 and 2 where each neighbour's ray meets the triangle's plane, skipped when that ray
+// runs along the plane. woundNormal must be the triangle's normal as wound, since the weights carry its sign.
 void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurface& surface, const float woundNormal[3], const RTCHit& hit,
 				 float duvdx[2], float duvdy[2])
 {
@@ -2462,13 +2438,32 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 	const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
 	const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
 	const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+	const float* origin = setup.m_cam.m_origin;
+	const float(*corners)[3] = surface.m_corners;
+	float e1[3], e2[3], toCorner[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = corners[1][i] - corners[0][i];
+		e2[i] = corners[2][i] - corners[0][i];
+		toCorner[i] = corners[0][i] - origin[i];
+	}
+	const float nn = dot3(woundNormal, woundNormal);
+	const float reach = dot3(toCorner, woundNormal);
 	for (int k = 0; k < 2; k++)
 	{
-		float neighbourDir[3], u, v;
+		float neighbourDir[3], w[3], t1[3], t2[3];
 		for (int i = 0; i < 3; i++)
 			neighbourDir[i] = rawDir[i] + steps[k][i];
-		if (!planeBarycentric(setup.m_cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+		const float denom = dot3(neighbourDir, woundNormal);
+		if (denom == 0.0f || nn == 0.0f)
 			continue;
+		const float s = reach / denom;
+		for (int i = 0; i < 3; i++)
+			w[i] = (origin[i] + neighbourDir[i] * s) - corners[0][i];
+		cross3(w, e2, t1);
+		cross3(e1, w, t2);
+		const float u = dot3(t1, woundNormal) / nn;
+		const float v = dot3(t2, woundNormal) / nn;
 		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
 		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
 	}
