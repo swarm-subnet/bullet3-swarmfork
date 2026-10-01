@@ -90,22 +90,32 @@ public:
 
 	// Creates or refreshes the instance for renderObj from its model, world transform and scaling.
 	void syncObject(TinyRenderObjectData* renderObj, const btTransform& worldTransform, const btVector3& localScaling);
-	// Records that renderObj's vertices were rewritten in place; its tree is refitted at the next commit.
-	void meshChanged(TinyRenderObjectData* renderObj);
+	// Records that renderObj's vertices were rewritten in place; its tree is refitted at the next commit. True when that
+	// tree also serves other render objects, which then refit it at their next sync.
+	bool meshChanged(TinyRenderObjectData* renderObj);
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
-	// Rebuilds the top-level tree after a batch of sync calls.
-	void commit();
+	// Rebuilds the top-level tree after a batch of sync calls. The mover tree, read only by mover shadows, is rebuilt
+	// when moverShadows asks for it, from whatever the movers are by then.
+	void commit(bool moverShadows);
+
+	// What a colour pixel shows where no drawn surface is shaded, asked for that pixel alone; row in output order.
+	struct Background
+	{
+		virtual void pixel(int row, int col, unsigned char out[3]) const = 0;
+	};
 
 	// One camera of a render: its view matrix and the buffers it writes. m_seg may be null, and m_rgb
 	// may be null only on a render with no shading; it is width * height * 3 bytes, rows in output
-	// order, and only hit pixels are written.
+	// order, and only hit pixels are written unless m_background is given, which then fills every other
+	// pixel. Without it a pixel no surface shades keeps the bytes it had.
 	struct Target
 	{
 		const float* m_view;
 		float* m_depth;
 		int* m_seg;
 		unsigned char* m_rgb;
+		const Background* m_background;
 	};
 
 	// One ray per pixel at the pixel corner, like TinyRenderer, rows already in output order. A hit

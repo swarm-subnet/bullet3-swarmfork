@@ -85,8 +85,11 @@ struct TinyRendererObjectArray
 	int m_linkIndex;
 	btTransform m_worldTransform;
 	btVector3 m_localScaling;
+	// Set while the ray-cast scene has not yet seen this pose, this scaling or a change to one of the render objects.
+	bool m_raycastDirty;
 
 	TinyRendererObjectArray()
+		: m_raycastDirty(true)
 	{
 		m_worldTransform.setIdentity();
 		m_localScaling.setValue(1, 1, 1);
@@ -178,6 +181,8 @@ struct TinyRendererVisualShapeConverterInternalData
 #ifdef SWARM_RAYCAST
 	// Created on the first ER_SWARM_RAYCAST render and kept in step with the render objects from then on.
 	SwarmRaycast* m_raycast;
+	// Set when a rewritten mesh tree also serves other render objects, so the next sync takes every object.
+	bool m_raycastSyncAll;
 #endif
 
 	TinyRendererVisualShapeConverterInternalData()
@@ -226,7 +231,7 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_batchCameraCount(1),
 		m_batchReadCamera(0)
 #ifdef SWARM_RAYCAST
-		, m_raycast(0)
+		, m_raycast(0), m_raycastSyncAll(false)
 #endif
 	{
 		m_depthBuffer.resize(m_swWidth * m_swHeight);
@@ -242,21 +247,25 @@ struct TinyRendererVisualShapeConverterInternalData
 	}
 
 #ifdef SWARM_RAYCAST
-	// Brings every render object into the ray-cast scene and rebuilds the top-level tree.
-	SwarmRaycast& syncRaycast()
+	// Brings every render object that changed since the last call into the ray-cast scene, in the same order as a
+	// full sync, and rebuilds the top-level tree; an unchanged object would leave the scene as it is. The mover tree
+	// is brought up to date only for a frame that casts mover shadows.
+	SwarmRaycast& syncRaycast(bool moverShadows)
 	{
 		if (!m_raycast)
 			m_raycast = new SwarmRaycast();
 		for (int n = 0; n < m_swRenderInstances.size(); n++)
 		{
 			TinyRendererObjectArray** visualArrayPtr = m_swRenderInstances.getAtIndex(n);
-			if (0 == visualArrayPtr)
+			if (0 == visualArrayPtr || !(m_raycastSyncAll || (*visualArrayPtr)->m_raycastDirty))
 				continue;
 			TinyRendererObjectArray* visualArray = *visualArrayPtr;
+			visualArray->m_raycastDirty = false;
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
 		}
-		m_raycast->commit();
+		m_raycastSyncAll = false;
+		m_raycast->commit(moverShadows);
 		return *m_raycast;
 	}
 
@@ -1306,6 +1315,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			TinyRendererObjectArray* visuals = *visualsPtr;
 			visuals->m_objectUniqueId = bodyUniqueId;
 			visuals->m_linkIndex = linkIndex;
+			visuals->m_raycastDirty = true;
 
 			b3VisualShapeData visualShape;
 			visualShape.m_objectUniqueId = bodyUniqueId;
@@ -1633,6 +1643,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 				visuals->m_linkIndex = linkIndex;
 				visuals->m_objectUniqueId = bodyUniqueId;
 				visuals->m_renderObjects.push_back(tinyObj);
+				visuals->m_raycastDirty = true;
 			}
 			
 			shapes1->push_back(visualShape);
@@ -1655,9 +1666,10 @@ void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVe
 
 			if (renderObj->m_model->nverts() == numVertices)
 			{
+				visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-				if (m_data->m_raycast)
-					m_data->m_raycast->meshChanged(renderObj);
+				if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+					m_data->m_raycastSyncAll = true;
 #endif
 				TinyRender::Vec3f* verts = renderObj->m_model->readWriteVertices();
 				//just do a sync
@@ -1728,6 +1740,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
@@ -1770,6 +1783,7 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
@@ -1830,14 +1844,19 @@ void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 	for (int i = 0; i < numPixels; ++i)
 		depth[i] = -farPlane;
 
-	if (!depthOnly)
+	if (!depthOnly && numPixels)
 	{
-		for (int y = 0; y < m_data->m_swHeight; ++y)
-			for (int x = 0; x < m_data->m_swWidth; ++x)
-				m_data->m_rgbColorBuffer.set(x, y, clearColor);
+		// The first row is set pixel by pixel, then copied into every other row.
+		for (int x = 0; x < m_data->m_swWidth; ++x)
+			m_data->m_rgbColorBuffer.set(x, 0, clearColor);
+		unsigned char* rgb = m_data->m_rgbColorBuffer.buffer();
+		const size_t rowBytes = (size_t)m_data->m_swWidth * m_data->m_rgbColorBuffer.get_bytespp();
+		for (int y = 1; y < m_data->m_swHeight; ++y)
+			memcpy(rgb + y * rowBytes, rgb, rowBytes);
 
-		float* shadow = numPixels ? &m_data->m_shadowBuffer[0] : 0;
-		for (int i = 0; i < numPixels; ++i)
+		// Only the rasterised path draws into the shadow buffer.
+		float* shadow = (m_data->m_flags & ER_SWARM_RAYCAST) == 0 ? &m_data->m_shadowBuffer[0] : 0;
+		for (int i = 0; shadow && i < numPixels; ++i)
 			shadow[i] = -1e30f;
 	}
 
@@ -1855,85 +1874,120 @@ static unsigned char skyByte(float v)
 	return (unsigned char)(v * 255.f + 0.5f);
 }
 
-// Colour buffer only: each pixel's view ray is lifted to world space and either read from the
+// The sky behind one frame: each pixel's view ray is lifted to world space and either read from the
 // sun sky map, or its component along the up axis blends horizon (level or below) into zenith
 // (straight up).
-void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky, bool daylight)
+struct SkyView
 {
-	const int width = m_data->m_swWidth;
-	const int height = m_data->m_swHeight;
-	const int up = m_data->m_upAxis;
-	// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
-	// world space takes the rows of the inverse view rotation, the sun sky all three.
-	const float invP00 = 1.f / projMat[0];
-	const float invP11 = 1.f / projMat[5];
-	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
-	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+	int m_width;
+	int m_height;
+	float m_invP00;
+	float m_invP11;
+	const float* m_view;
+	const SwarmSky* m_sunSky;
+	bool m_daylight;
+	float m_horizon[3];
+	float m_rise[3];
+	float m_up[3];
+	const float* m_invRayLen;
 
-	if (sunSky)
+	// The colour of column x of buffer row y, in the row order of the rasterised path, before its flip.
+	void paint(int x, int y, unsigned char out[3]) const
 	{
-		for (int y = 0; y < height; ++y)
+		// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
+		// world space takes the rows of the inverse view rotation, the sun sky all three.
+		const float dy = (2.f * (y + 0.5f) / m_height - 1.f) * m_invP11;
+		const float dx = (2.f * (x + 0.5f) / m_width - 1.f) * m_invP00;
+		if (m_sunSky)
 		{
-			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
-			for (int x = 0; x < width; ++x, pixel += bytespp)
-			{
-				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-				const float wx = viewMat[0] * dx + viewMat[1] * dy - viewMat[2];
-				const float wy = viewMat[4] * dx + viewMat[5] * dy - viewMat[6];
-				const float wz = viewMat[8] * dx + viewMat[9] * dy - viewMat[10];
-				if (daylight)
-					sunSky->lookupDisplay(wx, wy, wz, pixel);
-				else
-					sunSky->lookup(wx, wy, wz, pixel);
-			}
+			const float wx = m_view[0] * dx + m_view[1] * dy - m_view[2];
+			const float wy = m_view[4] * dx + m_view[5] * dy - m_view[6];
+			const float wz = m_view[8] * dx + m_view[9] * dy - m_view[10];
+			if (m_daylight)
+				m_sunSky->lookupDisplay(wx, wy, wz, out);
+			else
+				m_sunSky->lookup(wx, wy, wz, out);
+			return;
 		}
+		// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
+		float t = (m_up[0] * dx + m_up[1] * dy - m_up[2]) * m_invRayLen[y * m_width + x];
+		t = t < 0.f ? 0.f : t;
+		out[0] = skyByte(m_horizon[0] + m_rise[0] * t);
+		out[1] = skyByte(m_horizon[1] + m_rise[1] * t);
+		out[2] = skyByte(m_horizon[2] + m_rise[2] * t);
+	}
+};
+
+#ifdef SWARM_RAYCAST
+// The sky of the pixels the ray caster finds empty; its rows run in output order, so its row r is buffer row height - 1 - r.
+struct RaycastSky : public SwarmRaycast::Background
+{
+	const SkyView* m_sky;
+
+	void pixel(int row, int col, unsigned char out[3]) const
+	{
+		m_sky->paint(col, m_sky->m_height - 1 - row, out);
+	}
+};
+#endif
+
+// Fills `sky` for this camera, and the per-pixel ray lengths a flat sky reads when the frame size or projection changed.
+static void prepareSky(TinyRendererVisualShapeConverterInternalData* data, const float viewMat[16], const float projMat[16], const SwarmSky* sunSky,
+					   bool daylight, SkyView& sky)
+{
+	const int width = data->m_swWidth;
+	const int height = data->m_swHeight;
+	const int up = data->m_upAxis;
+	sky.m_width = width;
+	sky.m_height = height;
+	sky.m_invP00 = 1.f / projMat[0];
+	sky.m_invP11 = 1.f / projMat[5];
+	sky.m_view = viewMat;
+	sky.m_sunSky = sunSky;
+	sky.m_daylight = daylight;
+	sky.m_invRayLen = 0;
+	if (sunSky)
 		return;
+	for (int i = 0; i < 3; i++)
+	{
+		sky.m_horizon[i] = (float)data->m_skyHorizonColor[i];
+		sky.m_rise[i] = (float)data->m_skyZenithColor[i] - sky.m_horizon[i];
+		sky.m_up[i] = viewMat[up * 4 + i];
 	}
 
-	const float hr = (float)m_data->m_skyHorizonColor[0];
-	const float hg = (float)m_data->m_skyHorizonColor[1];
-	const float hb = (float)m_data->m_skyHorizonColor[2];
-	const float sr = (float)m_data->m_skyZenithColor[0] - hr;
-	const float sg = (float)m_data->m_skyZenithColor[1] - hg;
-	const float sb = (float)m_data->m_skyZenithColor[2] - hb;
-	const float rx = viewMat[up * 4 + 0];
-	const float ry = viewMat[up * 4 + 1];
-	const float rz = viewMat[up * 4 + 2];
-
 	// The ray lengths depend only on the resolution and projection, so they are kept between frames.
-	if (m_data->m_skyRayWidth != width || m_data->m_skyRayHeight != height || m_data->m_skyRayInvP00 != invP00 || m_data->m_skyRayInvP11 != invP11)
+	const float invP00 = sky.m_invP00;
+	const float invP11 = sky.m_invP11;
+	if (data->m_skyRayWidth != width || data->m_skyRayHeight != height || data->m_skyRayInvP00 != invP00 || data->m_skyRayInvP11 != invP11)
 	{
-		m_data->m_skyInvRayLen.resize(width * height);
+		data->m_skyInvRayLen.resize(width * height);
 		for (int y = 0; y < height; ++y)
 		{
 			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
 			for (int x = 0; x < width; ++x)
 			{
 				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-				m_data->m_skyInvRayLen[y * width + x] = 1.f / sqrtf(dx * dx + dy * dy + 1.f);
+				data->m_skyInvRayLen[y * width + x] = 1.f / sqrtf(dx * dx + dy * dy + 1.f);
 			}
 		}
-		m_data->m_skyRayWidth = width;
-		m_data->m_skyRayHeight = height;
-		m_data->m_skyRayInvP00 = invP00;
-		m_data->m_skyRayInvP11 = invP11;
+		data->m_skyRayWidth = width;
+		data->m_skyRayHeight = height;
+		data->m_skyRayInvP00 = invP00;
+		data->m_skyRayInvP11 = invP11;
 	}
+	sky.m_invRayLen = &data->m_skyInvRayLen[0];
+}
 
-	// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
-	const float* invLen = &m_data->m_skyInvRayLen[0];
-	for (int y = 0; y < height; ++y)
-	{
-		const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
-		for (int x = 0; x < width; ++x, pixel += bytespp)
-		{
-			const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-			float t = (rx * dx + ry * dy - rz) * invLen[y * width + x];
-			t = t < 0.f ? 0.f : t;
-			pixel[0] = skyByte(hr + sr * t);
-			pixel[1] = skyByte(hg + sg * t);
-			pixel[2] = skyByte(hb + sb * t);
-		}
-	}
+// Colour buffer only: every pixel takes its sky, for the rasterised path to draw over.
+void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky, bool daylight)
+{
+	SkyView sky;
+	prepareSky(m_data, viewMat, projMat, sunSky, daylight, sky);
+	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
+	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+	for (int y = 0; y < sky.m_height; ++y)
+		for (int x = 0; x < sky.m_width; ++x, pixel += bytespp)
+			sky.paint(x, y, pixel);
 }
 
 void TinyRendererVisualShapeConverter::setBatchReadCamera(int camIndex)
@@ -2040,7 +2094,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 #ifdef SWARM_RAYCAST
-		const SwarmRaycast& raycast = m_data->syncRaycast();
+		const SwarmRaycast& raycast = m_data->syncRaycast(false);
 		// All cameras go into one tile schedule, so the threads share the whole batch, not one camera each.
 		btAlignedObjectArray<SwarmRaycast::Target> targets;
 		targets.resize(numCameras);
@@ -2053,6 +2107,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 			targets[cam].m_depth = zbuf;
 			targets[cam].m_seg = 0;
 			targets[cam].m_rgb = 0;
+			targets[cam].m_background = 0;
 		}
 		raycast.render(&targets[0], numCameras, projMat, width, height, 0, renderThreads, (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else
@@ -2178,12 +2233,24 @@ void TinyRendererVisualShapeConverter::render()
 	render(viewMat, projMat);
 }
 
+// True when two poses and scalings hold the same bits in every component a render reads.
+static bool samePose(const btTransform& a, const btVector3& aScaling, const btTransform& b, const btVector3& bScaling)
+{
+	const size_t row = 3 * sizeof(btScalar);
+	for (int r = 0; r < 3; r++)
+		if (memcmp(&a.getBasis()[r][0], &b.getBasis()[r][0], row) != 0)
+			return false;
+	return memcmp(&a.getOrigin()[0], &b.getOrigin()[0], row) == 0 && memcmp(&aScaling[0], &bScaling[0], row) == 0;
+}
+
 void TinyRendererVisualShapeConverter::syncTransform(int shapeUniqueId, const btTransform& worldTransform, const btVector3& localScaling)
 {
 	TinyRendererObjectArray** renderObjPtr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (renderObjPtr)
 	{
 		TinyRendererObjectArray* renderObj = *renderObjPtr;
+		if (!samePose(renderObj->m_worldTransform, renderObj->m_localScaling, worldTransform, localScaling))
+			renderObj->m_raycastDirty = true;
 		renderObj->m_worldTransform = worldTransform;
 		renderObj->m_localScaling = localScaling;
 	}
@@ -2326,7 +2393,13 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			glint.m_skyZenith[i] = (float)m_data->m_skyZenithColor[i];
 		}
 	}
-	if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
+	const bool sky = (sunSky || m_data->m_hasSky) && !depthOnly && !thermal;
+	// The ray caster paints its own sky; a build without it keeps the painted one on the warning path below.
+	bool raycastSky = false;
+#ifdef SWARM_RAYCAST
+	raycastSky = (m_data->m_flags & ER_SWARM_RAYCAST) != 0;
+#endif
+	if (sky && !raycastSky)
 	{
 		paintSky(viewMat, projMat, sunSky, daylight);
 	}
@@ -2334,14 +2407,16 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 		// Depth, segmentation and colour come from the ray caster, already in output row order; a
-		// pixel that hits nothing keeps what clearBuffers left in it.
+		// pixel that hits nothing takes the sky, or keeps what clearBuffers left in it when there is none.
 #ifdef SWARM_RAYCAST
 		const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
 		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
-		// The sky is painted for the flip the rasterised path does once it has drawn; this path
-		// writes its rows the right way up and never flips, so the sky is turned over here.
-		if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
-			m_data->m_rgbColorBuffer.flip_vertically();
+		// The ray caster asks for the sky only where a ray meets nothing.
+		SkyView skyView;
+		RaycastSky background;
+		background.m_sky = &skyView;
+		if (sky && numPixels)
+			prepareSky(m_data, viewMat, projMat, sunSky, daylight, skyView);
 		SwarmRaycastShading shading;
 		for (int i = 0; i < 3; i++)
 		{
@@ -2376,7 +2451,8 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
 		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
-		m_data->syncRaycast().render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
+		target.m_background = (sky && numPixels) ? &background : 0;
+		m_data->syncRaycast(shading.m_moverShadow).render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
 									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else
@@ -2593,7 +2669,9 @@ void TinyRendererVisualShapeConverter::setWidthAndHeight(int width, int height)
 	m_data->m_depthBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_shadowBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_segmentationMaskBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
-	m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
+	// Every frame writes each colour pixel before it is read, so a buffer of the right size is kept.
+	if (m_data->m_rgbColorBuffer.get_width() != width || m_data->m_rgbColorBuffer.get_height() != height)
+		m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
 }
 
 void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixelsRGBA, int rgbaBufferSizeInPixels,
@@ -2645,10 +2723,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 
 		if (segmentationMaskBuffer)
 		{
+			const int* src = &m_data->m_segmentationMaskBuffer[startPixelIndex];
+			const bool objectOnly = (m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				int segMask = m_data->m_segmentationMaskBuffer[i + startPixelIndex];
-				if ((m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0)
+				int segMask = src[i];
+				if (objectOnly)
 				{
 					//if we don't explicitly request link index, clear it out
 					//object index are the lower 24bits
@@ -2664,11 +2744,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 		// In depth-only mode nothing was shaded, so the color buffer holds no image.
 		if (pixelsRGBA && !depthOnly)
 		{
+			const unsigned char* rgb = m_data->m_rgbColorBuffer.buffer() + (size_t)startPixelIndex * 3;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				pixelsRGBA[i * numBytesPerPixel] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 0];
-				pixelsRGBA[i * numBytesPerPixel + 1] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 1];
-				pixelsRGBA[i * numBytesPerPixel + 2] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 2];
+				pixelsRGBA[i * numBytesPerPixel] = rgb[i * 3 + 0];
+				pixelsRGBA[i * numBytesPerPixel + 1] = rgb[i * 3 + 1];
+				pixelsRGBA[i * numBytesPerPixel + 2] = rgb[i * 3 + 2];
 				pixelsRGBA[i * numBytesPerPixel + 3] = 255;
 			}
 		}
@@ -2709,9 +2790,10 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 			}
 			model->recomputeNormals();
 			renderObj->computeLocalAABB();
+			visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-			if (m_data->m_raycast)
-				m_data->m_raycast->meshChanged(renderObj);
+			if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+				m_data->m_raycastSyncAll = true;
 #endif
 			updated++;
 		}
@@ -2805,6 +2887,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 
 			if (visualArray->m_objectUniqueId == bodyUniqueId && visualArray->m_linkIndex == jointIndex)
 			{
+				visualArray->m_raycastDirty = true;
 				for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				{
 					TinyRenderObjectData* renderObj = visualArray->m_renderObjects[v];
