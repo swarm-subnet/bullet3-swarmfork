@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds Embree 4.4.1 as static libraries for the ray-cast depth backend: one AVX2 code path, no runtime
-# dispatch, every hardware reciprocal replaced by IEEE division (exact_division.patch), single-threaded
-# tree builds, and a built tree saved and loaded as one image (tree_cache.patch). The compiled copy is kept
-# in a cache keyed by Embree version, patches, this script (the flags) and the compiler, and copied into
-# prefix/ next to this script; a key already in the cache is never rebuilt. setup.py runs this on every
-# build and it returns at once when prefix/ carries the current key.
+# dispatch, no multiply-add fused by the compiler, every hardware reciprocal replaced by IEEE division
+# (exact_division.patch), single-threaded tree builds, and a built tree saved and loaded as one image
+# (tree_cache.patch). The compiled copy is kept in a cache keyed by Embree version, patches, this script (the
+# flags) and the compiler, and copied into prefix/ next to this script; a key already in the cache is never
+# rebuilt. setup.py runs this on every build and it returns at once when prefix/ carries the current key.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,8 +63,11 @@ if [[ ! -f "${CACHED}/lib/libembree4.a" ]]; then
     fi
 
     # One ISA compiled in and MAX_ISA=NONE: the library holds a single AVX2 code path and never dispatches.
+    # Embree's flags would leave GCC's C++ default -ffp-contract=fast: multiply-adds Embree never wrote, fused per compiler.
     cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DEMBREE_IGNORE_CMAKE_CXX_FLAGS=OFF \
+        -DCMAKE_CXX_FLAGS=-ffp-contract=off \
         -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
