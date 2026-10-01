@@ -2910,6 +2910,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
+			if (target.m_background && !(hit && sample.m_shaded))
+				target.m_background->pixel(row, col, &target.m_rgb[offset * 3]);
 			if (!hit)
 			{
 				if (scratch)
@@ -3205,6 +3207,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
 				Sample probe;
+				unsigned char background[3];
 				if (hasOwn)
 				{
 					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
@@ -3212,9 +3215,15 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
-					restColour = (traceRay(job, setup, px, py, args, shadowArgs, probe) && probe.m_shaded)
-									 ? probe.m_rgb
-									 : &scratch.m_background[offset * 3];
+					if (traceRay(job, setup, px, py, args, shadowArgs, probe) && probe.m_shaded)
+						restColour = probe.m_rgb;
+					else if (target.m_background)
+					{
+						target.m_background->pixel(row, col, background);
+						restColour = background;
+					}
+					else
+						restColour = &scratch.m_background[offset * 3];
 				}
 				for (int i = 0; i < 3; i++)
 					colour[i] += rest * (linear ? kSwarmSrgbToLinear[restColour[i]] : (double)restColour[i]);
@@ -3237,13 +3246,27 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		}
 	}
 }
+
+// Every pixel of a camera that traces no ray takes its background, when it has one.
+void fillBackground(const SwarmRaycast::Target& target, int width, int height)
+{
+	if (!target.m_background || !target.m_rgb)
+		return;
+	for (int row = 0; row < height; row++)
+		for (int col = 0; col < width; col++)
+			target.m_background->pixel(row, col, &target.m_rgb[((size_t)row * width + col) * 3]);
+}
 }  // namespace
 
 void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
 						  const SwarmRaycastShading* shading, int threads, bool alphaCutout) const
 {
 	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
+	{
+		for (int i = 0; i < numTargets && width > 0 && height > 0; i++)
+			fillBackground(targets[i], width, height);
 		return;
+	}
 	if (threads < 1)
 		threads = 1;
 
@@ -3303,7 +3326,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		CameraSetup& setup = setups[(size_t)i];
 		setup.m_valid = setupCamera(targets[i].m_view, projMat, setup.m_cam);
 		if (!setup.m_valid)
+		{
+			fillBackground(targets[i], width, height);
 			continue;
+		}
 		// The unnormalised ray direction is affine in the pixel position, so the direction one pixel to
 		// the right or one row up is the pixel's own direction plus a constant step.
 		for (int k = 0; k < 3; k++)
@@ -3336,7 +3362,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		scratch[i].m_ids.assign(numPixels, -1);
 		scratch[i].m_hits.assign(numPixels, none);
 		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
-		scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
+		if (!targets[i].m_background)
+			scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 	}
 
 	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera

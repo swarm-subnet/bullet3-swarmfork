@@ -97,15 +97,23 @@ public:
 	// Rebuilds the top-level tree after a batch of sync calls.
 	void commit();
 
+	// What a colour pixel shows where no drawn surface is shaded, asked for that pixel alone; row in output order.
+	struct Background
+	{
+		virtual void pixel(int row, int col, unsigned char out[3]) const = 0;
+	};
+
 	// One camera of a render: its view matrix and the buffers it writes. m_seg may be null, and m_rgb
 	// may be null only on a render with no shading; it is width * height * 3 bytes, rows in output
-	// order, and only hit pixels are written.
+	// order, and only hit pixels are written unless m_background is given, which then fills every other
+	// pixel. Without it a pixel no surface shades keeps the bytes it had.
 	struct Target
 	{
 		const float* m_view;
 		float* m_depth;
 		int* m_seg;
 		unsigned char* m_rgb;
+		const Background* m_background;
 	};
 
 	// One ray per pixel at the pixel corner, like TinyRenderer, rows already in output order. A hit
