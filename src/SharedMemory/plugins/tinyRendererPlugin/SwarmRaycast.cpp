@@ -330,6 +330,9 @@ inline float placementSign(const float* t)
 // full search when the next hit lies inside the window or the nearest is seen too obliquely for the window to hold.
 struct HintedSearch
 {
+	// The ray's world direction, and the coordinate size its window allows for.
+	float m_dir[3];
+	float m_largest;
 	float m_limit;
 	float m_window;
 	float m_nearest;
@@ -338,7 +341,8 @@ struct HintedSearch
 	RTCHit m_hit;
 };
 thread_local HintedSearch* t_hintedSearch = 0;
-// Below this cosine between the ray and a face the face's own distance rounds beyond the window.
+// Below this cosine between the ray and a face, for coordinates of the window's size, the face's own distance rounds
+// beyond the window.
 const float kHintMinFacing = 1.0f / 16.0f;
 
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
@@ -432,6 +436,47 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 }
 
+// The cosine between a kept hit's face and the ray in world space, where its distance rounds, scaled down by how far the
+// coordinates of the hit's own frame outgrow the window's: the face's normal goes to world space through the inverse
+// transpose of its placement or instance, and the ray's origin there, over the ray's stretch, sizes the coordinates.
+float hintFacing(const RTCFilterFunctionNArguments* args, const RTCHit* hit, const RTCRay* ray, float t, const HintedSearch& search)
+{
+	const QueryContext* ctx = (const QueryContext*)args->context;
+	const float local[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
+	float normal[3] = {local[0], local[1], local[2]};
+	if (!args->geometryUserPtr)
+	{
+		unsigned placement = 0;
+		const Batch* batch = hitBatch(ctx, hit, placement);
+		const Instance* inst = batch ? 0 : hitInstance(ctx, hit);
+		if (batch)
+		{
+			const float* m = &batch->m_normalRotations[(size_t)placement * 9];
+			for (int r = 0; r < 3; r++)
+				normal[r] = dot3(m + r * 3, local);
+		}
+		else if (inst)
+		{
+			// Cofactors of the instance's 3x3 part: its inverse transpose up to a scale the cosine drops.
+			const float* m = inst->m_transform;
+			const float a[3] = {m[0], m[1], m[2]}, b[3] = {m[4], m[5], m[6]}, c[3] = {m[8], m[9], m[10]};
+			float rows[3][3];
+			cross3(b, c, rows[0]);
+			cross3(c, a, rows[1]);
+			cross3(a, b, rows[2]);
+			for (int r = 0; r < 3; r++)
+				normal[r] = (rows[0][r] * local[0] + rows[1][r] * local[1]) + rows[2][r] * local[2];
+		}
+		else
+			return 0.0f;
+	}
+	const float org[3] = {ray->org_x, ray->org_y, ray->org_z};
+	const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
+	const float size = sqrtf(dot3(org, org) / dot3(dir, dir)) + t;
+	const float scale = size > search.m_largest ? search.m_largest / size : 1.0f;
+	return fabsf(dot3(search.m_dir, normal)) / sqrtf(dot3(normal, normal)) * scale;
+}
+
 // The camera rays' filter: keepHit, and under a hinted search the note of each kept hit.
 void hitFilter(const RTCFilterFunctionNArguments* args)
 {
@@ -449,11 +494,7 @@ void hitFilter(const RTCFilterFunctionNArguments* args)
 		search->m_next = search->m_nearest;
 		search->m_nearest = t;
 		search->m_hit = *hit;
-		// The ray and the normal in the frame Embree tested them in, the hit's own instance.
-		const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
-		const float normal[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
-		const float facing = fabsf(dot3(dir, normal));
-		search->m_oblique = !(facing >= kHintMinFacing * sqrtf(dot3(dir, dir) * dot3(normal, normal)));
+		search->m_oblique = !(hintFacing(args, hit, ray, t, *search) >= kHintMinFacing);
 	}
 	else if (t < search->m_next)
 		search->m_next = t;
@@ -2861,6 +2902,9 @@ void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArgume
 			spread = step > spread ? step : spread;
 		}
 		HintedSearch search;
+		for (int k = 0; k < 3; k++)
+			search.m_dir[k] = dir[k];
+		search.m_largest = largest;
 		search.m_window = (spread + largest / kHintMinFacing + reach) * (8.0f / 16777216.0f);
 		search.m_limit = reach + 2.0f * search.m_window;
 		if (search.m_limit < end)
