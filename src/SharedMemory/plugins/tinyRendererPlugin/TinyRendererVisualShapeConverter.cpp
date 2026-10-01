@@ -27,6 +27,7 @@ subject to the following restrictions:
 #include <cstdio>
 #include "../../../../examples/Utils/b3ResourcePath.h"
 #include "../../../TinyRenderer/TinyRenderer.h"
+#include "SwarmDaylight.h"
 #include "SwarmSky.h"
 #include "../../../../examples/OpenGLWindow/SimpleCamera.h"
 #include "../../../../examples/Importers/ImportMeshUtility/b3ImportMeshUtility.h"
@@ -157,6 +158,14 @@ struct TinyRendererVisualShapeConverterInternalData
 	float m_airTemperature;
 	float m_skyTemperature;
 	int m_thermalSeed;
+	// ER_SWARM_LOW_LIGHT arguments, each kept until the next call sets it.
+	float m_sensorPhotons;
+	float m_sensorReadNoise;
+	float m_sensorGainCap;
+	int m_sensorSeed;
+	// The spot light of this request, off unless the request carries one.
+	bool m_hasSpotLight;
+	float m_spotLight[9];
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
@@ -207,6 +216,11 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_airTemperature(20.0f),
 		m_skyTemperature(-20.0f),
 		m_thermalSeed(0),
+		m_sensorPhotons(0.0f),
+		m_sensorReadNoise(0.0f),
+		m_sensorGainCap(16.0f),
+		m_sensorSeed(0),
+		m_hasSpotLight(false),
 		m_hasShadow(false),
 		m_flags(0),
 		m_batchCameraCount(1),
@@ -244,6 +258,59 @@ struct TinyRendererVisualShapeConverterInternalData
 		}
 		m_raycast->commit();
 		return *m_raycast;
+	}
+
+	// The spot light, the near infrared and the low-light camera of this request onto a colour frame's shading, whose
+	// light terms are already filled; `off` is a frame none of them reach, a depth or a thermal one.
+	void fillLowLight(SwarmRaycastShading& shading, bool off) const
+	{
+		shading.m_nearInfrared = !off && (m_flags & ER_SWARM_NEAR_INFRARED) != 0;
+		shading.m_lowLight = !off && (m_flags & ER_SWARM_LOW_LIGHT) != 0;
+		shading.m_sensorPhotons = m_sensorPhotons;
+		shading.m_sensorReadNoise = m_sensorReadNoise;
+		shading.m_sensorGainCap = m_sensorGainCap;
+		shading.m_sensorSeed = (unsigned int)m_sensorSeed;
+
+		// White balance to the light on level ground: the ambient term plus the direct light by its height.
+		const float up = shading.m_lightDir[m_upAxis] > 0.0f ? shading.m_lightDir[m_upAxis] : 0.0f;
+		float light[3];
+		for (int i = 0; i < 3; i++)
+			light[i] = shading.m_ambientCoeff * shading.m_ambientColor[i] + shading.m_diffuseCoeff * up * shading.m_lightColor[i];
+		const float white = (0.2126f * light[0] + 0.7152f * light[1]) + 0.0722f * light[2];
+		for (int i = 0; i < 3; i++)
+			shading.m_whiteBalance[i] = light[i] > 0.0f ? white / light[i] : 1.0f;
+
+		// The near infrared sees the lights by their strength alone.
+		if (shading.m_nearInfrared)
+		{
+			const float sun = (0.2126f * shading.m_lightColor[0] + 0.7152f * shading.m_lightColor[1]) + 0.0722f * shading.m_lightColor[2];
+			const float sky = (0.2126f * shading.m_ambientColor[0] + 0.7152f * shading.m_ambientColor[1]) + 0.0722f * shading.m_ambientColor[2];
+			for (int i = 0; i < 3; i++)
+			{
+				shading.m_lightColor[i] = sun;
+				shading.m_ambientColor[i] = sky;
+			}
+		}
+
+		// Half the intensity at the edge of the cone: full inside half its angle, none past 1.32 times it, smooth between.
+		const float* spot = m_spotLight;
+		float length = 0.0f;
+		for (int i = 0; m_hasSpotLight && i < 3; i++)
+			length += spot[3 + i] * spot[3 + i];
+		length = sqrtf(length);
+		shading.m_spot = !off && m_hasSpotLight && length > 0.0f && spot[6] > 0.0f && spot[7] > 0.0f && spot[8] > 0.0f;
+		if (!shading.m_spot)
+			return;
+		const double halfAngle = (double)spot[6] * 0.5 * (3.14159265358979323846 / 180.0);
+		for (int i = 0; i < 3; i++)
+		{
+			shading.m_spotPosition[i] = spot[i];
+			shading.m_spotDirection[i] = spot[3 + i] / length;
+		}
+		shading.m_spotCosInner = (float)swarmCos(0.5 * halfAngle);
+		shading.m_spotCosOuter = (float)swarmCos(1.3228756555322954 * halfAngle);
+		shading.m_spotRange = spot[7];
+		shading.m_spotIntensity = spot[8];
 	}
 #endif
 };
@@ -366,6 +433,33 @@ void TinyRendererVisualShapeConverter::setSkyTemperature(float celsius)
 void TinyRendererVisualShapeConverter::setThermalSeed(int seed)
 {
 	m_data->m_thermalSeed = seed;
+}
+
+void TinyRendererVisualShapeConverter::setSensorPhotons(float photons)
+{
+	m_data->m_sensorPhotons = photons > 0.0f ? photons : 0.0f;
+}
+
+void TinyRendererVisualShapeConverter::setSensorReadNoise(float electrons)
+{
+	m_data->m_sensorReadNoise = electrons > 0.0f ? electrons : 0.0f;
+}
+
+void TinyRendererVisualShapeConverter::setSensorGainCap(float gainCap)
+{
+	m_data->m_sensorGainCap = gainCap > 0.0f ? gainCap : 16.0f;
+}
+
+void TinyRendererVisualShapeConverter::setSensorSeed(int seed)
+{
+	m_data->m_sensorSeed = seed;
+}
+
+void TinyRendererVisualShapeConverter::setSpotLight(bool enabled, const float spot[9])
+{
+	m_data->m_hasSpotLight = enabled;
+	for (int i = 0; enabled && i < 9; i++)
+		m_data->m_spotLight[i] = spot[i];
 }
 
 // materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
@@ -2276,6 +2370,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_airTemperature = m_data->m_airTemperature;
 		shading.m_skyTemperature = m_data->m_skyTemperature;
 		shading.m_thermalSeed = (unsigned int)m_data->m_thermalSeed;
+		m_data->fillLowLight(shading, depthOnly || thermal);
 		SwarmRaycast::Target target;
 		target.m_view = viewMat;
 		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;

@@ -21,6 +21,7 @@
 #include "../../../TinyRenderer/TinyRenderer.h"
 #include "../../../TinyRenderer/SwarmGamma.h"
 #include "SwarmDaylight.h"
+#include "SwarmLowLight.h"
 #include "SwarmSky.h"
 #include "SwarmThermal.h"
 #include "Bullet3Common/b3Logging.h"
@@ -49,6 +50,8 @@ const int kPaneDepth = 3;
 const unsigned char kAlphaCutoff = 128;
 // A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
 const unsigned char kVeilCoverage = 8;
+// Near infrared: a leaf reflects about half of it, far more than of visible green, which is why foliage glows there.
+const float kLeafNearInfrared = 0.5f;
 
 inline float dot3(const float a[3], const float b[3])
 {
@@ -1878,6 +1881,46 @@ inline float powInt(float x, int e)
 	return result;
 }
 
+// Near-infrared albedo from a linear visible colour: at least its luminance and its red, since skin, soil and dyes
+// that reflect red reflect the near infrared too, raised towards a leaf's by how much green outweighs red and blue.
+inline float nearInfraredAlbedo(const float base[3])
+{
+	const float luminance = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
+	const float floor = luminance > base[0] ? luminance : base[0];
+	const float other = base[0] > base[2] ? base[0] : base[2];
+	float green = base[1] > other ? (base[1] - other) / base[1] : 0.0f;
+	green = green * 2.0f < 1.0f ? green * 2.0f : 1.0f;
+	return floor + (kLeafNearInfrared - floor) * green;
+}
+
+// Irradiance the spot light puts on a point facing `normal`: its intensity over the squared distance, times the
+// cosine at the surface, the smooth cone and the smooth end of its range.
+inline float spotIrradiance(const SwarmRaycastShading& shading, const float point[3], const float normal[3])
+{
+	float toLamp[3];
+	for (int i = 0; i < 3; i++)
+		toLamp[i] = shading.m_spotPosition[i] - point[i];
+	const float distance2 = dot3(toLamp, toLamp);
+	if (!(distance2 > 0.0f))
+		return 0.0f;
+	const float distance = sqrtf(distance2);
+	const float reach = distance / shading.m_spotRange;
+	if (!(reach < 1.0f))
+		return 0.0f;
+	for (int i = 0; i < 3; i++)
+		toLamp[i] /= distance;
+	const float facing = dot3(normal, toLamp);
+	const float axis = -dot3(shading.m_spotDirection, toLamp);
+	if (!(facing > 0.0f) || !(axis > shading.m_spotCosOuter))
+		return 0.0f;
+	float cone = (axis - shading.m_spotCosOuter) / (shading.m_spotCosInner - shading.m_spotCosOuter);
+	cone = cone < 1.0f ? cone : 1.0f;
+	cone = cone * cone * (3.0f - 2.0f * cone);
+	const float reach2 = reach * reach;
+	const float window = 1.0f - reach2 * reach2;
+	return shading.m_spotIntensity * facing * cone * (window * window) / distance2;
+}
+
 // Segmentation id of a hit, plus the surface when asked for; false for a hit the scene does not know.
 bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMember*>& members,
 				const std::vector<Instance*>& instances, const std::vector<Batch*>& batches, unsigned forestId,
@@ -2023,14 +2066,15 @@ bool planeBarycentric(const float origin[3], const float dir[3], const float cor
 // without vertex normals is lit by faceNormal, the triangle's own normal turned towards the camera.
 // With the glint on, the lit colour then blends towards the sky mirrored about the normal from viewDir.
 // With linear light the same terms run on the decoded value of the texture-times-colour byte, the
-// glint blends in linear too, and the byte written is the sRGB encoding of the result.
+// glint blends in linear too, and the byte written is the sRGB encoding of the result; the spot light
+// adds to it there, and in near infrared the colour becomes the near-infrared albedo.
 void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
 				   const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
 				   float distance, unsigned char out[3]);
 
 void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
 			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
-			  float distance, unsigned char out[3])
+			  float distance, const float point[3], unsigned char out[3])
 {
 	if (shading.m_daylight)
 	{
@@ -2073,10 +2117,23 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 	float lit[3];
 	if (shading.m_linearLight)
 	{
+		float base[3];
 		for (int i = 0; i < 3; i++)
+			base[i] = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+		if (shading.m_nearInfrared)
+			base[0] = base[1] = base[2] = nearInfraredAlbedo(base);
+		for (int i = 0; i < 3; i++)
+			lit[i] = shading.m_ambientCoeff * base[i] * shading.m_ambientColor[i] + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base[i] * shading.m_lightColor[i];
+		if (shading.m_spot)
 		{
-			const float base = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
-			lit[i] = shading.m_ambientCoeff * base * shading.m_ambientColor[i] + shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base * shading.m_lightColor[i];
+			// The lamp lights the side the camera sees, whichever way a double-sided face is wound.
+			float facing[3] = {normal[0], normal[1], normal[2]};
+			if (dot3(facing, faceNormal) < 0.0f)
+				for (int i = 0; i < 3; i++)
+					facing[i] = -facing[i];
+			const float lamp = spotIrradiance(shading, point, facing);
+			for (int i = 0; i < 3; i++)
+				lit[i] += lamp * base[i];
 		}
 		if (shading.m_glint.m_enabled)
 			shading.m_glint.applyLinear(normal, toCamera, &model->getSpecularColor()[0], lit);
@@ -2788,7 +2845,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		return true;
 	}
 
-	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, out.m_rgb);
+	const float point[3] = {hx, hy, hz};
+	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
 	return true;
 }
 
@@ -3332,4 +3390,23 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	for (int i = 0; thermal && i < numTargets; i++)
 		if (setups[(size_t)i].m_valid && targets[i].m_rgb)
 			SwarmThermal::develop(&radiance[(size_t)i * numPixels], width, height, shading->m_thermalSeed, threads, targets[i].m_rgb);
+
+	// The low-light camera and the grey of the near infrared work on the finished frame, sky and edges included.
+	if (shading && !thermal && (shading->m_lowLight || shading->m_nearInfrared))
+	{
+		SwarmLowLight::Settings camera;
+		camera.m_lowLight = shading->m_lowLight;
+		camera.m_grey = shading->m_nearInfrared;
+		camera.m_photons = shading->m_sensorPhotons;
+		camera.m_readNoise = shading->m_sensorReadNoise;
+		camera.m_gainCap = shading->m_sensorGainCap;
+		camera.m_seed = shading->m_sensorSeed;
+		for (int k = 0; k < 3; k++)
+			camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
+		// One thread: the chain is a dozen short passes, and on a busy box the barriers between them cost more than the
+		// passes; the bytes are the same at any count.
+		for (int i = 0; i < numTargets; i++)
+			if (setups[(size_t)i].m_valid && targets[i].m_rgb)
+				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, 1);
+	}
 }

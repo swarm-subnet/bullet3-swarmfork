@@ -296,6 +296,13 @@ struct RequestPixelDataArgs
 	float m_airTemperature;
 	float m_skyTemperature;
 	int m_thermalSeed;
+	// ER_SWARM_LOW_LIGHT arguments, carried under the same field bits
+	float m_sensorPhotons;
+	float m_sensorReadNoise;
+	float m_sensorGainCap;
+	int m_sensorSeed;
+	// A spot light for this request only: position, unit direction, full cone angle in degrees, range, intensity
+	float m_spotLight[9];
 };
 
 enum EnumRequestPixelDaylightFields
@@ -307,6 +314,11 @@ enum EnumRequestPixelDaylightFields
 	REQUEST_PIXEL_THERMAL_AIR = 16,
 	REQUEST_PIXEL_THERMAL_SKY = 32,
 	REQUEST_PIXEL_THERMAL_SEED = 64,
+	REQUEST_PIXEL_SENSOR_PHOTONS = 128,
+	REQUEST_PIXEL_SENSOR_READ_NOISE = 256,
+	REQUEST_PIXEL_SENSOR_GAIN_CAP = 512,
+	REQUEST_PIXEL_SENSOR_SEED = 1024,
+	REQUEST_PIXEL_SPOT_LIGHT = 2048,
 };
 
 enum EnumRequestPixelDataUpdateFlags

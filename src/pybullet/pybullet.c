@@ -10200,6 +10200,14 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	PyObject* thermalSeedObj = 0;
 	float airTemperature, skyTemperature;
 	int thermalSeed;
+	// ER_SWARM_LOW_LIGHT arguments; a negative value, or no seed, leaves the last setting in place
+	float sensorPhotons = -1;
+	float sensorReadNoise = -1;
+	float sensorGainCap = -1;
+	PyObject* sensorSeedObj = 0;
+	// a spot light for this request only: [x, y, z, dx, dy, dz, angleDegrees, range, intensity]
+	PyObject* spotLightObj = 0;
+	float spotLight[9];
 	int flags = -1;
 	int renderer = -1;
 	// inialize cmd
@@ -10207,11 +10215,31 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", "airTemperature", "skyTemperature", "thermalSeed", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", "airTemperature", "skyTemperature", "thermalSeed", "sensorPhotons", "sensorReadNoise", "sensorGainCap", "sensorSeed", "spotLight", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiffOOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius, &airTemperatureObj, &skyTemperatureObj, &thermalSeedObj))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiffOOOfffOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius, &airTemperatureObj, &skyTemperatureObj, &thermalSeedObj, &sensorPhotons, &sensorReadNoise, &sensorGainCap, &sensorSeedObj, &spotLightObj))
 	{
 		return NULL;
+	}
+	if (spotLightObj == Py_None)
+		spotLightObj = 0;
+	if (spotLightObj)
+	{
+		PyObject* seq = PySequence_Fast(spotLightObj, "spotLight must be a sequence of 9 numbers");
+		int i;
+		if (!seq)
+			return NULL;
+		if (PySequence_Fast_GET_SIZE(seq) != 9)
+		{
+			Py_DECREF(seq);
+			PyErr_SetString(SpamError, "spotLight takes [x, y, z, dx, dy, dz, angleDegrees, range, intensity].");
+			return NULL;
+		}
+		for (i = 0; i < 9; i++)
+			spotLight[i] = (float)PyFloat_AsDouble(PySequence_Fast_GET_ITEM(seq, i));
+		Py_DECREF(seq);
+		if (PyErr_Occurred())
+			return NULL;
 	}
 	if (airTemperatureObj == Py_None)
 		airTemperatureObj = 0;
@@ -10321,6 +10349,32 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	if (thermalSeedObj)
 	{
 		b3RequestCameraImageSetThermalSeed(command, thermalSeed);
+	}
+	if (sensorPhotons >= 0)
+	{
+		b3RequestCameraImageSetSensorPhotons(command, sensorPhotons);
+	}
+	if (sensorReadNoise >= 0)
+	{
+		b3RequestCameraImageSetSensorReadNoise(command, sensorReadNoise);
+	}
+	if (sensorGainCap >= 0)
+	{
+		b3RequestCameraImageSetSensorGainCap(command, sensorGainCap);
+	}
+	// any integer seeds the grain; its low 32 bits are what count
+	if (sensorSeedObj && sensorSeedObj != Py_None)
+	{
+		unsigned long seed = PyLong_AsUnsignedLongMask(sensorSeedObj);
+		if (PyErr_Occurred())
+		{
+			return NULL;
+		}
+		b3RequestCameraImageSetSensorSeed(command, (int)(unsigned int)seed);
+	}
+	if (spotLightObj)
+	{
+		b3RequestCameraImageSetSpotLight(command, spotLight, spotLight + 3, spotLight[6], spotLight[7], spotLight[8]);
 	}
 
 	if (flags >= 0)
@@ -13169,7 +13223,8 @@ static PyMethodDef SpamMethods[] = {
 	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky, "
 	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path, and under "
 	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius, and under "
-	 "ER_SWARM_THERMAL airTemperature, skyTemperature and thermalSeed), and return the "
+	 "ER_SWARM_THERMAL airTemperature, skyTemperature and thermalSeed, under ER_SWARM_LOW_LIGHT sensorPhotons, "
+	 "sensorReadNoise, sensorGainCap and sensorSeed, and spotLight for a lamp in this frame only), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
@@ -13635,6 +13690,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_LEAF_NO_SHADOW", ER_SWARM_LEAF_NO_SHADOW);
 	PyModule_AddIntConstant(m, "ER_SWARM_THERMAL", ER_SWARM_THERMAL);
+	PyModule_AddIntConstant(m, "ER_SWARM_LOW_LIGHT", ER_SWARM_LOW_LIGHT);
+	PyModule_AddIntConstant(m, "ER_SWARM_NEAR_INFRARED", ER_SWARM_NEAR_INFRARED);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

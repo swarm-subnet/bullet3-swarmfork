@@ -4423,6 +4423,16 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 							m_data->m_pluginManager.getRenderInterface()->setSkyTemperature(clientCmd.m_requestPixelDataArguments.m_skyTemperature);
 						if ((fields & REQUEST_PIXEL_THERMAL_SEED) != 0)
 							m_data->m_pluginManager.getRenderInterface()->setThermalSeed(clientCmd.m_requestPixelDataArguments.m_thermalSeed);
+						if ((fields & REQUEST_PIXEL_SENSOR_PHOTONS) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorPhotons(clientCmd.m_requestPixelDataArguments.m_sensorPhotons);
+						if ((fields & REQUEST_PIXEL_SENSOR_READ_NOISE) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorReadNoise(clientCmd.m_requestPixelDataArguments.m_sensorReadNoise);
+						if ((fields & REQUEST_PIXEL_SENSOR_GAIN_CAP) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorGainCap(clientCmd.m_requestPixelDataArguments.m_sensorGainCap);
+						if ((fields & REQUEST_PIXEL_SENSOR_SEED) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorSeed(clientCmd.m_requestPixelDataArguments.m_sensorSeed);
+						// The spot light is per request, so a lamp never outlives the frame that asked for it.
+						m_data->m_pluginManager.getRenderInterface()->setSpotLight((fields & REQUEST_PIXEL_SPOT_LIGHT) != 0, clientCmd.m_requestPixelDataArguments.m_spotLight);
 						m_data->m_pluginManager.getRenderInterface()->setSkyPhoto((fields & REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO) != 0, clientCmd.m_requestPixelDataArguments.m_skyTextureId, clientCmd.m_requestPixelDataArguments.m_skyYaw);
 					}
 

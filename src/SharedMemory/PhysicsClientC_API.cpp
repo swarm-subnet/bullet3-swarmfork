@@ -4732,6 +4732,50 @@ B3_SHARED_API void b3RequestCameraImageSetThermalSeed(b3SharedMemoryCommandHandl
 	command->m_requestPixelDataArguments.m_thermalSeed = seed;
 }
 
+B3_SHARED_API void b3RequestCameraImageSetSensorPhotons(b3SharedMemoryCommandHandle commandHandle, float photons)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_SENSOR_PHOTONS);
+	command->m_requestPixelDataArguments.m_sensorPhotons = photons;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSensorReadNoise(b3SharedMemoryCommandHandle commandHandle, float electrons)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_SENSOR_READ_NOISE);
+	command->m_requestPixelDataArguments.m_sensorReadNoise = electrons;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSensorGainCap(b3SharedMemoryCommandHandle commandHandle, float gainCap)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_SENSOR_GAIN_CAP);
+	command->m_requestPixelDataArguments.m_sensorGainCap = gainCap;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSensorSeed(b3SharedMemoryCommandHandle commandHandle, int seed)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_SENSOR_SEED);
+	command->m_requestPixelDataArguments.m_sensorSeed = seed;
+}
+
+B3_SHARED_API void b3RequestCameraImageSetSpotLight(b3SharedMemoryCommandHandle commandHandle, const float position[3], const float direction[3],
+													 float angleDegrees, float range, float intensity)
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3RequestCameraImageMarkDaylight(command, REQUEST_PIXEL_SPOT_LIGHT);
+	float* spot = command->m_requestPixelDataArguments.m_spotLight;
+	for (int i = 0; i < 3; i++)
+	{
+		spot[i] = position[i];
+		spot[3 + i] = direction[i];
+	}
+	spot[6] = angleDegrees;
+	spot[7] = range;
+	spot[8] = intensity;
+}
+
 B3_SHARED_API void b3RequestCameraImageSetShadow(b3SharedMemoryCommandHandle commandHandle, int hasShadow)
 {
 	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
