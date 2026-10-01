@@ -82,6 +82,8 @@ The full picture on the ray-cast path, as measured on the solar-park slice at 25
 
 `getDepthImagesBatch(width, height, viewMatrices, projectionMatrix, lightDirection, flags, physicsClientId)` is a fork-only call: several depth cameras of the same scene in one request, returned as a `(numCameras, height, width)` float32 array. Depth only, needs NumPy, accepts `ER_SWARM_RAYCAST`; all cameras of one call share one tile schedule across the threads. The swarm environment uses it for every multi-drone family unless `SWARM_BATCH_DEPTH=0`.
 
+`getCameraImage` lets go of the GIL while the frame is drawn and takes it back to build the returned arrays, so other Python threads run meanwhile; a wheel that does has `CAMERA_RELEASES_GIL`. Pixels are unchanged. Two threads must still not drive the same client at once. Swarm Sentinel's evaluator uses it to time the model's next decision while the frame is drawn.
+
 ## 3. Visual shape flags
 
 Passed in `flags=` of `createVisualShape` and `changeVisualShape`; `loadURDF` has its own flag for the material case. The whole enum, upstream rows included, so the taken bits are visible:

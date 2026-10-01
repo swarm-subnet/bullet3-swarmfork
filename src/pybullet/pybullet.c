@@ -10444,7 +10444,10 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		b3SharedMemoryStatusHandle statusHandle;
 		int statusType;
 
+		// the frame touches no Python object, so other threads run while it is drawn
+		Py_BEGIN_ALLOW_THREADS
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+		Py_END_ALLOW_THREADS
 		statusType = b3GetStatusType(statusHandle);
 		if (statusType == CMD_CAMERA_IMAGE_COMPLETED)
 		{
@@ -13790,6 +13793,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS_BACKED", eVISUAL_SHAPE_GLASS_BACKED);
 	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
 	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
+	// Present when getCameraImage lets go of the GIL while the frame is drawn.
+	PyModule_AddIntConstant(m, "CAMERA_RELEASES_GIL", 1);
 
 	PyModule_AddIntConstant(m, "MAX_RAY_INTERSECTION_BATCH_SIZE", MAX_RAY_INTERSECTION_BATCH_SIZE_STREAMING);
 
