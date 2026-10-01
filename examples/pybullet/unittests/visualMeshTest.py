@@ -162,6 +162,22 @@ class TestVisualMesh(unittest.TestCase):
     after, _ = self.render(PICTURE)
     self.assertNotEqual(moved.tobytes(), after.tobytes())
 
+  def test_a_rewrite_leaves_the_kept_tree_alone(self):
+    """A rewritten mover leaves the tree the process keeps for its first shape, so a later world draws that shape again."""
+    def moved_body():
+      """A fresh world whose grid body has moved, so it is drawn through a mesh tree."""
+      p.resetSimulation()
+      uid = self.body()
+      self.render(PICTURE)
+      p.resetBasePositionAndOrientation(uid, [0.2, 0.1, 0], [0, 0, 0, 1])
+      return uid
+    moved_body()
+    first, _ = self.render(PICTURE)
+    p.resetMeshData(moved_body(), self.raised(0.9))
+    self.assertNotEqual(first.tobytes(), self.render(PICTURE)[0].tobytes())
+    moved_body()
+    self.assertEqual(first.tobytes(), self.render(PICTURE)[0].tobytes())
+
   def test_the_same_upload_twice_gives_the_same_bytes(self):
     """Rewriting with the same positions twice renders the same frame, so nothing accumulates."""
     uid = self.body()
