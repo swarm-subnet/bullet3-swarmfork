@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <list>
 #include <map>
 #include <string>
 #include <vector>
@@ -127,6 +128,11 @@ struct StaticMember
 	int m_segmentation;
 };
 
+struct CachedTree;
+// The process's mesh trees by vertex and triangle count, and the idle ones, least recently used first.
+typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
+typedef std::list<CachedTree*> IdleTrees;
+
 // A mesh tree committed over its own copy of the vertex and index arrays and kept for the life of the process. A build
 // runs the same steps on the same arrays, so a later world handing over equal arrays is given the tree it would build.
 struct CachedTree
@@ -134,9 +140,10 @@ struct CachedTree
 	RTCScene m_scene;
 	RTCGeometry m_geometry;
 	size_t m_triangles;
-	// Worlds drawing the tree now, and when the last one let it go.
+	// Worlds drawing the tree now; at zero the tree waits at m_idle for a later world.
 	int m_users;
-	unsigned long long m_lastUse;
+	TreeCache::iterator m_entry;
+	IdleTrees::iterator m_idle;
 };
 
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
@@ -568,14 +575,14 @@ void joinCommit(RTCScene scene)
 	rtcJoinCommitScene(scene);
 }
 
-// Idle cached trees are kept up to this many triangles, the least recently used dropped first.
-const size_t kTreeCacheIdleTriangles = 2000000;
+// Idle cached trees are kept up to this weight, the least recently used dropped first. A tree weighs its triangles plus
+// a fixed share for its scene, geometry and allocator blocks, so many tiny trees cannot pile up either.
+const size_t kTreeCacheIdleWeight = 2000000;
+const size_t kTreeCacheEntryWeight = 1000;
 
-// The process's mesh trees by vertex and triangle count, and the triangles of those no world draws at the moment.
-typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
 TreeCache gTreeCache;
-size_t gTreeCacheIdleTriangles = 0;
-unsigned long long gTreeCacheClock = 0;
+IdleTrees gIdleTrees;
+size_t gIdleWeight = 0;
 
 // The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
 CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
@@ -590,7 +597,10 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
 			continue;
 		if (tree->m_users++ == 0)
-			gTreeCacheIdleTriangles -= numTriangles;
+		{
+			gIdleTrees.erase(tree->m_idle);
+			gIdleWeight -= numTriangles + kTreeCacheEntryWeight;
+		}
 		return tree;
 	}
 	CachedTree* tree = new CachedTree;
@@ -610,7 +620,7 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	rtcCommitGeometry(tree->m_geometry);
 	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
 	joinCommit(tree->m_scene);
-	gTreeCache.insert(std::make_pair(key, tree));
+	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
 	return tree;
 }
 
@@ -619,17 +629,14 @@ void releaseCachedTree(CachedTree* tree)
 {
 	if (--tree->m_users > 0)
 		return;
-	tree->m_lastUse = ++gTreeCacheClock;
-	gTreeCacheIdleTriangles += tree->m_triangles;
-	while (gTreeCacheIdleTriangles > kTreeCacheIdleTriangles)
+	tree->m_idle = gIdleTrees.insert(gIdleTrees.end(), tree);
+	gIdleWeight += tree->m_triangles + kTreeCacheEntryWeight;
+	while (gIdleWeight > kTreeCacheIdleWeight)
 	{
-		TreeCache::iterator oldest = gTreeCache.end();
-		for (TreeCache::iterator it = gTreeCache.begin(); it != gTreeCache.end(); ++it)
-			if (it->second->m_users == 0 && (oldest == gTreeCache.end() || it->second->m_lastUse < oldest->second->m_lastUse))
-				oldest = it;
-		CachedTree* drop = oldest->second;
-		gTreeCacheIdleTriangles -= drop->m_triangles;
-		gTreeCache.erase(oldest);
+		CachedTree* drop = gIdleTrees.front();
+		gIdleTrees.pop_front();
+		gIdleWeight -= drop->m_triangles + kTreeCacheEntryWeight;
+		gTreeCache.erase(drop->m_entry);
 		rtcReleaseGeometry(drop->m_geometry);
 		rtcReleaseScene(drop->m_scene);
 		delete drop;
