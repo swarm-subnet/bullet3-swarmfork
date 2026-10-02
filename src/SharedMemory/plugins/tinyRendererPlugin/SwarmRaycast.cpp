@@ -3849,6 +3849,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			bool crease = job.m_shading->m_creaseFill && hasOwn && covered > 0.0;
 			for (int n = 0; n < 4 && crease; n++)
 				crease = neighbours[n] != offset && ids[neighbours[n]] == id && hits[neighbours[n]].m_prim != RTC_INVALID_GEOMETRY_ID;
+			// One body can span far depths, as the whole forest does: a step that passes the outline rule keeps its probe.
+			crease = crease && !isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, kOutlineTolerance);
 			if (rest > kCoverageEpsilon && !crease)
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;

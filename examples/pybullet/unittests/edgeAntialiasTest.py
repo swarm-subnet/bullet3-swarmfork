@@ -255,13 +255,19 @@ class TestCreaseFill(unittest.TestCase):
     self.assertEqual(seg.tobytes(), seg_f.tobytes())
 
   def test_only_creases_inside_one_body_change(self):
-    """Depth and mask keep their bytes; a pixel next to another body or the frame's border is the full blend, and some
-    creases among the leaves come out differently."""
+    """Depth and mask keep their bytes; a pixel next to another body, at a depth step the outline rule calls an outline,
+    or on the frame's border is the full blend, and some creases among the leaves come out differently."""
     rgb_aa, depth_aa, seg_aa = render(self.AA, **self.EYE)
     rgb_f, depth_f, seg_f = render(self.FILL, **self.EYE)
     self.assertEqual(depth_aa.tobytes(), depth_f.tobytes())
     self.assertEqual(seg_aa.tobytes(), seg_f.tobytes())
-    outline = near_a_mask_change(seg_aa, 0)
+    near, far = 0.1, 30.0
+    w = (far - (far - near) * depth_aa.astype(np.float64)) / (far * near)
+    step = np.zeros((SIZE, SIZE), dtype=bool)
+    step[:, 1:-1] |= np.abs(w[:, :-2] + w[:, 2:] - 2 * w[:, 1:-1]) > 0.25 * w[:, 1:-1]
+    step[1:-1, :] |= np.abs(w[:-2, :] + w[2:, :] - 2 * w[1:-1, :]) > 0.25 * w[1:-1, :]
+    self.assertGreater(int(step.sum()), 10)
+    outline = near_a_mask_change(seg_aa, 0) | step
     outline[0, :] = outline[-1, :] = outline[:, 0] = outline[:, -1] = True
     self.assertTrue((rgb_f[outline] == rgb_aa[outline]).all())
     self.assertGreater(int((rgb_f != rgb_aa).any(axis=2).sum()), 10)
