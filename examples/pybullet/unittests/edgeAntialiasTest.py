@@ -199,13 +199,97 @@ class TestEdgeAntialiasThreads(unittest.TestCase):
   """The blended bytes do not depend on how many render threads are used."""
 
   def test_same_bytes_for_one_two_and_four_threads(self):
-    """Renders the scene, also with outline-only edges, in a fresh process per thread count and compares the hashes."""
+    """Renders the scene, also with outline-only edges and the leaves with crease fill, in a fresh process per thread
+    count and compares the hashes."""
     digests = set()
     for threads in ("1", "2", "4"):
       env = dict(os.environ, SWARM_RENDER_THREADS=threads)
       out = subprocess.check_output([sys.executable, __file__, "--hash"], env=env, text=True)
       digests.add(out.strip())
     self.assertEqual(len(digests), 1)
+
+
+def build_foliage():
+  """A floor and one body of 300 small leaves at many depths, so most of its pixels are creases inside one body."""
+  build_world()
+  rng = np.random.default_rng(7)
+  vertices, indices = [], []
+  for k in range(300):
+    centre = rng.uniform([-0.8, -0.8, 1.2], [0.8, 0.8, 2.2])
+    a, b = rng.normal(size=3), rng.normal(size=3)
+    a = a / np.linalg.norm(a) * 0.09
+    b = np.cross(a, b)
+    b = b / np.linalg.norm(b) * 0.09
+    vertices += [list(centre - a - b), list(centre + a - b), list(centre + a + b), list(centre - a + b)]
+    indices += [4 * k, 4 * k + 1, 4 * k + 2, 4 * k, 4 * k + 2, 4 * k + 3]
+  leaves = p.createVisualShape(p.GEOM_MESH, vertices=vertices, indices=indices, rgbaColor=[0.2, 0.6, 0.2, 1],
+                               flags=p.VISUAL_SHAPE_DOUBLE_SIDED)
+  p.createMultiBody(baseMass=0, baseVisualShapeIndex=leaves)
+
+
+@unittest.skipUnless(hasattr(p, "ER_SWARM_CREASE_FILL"), "wheel built without crease fill")
+class TestCreaseFill(unittest.TestCase):
+  """ER_SWARM_CREASE_FILL: a crease inside one body fills its uncovered share from its neighbours, every other pixel
+  keeps the full blend."""
+
+  BASE = TestEdgeAntialias.BASE
+  AA = TestEdgeAntialias.AA
+  FILL = AA | getattr(p, "ER_SWARM_CREASE_FILL", 0)
+  EYE = dict(eye=(2.5, -2.5, 3.0), target=(0, 0, 1.4))
+
+  def setUp(self):
+    """Connects and builds the foliage scene."""
+    p.connect(p.DIRECT)
+    build_foliage()
+
+  def tearDown(self):
+    """Disconnects."""
+    p.disconnect()
+
+  def test_without_edge_antialias_nothing_changes(self):
+    """The flag alone leaves every colour, depth and mask byte as it was."""
+    rgb, depth, seg = render(self.BASE, **self.EYE)
+    rgb_f, depth_f, seg_f = render(self.BASE | p.ER_SWARM_CREASE_FILL, **self.EYE)
+    self.assertEqual(rgb.tobytes(), rgb_f.tobytes())
+    self.assertEqual(depth.tobytes(), depth_f.tobytes())
+    self.assertEqual(seg.tobytes(), seg_f.tobytes())
+
+  def test_only_creases_inside_one_body_change(self):
+    """Depth and mask keep their bytes; a pixel next to another body, at a depth step the outline rule calls an outline,
+    or on the frame's border is the full blend, and some creases among the leaves come out differently."""
+    rgb_aa, depth_aa, seg_aa = render(self.AA, **self.EYE)
+    rgb_f, depth_f, seg_f = render(self.FILL, **self.EYE)
+    self.assertEqual(depth_aa.tobytes(), depth_f.tobytes())
+    self.assertEqual(seg_aa.tobytes(), seg_f.tobytes())
+    near, far = 0.1, 30.0
+    w = (far - (far - near) * depth_aa.astype(np.float64)) / (far * near)
+    step = np.zeros((SIZE, SIZE), dtype=bool)
+    step[:, 1:-1] |= np.abs(w[:, :-2] + w[:, 2:] - 2 * w[:, 1:-1]) > 0.25 * w[:, 1:-1]
+    step[1:-1, :] |= np.abs(w[:-2, :] + w[2:, :] - 2 * w[1:-1, :]) > 0.25 * w[1:-1, :]
+    self.assertGreater(int(step.sum()), 10)
+    outline = near_a_mask_change(seg_aa, 0) | step
+    outline[0, :] = outline[-1, :] = outline[:, 0] = outline[:, -1] = True
+    self.assertTrue((rgb_f[outline] == rgb_aa[outline]).all())
+    self.assertGreater(int((rgb_f != rgb_aa).any(axis=2).sum()), 10)
+
+  def test_creases_in_front_of_a_mover_keep_their_probe(self):
+    """A body added after the first frame, a mover, behind the leaves: the creases over it come out as the full blend,
+    where without it some did not."""
+    before_aa, _, _ = render(self.AA, **self.EYE)
+    before_f, _, _ = render(self.FILL, **self.EYE)
+    box = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3, 0.3, 0.3], rgbaColor=[1, 0, 0, 1])
+    p.createMultiBody(baseMass=0, baseVisualShapeIndex=box, basePosition=[0.2, 0.2, 0.9])
+    rgb_aa, _, _ = render(self.AA, **self.EYE)
+    rgb_f, _, _ = render(self.FILL, **self.EYE)
+    view = np.array(p.computeViewMatrix(list(self.EYE["eye"]), list(self.EYE["target"]), [0, 0, 1])).reshape(4, 4).T
+    proj = np.array(p.computeProjectionMatrixFOV(70, 1.0, 0.1, 30.0)).reshape(4, 4).T
+    corners = np.array([[0.2 + x, 0.2 + y, 0.9 + z, 1.0] for x in (-0.3, 0.3) for y in (-0.3, 0.3) for z in (-0.3, 0.3)])
+    clip = corners @ (proj @ view).T
+    cols = (clip[:, 0] / clip[:, 3] + 1.0) * 0.5 * SIZE
+    rows = ((1.0 - clip[:, 1] / clip[:, 3]) * SIZE - 2.0) * 0.5
+    region = (slice(int(np.ceil(rows.min())), int(np.floor(rows.max())) + 1), slice(int(np.ceil(cols.min())), int(np.floor(cols.max())) + 1))
+    self.assertTrue((before_f[region] != before_aa[region]).any())
+    self.assertTrue((rgb_f[region] == rgb_aa[region]).all())
 
 
 def colour_hash():
@@ -219,6 +303,13 @@ def colour_hash():
                        p.ER_SWARM_EDGE_OUTLINE, shadow=1)
     print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
   p.disconnect()
+  if hasattr(p, "ER_SWARM_CREASE_FILL"):
+    p.connect(p.DIRECT)
+    build_foliage()
+    rgb, _, _ = render(p.ER_NO_SEGMENTATION_MASK | p.ER_SWARM_RAYCAST | p.ER_TEXTURE_FILTER | p.ER_EDGE_ANTIALIAS |
+                       p.ER_SWARM_CREASE_FILL, shadow=1, **TestCreaseFill.EYE)
+    print(hashlib.sha256(rgb.astype(np.uint8).tobytes()).hexdigest())
+    p.disconnect()
 
 
 if __name__ == '__main__':
