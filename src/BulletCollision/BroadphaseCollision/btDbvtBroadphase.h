@@ -47,10 +47,13 @@ struct btDbvtProxy : btBroadphaseProxy
 	btDbvtNode* leaf;
 	btDbvtProxy* links[2];
 	int stage;
+	// True while the leaf's volume holds the proxy's bounds and they are a box with no NaN.
+	bool settled;
 	/* ctor			*/
 	btDbvtProxy(const btVector3& aabbMin, const btVector3& aabbMax, void* userPtr, int collisionFilterGroup, int collisionFilterMask) : btBroadphaseProxy(aabbMin, aabbMax, userPtr, collisionFilterGroup, collisionFilterMask)
 	{
 		links[0] = links[1] = 0;
+		settled = false;
 	}
 };
 
