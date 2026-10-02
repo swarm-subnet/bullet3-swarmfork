@@ -27,15 +27,23 @@ def write_meshes(folder):
   return ["flat.obj", "stand.obj"]
 
 
-def write_forest(folder, meshes, placements):
-  """Write a forest file naming the meshes and listing each placement as index, xyz, quaternion and scale."""
+def write_forest(folder, meshes, placements, binary=False):
+  """Write a forest file naming the meshes and listing each placement as index, xyz, quaternion and scale.
+
+  binary writes the rows as doubles after a "binary" line, each the number its text form would parse to.
+  """
   lines = ["# a comment line is skipped"] + ["mesh %s" % name for name in meshes]
+  rows = []
   for index, position, yaw, scale in placements:
-    lines.append("%d %f %f %f 0 0 %f %f %f %f %f" % ((index,) + tuple(position) + (math.sin(yaw / 2), math.cos(yaw / 2))
-                                                     + tuple(scale)))
+    rows.append("%d %f %f %f 0 0 %f %f %f %f %f" % ((index,) + tuple(position) + (math.sin(yaw / 2), math.cos(yaw / 2))
+                                                    + tuple(scale)))
   path = os.path.join(folder, "forest.fst")
-  with open(path, "w") as out:
-    out.write("\n".join(lines) + "\n")
+  with open(path, "wb") as out:
+    if binary:
+      out.write(("\n".join(lines + ["binary %d" % len(rows)]) + "\n").encode())
+      out.write(np.array([[float(v) for v in row.split()] for row in rows], dtype="<f8").tobytes())
+    else:
+      out.write(("\n".join(lines + rows) + "\n").encode())
   return path
 
 
@@ -45,11 +53,11 @@ def ground():
   p.createMultiBody(0, -1, shape, basePosition=[0, 0, -0.05])
 
 
-def forest_world(folder, base=(0, 0, 0), flags=INSTANCED):
+def forest_world(folder, base=(0, 0, 0), flags=INSTANCED, binary=False):
   """The placements as one forest body; returns its body id."""
   p.resetSimulation()
   ground()
-  path = write_forest(folder, write_meshes(folder), PLACEMENTS)
+  path = write_forest(folder, write_meshes(folder), PLACEMENTS, binary)
   shape = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=flags | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY,
                               specularColor=[0, 0, 0])
   return p.createMultiBody(0, -1, shape, basePosition=list(base))
@@ -67,6 +75,13 @@ def separate_world(folder, base=(0, 0, 0)):
     bodies.append(p.createMultiBody(0, -1, shape, basePosition=[a + b for a, b in zip(base, position)],
                                     baseOrientation=[0, 0, math.sin(yaw / 2), math.cos(yaw / 2)]))
   return bodies
+
+
+def identity_hash(folder):
+  """Hash of the forest frame drawn with every picture flag, the frame the thread and process checks compare."""
+  forest_world(folder)
+  buffers = frame(RAY | MAP | DAY | CUTOUT | p.ER_EDGE_ANTIALIAS | p.ER_TEXTURE_FILTER, eye=(0, -6, 6))
+  return hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()
 
 
 def child(threads):
@@ -105,6 +120,31 @@ class TestForestBatch(unittest.TestCase):
       separate_world(self.folder)
       apart = frame(flags=flags, eye=(0, -6, 6))
       self.assertPixelsEqual(together, apart)
+
+  def test_binary_rows_draw_the_text_rows_bytes(self):
+    """Rows given as doubles draw the same colour, depth and mask as the same rows given as text."""
+    forest_world(self.folder)
+    text = frame(flags=RAY | MAP | DAY | CUTOUT, eye=(0, -6, 6))
+    forest_world(self.folder, binary=True)
+    binary = frame(flags=RAY | MAP | DAY | CUTOUT, eye=(0, -6, 6))
+    for left, right in zip(text, binary):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
+
+  def test_a_damaged_binary_file_draws_nothing_and_fails_nothing(self):
+    """A row count past the end of the file refuses it, and rows whose mesh index is NaN or out of range are skipped."""
+    self.assertTrue(p.FOREST_FILE_BINARY)
+    meshes = write_meshes(self.folder)
+    rows = np.array([[0, 0, 0, 0.5, 0, 0, 0, 1, 1, 1, 1]] * 3, dtype="<f8")
+    rows[1, 0], rows[2, 0] = np.nan, 7.0
+    for count, body in ((10 ** 15, rows), (2, rows[1:])):
+      p.resetSimulation()
+      path = os.path.join(self.folder, "damaged.fst")
+      with open(path, "wb") as out:
+        out.write(("".join("mesh %s\n" % name for name in meshes) + "binary %d\n" % count).encode() + body.tobytes())
+      shape = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=INSTANCED | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+      p.createMultiBody(0, -1, shape)
+      _, _, mask = frame(flags=RAY, shadow=0, eye=(0, -6, 6))
+      self.assertEqual(int((mask >= 0).sum()), 0)
 
   def test_body_pose_carries_the_placements(self):
     """A forest body placed off the origin moves every placement with it."""
@@ -145,6 +185,15 @@ class TestForestBatch(unittest.TestCase):
     _, _, mask = frame(flags=RAY, shadow=0, eye=(0, -6, 6))
     self.assertEqual(int((mask > 0).sum()), 0)
 
+  def test_later_world_draws_what_a_fresh_process_draws(self):
+    """A forest drawn after other worlds in the process, its mesh trees kept from them, gives a fresh process's bytes."""
+    for _ in range(2):
+      forest_world(self.folder)
+      frame(flags=RAY, eye=(0, -6, 6))
+      p.disconnect()
+      p.connect(p.DIRECT)
+    self.assertEqual(identity_hash(self.folder), child("2"))
+
   def test_threads_give_the_same_bytes(self):
     """Fresh processes render identical colour, depth and mask at one, two and four threads."""
     hashes = [child(t) for t in ("1", "2", "4")]
@@ -156,9 +205,7 @@ if __name__ == "__main__":
   if len(sys.argv) > 1 and sys.argv[1] == "identity":
     p.connect(p.DIRECT)
     with tempfile.TemporaryDirectory() as folder:
-      forest_world(folder)
-      buffers = frame(RAY | MAP | DAY | CUTOUT | p.ER_EDGE_ANTIALIAS | p.ER_TEXTURE_FILTER, eye=(0, -6, 6))
-      print(json.dumps(hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()))
+      print(json.dumps(identity_hash(folder)))
     p.disconnect()
   else:
     unittest.main()

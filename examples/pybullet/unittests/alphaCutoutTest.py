@@ -124,6 +124,19 @@ class TestAlphaCutout(unittest.TestCase):
     # Back to the solid setting on the same client: a stale map would hand back the cut-out counts.
     self.assertEqual(self.shaded_floor(RAY | smap), shaded_solid)
 
+  def test_shadow_map_follows_a_card_retextured_in_place(self):
+    """A card that stays put but takes an opaque texture recasts its cells, so the map matches one cast fresh."""
+    flags = CUT | p.ER_SWARM_SHADOW_MAP
+    render(flags, shadow=1)
+    opaque = os.path.join(self.tmp, 'leaf_opaque.tga')
+    write_leaf_tga(opaque, with_alpha=False)
+    p.changeVisualShape(self.card, -1, textureUniqueId=p.loadTexture(opaque))
+    after, _, _ = render(flags, shadow=1)
+    p.resetSimulation()
+    build_world(opaque)
+    fresh, _, _ = render(flags, shadow=1)
+    self.assertEqual(after.tobytes(), fresh.tobytes())
+
   def test_mover_shadow_falls_through_the_hole(self):
     """A card that moved casts its mover shadow through the hole as well."""
     flags = p.ER_SWARM_SHADOW_MAP | p.ER_SWARM_MOVER_SHADOW

@@ -604,26 +604,23 @@ void Model::load_texture(std::string filename, const char *suffix, TGAImage &img
 	}
 }
 
+// Wraps a texture coordinate into [0, 1).
+static float wrapUnit(float value)
+{
+	// A float's fraction is exact in float: modf's value without the double round trip, and none for an infinity.
+	float f = value - std::trunc(value);
+	if (f != f)
+		f = value != value ? value : 0.f;
+	return f < 0.f ? f + 1.f : f;
+}
+
 TGAColor Model::diffuse(Vec2f uvf)
 {
 	if (m_diffuse && m_diffuse->img_.get_width() && m_diffuse->img_.get_height())
 	{
 		TGAImage& diffusemap_ = m_diffuse->img_;
-		double val;
-		//		bool repeat = true;
-		//		if (repeat)
-		{
-			uvf[0] = std::modf(uvf[0], &val);
-			if (uvf[0] < 0)
-			{
-				uvf[0] = uvf[0] + 1;
-			}
-			uvf[1] = std::modf(uvf[1], &val);
-			if (uvf[1] < 0)
-			{
-				uvf[1] = uvf[1] + 1;
-			}
-		}
+		uvf[0] = wrapUnit(uvf[0]);
+		uvf[1] = wrapUnit(uvf[1]);
         	Vec2i uv(uvf[0] * diffusemap_.get_width(), uvf[1] * diffusemap_.get_height());
 		return diffusemap_.get(uv[0], uv[1]);
 	}
@@ -641,13 +638,8 @@ unsigned char Model::alpha(Vec2f uvf) const
 	if (!hasAlpha())
 		return 255;
 	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
-	double val;
-	uvf[0] = std::modf(uvf[0], &val);
-	if (uvf[0] < 0)
-		uvf[0] = uvf[0] + 1;
-	uvf[1] = std::modf(uvf[1], &val);
-	if (uvf[1] < 0)
-		uvf[1] = uvf[1] + 1;
+	uvf[0] = wrapUnit(uvf[0]);
+	uvf[1] = wrapUnit(uvf[1]);
 	int x = (int)(uvf[0] * w), y = (int)(uvf[1] * h);
 	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
 	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
@@ -719,6 +711,16 @@ static void buildMips(SharedTexture& tex)
 	}
 }
 
+// (i % n + n) % n; a wrapped coordinate floors to -1 .. n - 1, which needs no division.
+static inline int wrapTexel(int i, int n)
+{
+	if (i >= 0 && i < n)
+		return i;
+	if (i == -1)
+		return n - 1;
+	return (i % n + n) % n;
+}
+
 // Four-texel blend inside one level with 8-bit fixed-point weights, repeat wrap.
 // u and v are already in [0, 1).
 static TGAColor sampleBilinear(TGAImage& img, float u, float v)
@@ -730,8 +732,8 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	const float fy = std::floor(y);
 	const int wx = (int)((x - fx) * 256.f);
 	const int wy = (int)((y - fy) * 256.f);
-	int x0 = ((int)fx % w + w) % w;
-	int y0 = ((int)fy % h + h) % h;
+	int x0 = wrapTexel((int)fx, w);
+	int y0 = wrapTexel((int)fy, h);
 	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1;
 	const int y1 = (y0 + 1 == h) ? 0 : y0 + 1;
 	const unsigned char* s = img.buffer();
@@ -748,8 +750,16 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	return c;
 }
 
-// One trilinear read at the level a footprint radius squared of rho2 texels asks for, log2 from the float's own bits.
-static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2)
+// Two mip levels and the 8-bit weight of the coarser one, which is read only when that weight is not zero.
+struct MipPick
+{
+	TGAImage* m_a;
+	TGAImage* m_b;
+	int m_weight;
+};
+
+// The levels a footprint radius squared of rho2 texels asks for, log2 from the float's own bits.
+static MipPick pickLevels(SharedTexture& tex, float rho2)
 {
 	float lambda = 0.f;
 	if (rho2 > 1.f)
@@ -772,23 +782,24 @@ static TGAColor sampleTrilinear(SharedTexture& tex, float u, float v, float rho2
 		level = last;
 		frac = 0.f;
 	}
-	TGAImage& imgA = level == 0 ? tex.img_ : *mips[level - 1];
-	TGAColor a = sampleBilinear(imgA, u, v);
-	const int wl = (int)(frac * 256.f);
+	MipPick pick;
+	pick.m_a = level == 0 ? &tex.img_ : mips[level - 1];
+	pick.m_weight = (int)(frac * 256.f);
+	pick.m_b = pick.m_weight == 0 ? 0 : mips[level];
+	return pick;
+}
+
+// One trilinear read from the levels pickLevels chose.
+static TGAColor sampleLevels(const MipPick& pick, float u, float v)
+{
+	TGAColor a = sampleBilinear(*pick.m_a, u, v);
+	const int wl = pick.m_weight;
 	if (wl == 0)
 		return a;
-	TGAColor b = sampleBilinear(*mips[level], u, v);
+	TGAColor b = sampleBilinear(*pick.m_b, u, v);
 	for (int i = 0; i < (int)a.bytespp; i++)
 		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
 	return a;
-}
-
-// Wraps a texture coordinate into [0, 1).
-static float wrapUnit(float value)
-{
-	double integral;
-	float f = (float)std::modf(value, &integral);
-	return f < 0.f ? f + 1.f : f;
 }
 
 // Trilinear sample at the pixel footprint; with more taps the footprint is walked along its long side and the reads averaged.
@@ -811,7 +822,7 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	const float ry2 = sy * sy + ty * ty;
 	const float rho2 = rx2 > ry2 ? rx2 : ry2;
 	if (maxTaps <= 1)
-		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+		return sampleLevels(pickLevels(*m_diffuse, rho2), uvf[0], uvf[1]);
 
 	const bool xMajor = rx2 >= ry2;
 	const float major2 = xMajor ? rx2 : ry2, minor2 = xMajor ? ry2 : rx2;
@@ -826,16 +837,17 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 		taps = taps > maxTaps ? maxTaps : (taps < 1 ? 1 : taps);
 	}
 	if (taps <= 1)
-		return sampleTrilinear(*m_diffuse, uvf[0], uvf[1], rho2);
+		return sampleLevels(pickLevels(*m_diffuse, rho2), uvf[0], uvf[1]);
 	const float perTap2 = major2 / ((float)taps * (float)taps);
 	const float tapRho2 = perTap2 > minor2 ? perTap2 : minor2;
 	const Vec2f along = xMajor ? duvdx : duvdy;
+	const MipPick pick = pickLevels(*m_diffuse, tapRho2);
 	int sum[4] = {0, 0, 0, 0};
 	unsigned char bytespp = 3;
 	for (int k = 0; k < taps; k++)
 	{
 		const float f = ((float)k + 0.5f) / (float)taps - 0.5f;
-		const TGAColor c = sampleTrilinear(*m_diffuse, wrapUnit(uvf[0] + along[0] * f), wrapUnit(uvf[1] + along[1] * f), tapRho2);
+		const TGAColor c = sampleLevels(pick, wrapUnit(uvf[0] + along[0] * f), wrapUnit(uvf[1] + along[1] * f));
 		bytespp = c.bytespp;
 		for (int i = 0; i < (int)c.bytespp; i++)
 			sum[i] += c.bgra[i];
@@ -845,6 +857,15 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	for (int i = 0; i < (int)bytespp; i++)
 		out.bgra[i] = (unsigned char)((sum[i] + taps / 2) / taps);
 	return out;
+}
+
+TGAColor Model::diffuseMean(Vec2f uvf)
+{
+	if (!m_diffuse || !m_diffuse->img_.get_width() || !m_diffuse->img_.get_height())
+		return TGAColor(255, 255, 255, 255);
+	if (!m_diffuse->mipsBuilt_)
+		buildMips(*m_diffuse);
+	return sampleBilinear(m_diffuse->mips_.empty() ? m_diffuse->img_ : *m_diffuse->mips_.back(), wrapUnit(uvf[0]), wrapUnit(uvf[1]));
 }
 
 unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged) const
@@ -866,7 +887,7 @@ unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged
 	const float x = wrapUnit(uvf[0]) * w - 0.5f, y = wrapUnit(uvf[1]) * h - 0.5f;
 	const float fx = std::floor(x), fy = std::floor(y);
 	const float ax = x - fx, ay = y - fy;
-	const int x0 = ((int)fx % w + w) % w, y0 = ((int)fy % h + h) % h;
+	const int x0 = wrapTexel((int)fx, w), y0 = wrapTexel((int)fy, h);
 	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1, y1 = (y0 + 1 == h) ? 0 : y0 + 1;
 	const float top = plane[(size_t)y0 * w + x0] * (1.f - ax) + plane[(size_t)y0 * w + x1] * ax;
 	const float bottom = plane[(size_t)y1 * w + x0] * (1.f - ax) + plane[(size_t)y1 * w + x1] * ax;

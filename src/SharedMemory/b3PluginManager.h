@@ -56,6 +56,7 @@ public:
 	void clearEvents();
 
 	void addNotification(const struct b3Notification& notification);
+	bool hasNotificationPlugins() const;
 	void reportNotifications();
 
 	void tickPlugins(double timeStep, b3PluginManagerTickMode tickMode);

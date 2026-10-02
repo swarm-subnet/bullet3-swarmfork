@@ -23,6 +23,7 @@ subject to the following restrictions:
 #include "Bullet3Common/b3FileUtils.h"
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstdio>
 #include "../../../../examples/Utils/b3ResourcePath.h"
@@ -54,6 +55,9 @@ struct MyTexture2
 	std::string m_name;
 };
 
+// File textures kept decoded for the process, so the next world that names one borrows it instead of decoding again.
+static std::set<std::string> gPinnedTextures;
+
 // Hands a file-backed texture to the renderer for good: a reference by name replaces the texels, which
 // no later reader needs, because the name finds the one copy the renderer keeps from here on.
 static void handOverTexture(MyTexture2& texData)
@@ -66,6 +70,8 @@ static void handOverTexture(MyTexture2& texData)
 		texData.m_name.clear();
 		return;
 	}
+	if (gPinnedTextures.insert(texData.m_name).second)
+		TinyRender::retainSharedTexture(texData.m_name.c_str());
 	if (texData.m_isCached)
 		b3ImportMeshUtility::releaseCachedTexture(texData.m_name.c_str());
 	else
@@ -85,8 +91,11 @@ struct TinyRendererObjectArray
 	int m_linkIndex;
 	btTransform m_worldTransform;
 	btVector3 m_localScaling;
+	// Set while the ray-cast scene has not yet seen this pose, this scaling or a change to one of the render objects.
+	bool m_raycastDirty;
 
 	TinyRendererObjectArray()
+		: m_raycastDirty(true)
 	{
 		m_worldTransform.setIdentity();
 		m_localScaling.setValue(1, 1, 1);
@@ -169,6 +178,8 @@ struct TinyRendererVisualShapeConverterInternalData
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
+	// Counts every change to a shape, a texture or the up axis, for ER_SWARM_FRAME_REUSE; a body's move is not one.
+	unsigned long long m_pictureRevision;
 
 	// depth-only camera batch: per-camera buffers rendered in parallel
 	btAlignedObjectArray<b3AlignedObjectArray<float> > m_batchDepthBuffers;
@@ -178,6 +189,8 @@ struct TinyRendererVisualShapeConverterInternalData
 #ifdef SWARM_RAYCAST
 	// Created on the first ER_SWARM_RAYCAST render and kept in step with the render objects from then on.
 	SwarmRaycast* m_raycast;
+	// Set when a rewritten mesh tree also serves other render objects, so the next sync takes every object.
+	bool m_raycastSyncAll;
 #endif
 
 	TinyRendererVisualShapeConverterInternalData()
@@ -223,10 +236,11 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_hasSpotLight(false),
 		m_hasShadow(false),
 		m_flags(0),
+		m_pictureRevision(0),
 		m_batchCameraCount(1),
 		m_batchReadCamera(0)
 #ifdef SWARM_RAYCAST
-		, m_raycast(0)
+		, m_raycast(0), m_raycastSyncAll(false)
 #endif
 	{
 		m_depthBuffer.resize(m_swWidth * m_swHeight);
@@ -242,21 +256,23 @@ struct TinyRendererVisualShapeConverterInternalData
 	}
 
 #ifdef SWARM_RAYCAST
-	// Brings every render object into the ray-cast scene and rebuilds the top-level tree.
-	SwarmRaycast& syncRaycast()
+	// Syncs the render objects changed since the last call, in full-sync order; the mover tree only for mover shadows.
+	SwarmRaycast& syncRaycast(bool moverShadows)
 	{
 		if (!m_raycast)
 			m_raycast = new SwarmRaycast();
 		for (int n = 0; n < m_swRenderInstances.size(); n++)
 		{
 			TinyRendererObjectArray** visualArrayPtr = m_swRenderInstances.getAtIndex(n);
-			if (0 == visualArrayPtr)
+			if (0 == visualArrayPtr || !(m_raycastSyncAll || (*visualArrayPtr)->m_raycastDirty))
 				continue;
 			TinyRendererObjectArray* visualArray = *visualArrayPtr;
+			visualArray->m_raycastDirty = false;
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
 		}
-		m_raycast->commit();
+		m_raycastSyncAll = false;
+		m_raycast->commit(moverShadows);
 		return *m_raycast;
 	}
 
@@ -1148,6 +1164,23 @@ struct ForestFile
 	std::vector<std::vector<float> > m_placements;
 };
 
+// Adds one placement "x y z qx qy qz qw sx sy sz" to its mesh: the scaled rotation, then the origin, as a column-major 3x4.
+static void addForestPlacement(ForestFile& out, int index, const double v[10])
+{
+	const double x = v[0], y = v[1], z = v[2], qx = v[3], qy = v[4], qz = v[5], qw = v[6], sx = v[7], sy = v[8], sz = v[9];
+	const double r[3][3] = {{1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)},
+							{2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)},
+							{2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)}};
+	const double scale[3] = {sx, sy, sz};
+	const double origin[3] = {x, y, z};
+	std::vector<float>& placements = out.m_placements[index];
+	for (int c = 0; c < 3; c++)
+		for (int row = 0; row < 3; row++)
+			placements.push_back((float)(r[row][c] * scale[c]));
+	for (int row = 0; row < 3; row++)
+		placements.push_back((float)origin[row]);
+}
+
 // Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines;
 // '#' starts a comment. False when the file cannot be read or names no mesh.
 static bool readForestFile(const std::string& fileName, CommonFileIOInterface* fileIO, ForestFile& out)
@@ -1156,7 +1189,7 @@ static bool readForestFile(const std::string& fileName, CommonFileIOInterface* f
 	std::string path = fileName;
 	if (fileIO && fileIO->findResourcePath(fileName.c_str(), found, sizeof(found)))
 		path = found;
-	std::ifstream in(path.c_str());
+	std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
 	if (!in)
 		return false;
 	const size_t slash = path.find_last_of("/\\");
@@ -1175,23 +1208,35 @@ static bool readForestFile(const std::string& fileName, CommonFileIOInterface* f
 			out.m_placements.push_back(std::vector<float>());
 			continue;
 		}
+		// Or one "binary <rows>" line, then those eleven numbers per row as little-endian doubles, with no text to parse.
+		if (line.compare(0, 7, "binary ") == 0)
+		{
+			// The rows the line names must all be in the file, so a damaged count cannot ask for more memory than that.
+			const std::streampos start = in.tellg();
+			in.seekg(0, std::ios::end);
+			const unsigned long long left = (unsigned long long)(in.tellg() - start);
+			in.seekg(start);
+			const unsigned long long rows = strtoull(line.c_str() + 7, 0, 10);
+			if (rows > left / (11 * sizeof(double)))
+				return false;
+			std::vector<double> values((size_t)rows * 11);
+			if (rows && !in.read((char*)&values[0], (std::streamsize)(values.size() * sizeof(double))))
+				return false;
+			for (size_t i = 0; i < (size_t)rows; i++)
+			{
+				const double* row = &values[i * 11];
+				// Range first, so a NaN or a huge value is never cast to int.
+				if (row[0] >= 0.0 && row[0] < (double)out.m_meshes.size() && row[0] == (double)(int)row[0])
+					addForestPlacement(out, (int)row[0], row + 1);
+			}
+			break;
+		}
 		int index = -1;
-		double x, y, z, qx, qy, qz, qw, sx, sy, sz;
-		if (sscanf(line.c_str(), "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &index, &x, &y, &z, &qx, &qy, &qz, &qw, &sx, &sy, &sz) != 11 ||
+		double v[10];
+		if (sscanf(line.c_str(), "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", &index, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) != 11 ||
 			index < 0 || index >= (int)out.m_meshes.size())
 			continue;
-		// Rotation from the unit quaternion, each column scaled by its axis: the placement's 3x4, column-major.
-		const double r[3][3] = {{1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)},
-								{2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)},
-								{2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)}};
-		const double scale[3] = {sx, sy, sz};
-		const double origin[3] = {x, y, z};
-		std::vector<float>& placements = out.m_placements[index];
-		for (int c = 0; c < 3; c++)
-			for (int row = 0; row < 3; row++)
-				placements.push_back((float)(r[row][c] * scale[c]));
-		for (int row = 0; row < 3; row++)
-			placements.push_back((float)origin[row]);
+		addForestPlacement(out, index, v);
 	}
 	return !out.m_meshes.empty();
 }
@@ -1202,6 +1247,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 	int bodyUniqueId, struct CommonFileIOInterface* fileIO)
 
 {
+	m_data->m_pictureRevision++;
 	int uniqueId = orgGraphicsUniqueId;
 	btAssert(orgGraphicsUniqueId >= 0);
 	btAssert(linkPtr);  // TODO: remove if (not doing it now, because diff will be 50+ lines)
@@ -1306,6 +1352,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			TinyRendererObjectArray* visuals = *visualsPtr;
 			visuals->m_objectUniqueId = bodyUniqueId;
 			visuals->m_linkIndex = linkIndex;
+			visuals->m_raycastDirty = true;
 
 			b3VisualShapeData visualShape;
 			visualShape.m_objectUniqueId = bodyUniqueId;
@@ -1330,6 +1377,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 			bool renderInstanced = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_INSTANCED) != 0;
 			bool renderTreeCache = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_RENDER_TREE_CACHE) != 0;
 			bool glass = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS) != 0;
+			bool glassBacked = useVisual && (linkPtr->m_visualArray[v1].m_flags & eVISUAL_SHAPE_GLASS_BACKED) != 0;
 
 			TinyRender::Matrix meshTransform = TinyRender::Matrix::identity();
 			if (renderInstanced)
@@ -1384,6 +1432,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						tinyObj->m_renderInstanced = renderInstanced;
 						tinyObj->m_meshTransform = meshTransform;
 						tinyObj->m_glass = glass;
+						tinyObj->m_glassBacked = glassBacked;
 						tinyObj->m_placements = forest.m_placements[mesh];
 						tinyObj->m_model = new TinyRender::Model();
 						tinyObj->m_model->shareFrom(*prototype.m_models[m]);
@@ -1506,6 +1555,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 					tinyObj->m_renderInstanced = renderInstanced;
 					tinyObj->m_meshTransform = meshTransform;
 					tinyObj->m_glass = glass;
+					tinyObj->m_glassBacked = glassBacked;
 					tinyObj->registerMeshShape(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size(), groupColor,
 						group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
 					float groupSpecular[3] = { (float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2] };
@@ -1538,6 +1588,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 				tinyObj->m_renderInstanced = renderInstanced;
 				tinyObj->m_meshTransform = meshTransform;
 				tinyObj->m_glass = glass;
+				tinyObj->m_glassBacked = glassBacked;
 				unsigned char* textureImage1 = 0;
 				const unsigned char* textureAlpha = 0;
 				int textureWidth = 0;
@@ -1590,6 +1641,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 
 int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualShapeData& visualShape, const float* vertices, int numvertices, const int* indices, int numIndices, int primitiveType, int textureId, int orgGraphicsUniqueId, int bodyUniqueId, int linkIndex)
 {
+	m_data->m_pictureRevision++;
 	btAlignedObjectArray<b3VisualShapeData>* shapes1 =
 		m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes1)
@@ -1633,6 +1685,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 				visuals->m_linkIndex = linkIndex;
 				visuals->m_objectUniqueId = bodyUniqueId;
 				visuals->m_renderObjects.push_back(tinyObj);
+				visuals->m_raycastDirty = true;
 			}
 			
 			shapes1->push_back(visualShape);
@@ -1644,6 +1697,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 
 void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVector3* vertices, int numVertices, const btVector3* normals, int numNormals)
 {
+	m_data->m_pictureRevision++;
 	TinyRendererObjectArray** visualsPtr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (visualsPtr != 0)
 	{
@@ -1655,9 +1709,10 @@ void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVe
 
 			if (renderObj->m_model->nverts() == numVertices)
 			{
+				visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-				if (m_data->m_raycast)
-					m_data->m_raycast->meshChanged(renderObj);
+				if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+					m_data->m_raycastSyncAll = true;
 #endif
 				TinyRender::Vec3f* verts = renderObj->m_model->readWriteVertices();
 				//just do a sync
@@ -1711,8 +1766,10 @@ int TinyRendererVisualShapeConverter::getVisualShapesData(int bodyUniqueId, int 
 
 void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags)
 {
+	m_data->m_pictureRevision++;
 	bool doubleSided = (flags & (eVISUAL_SHAPE_DOUBLE_SIDED | eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)) != 0;
 	bool glass = (flags & eVISUAL_SHAPE_GLASS) != 0;
+	bool glassBacked = (flags & eVISUAL_SHAPE_GLASS_BACKED) != 0;
 	btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes)
 	{
@@ -1728,12 +1785,14 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
 					{
 						visuals->m_renderObjects[q]->m_doubleSided = doubleSided;
 						visuals->m_renderObjects[q]->m_glass = glass;
+						visuals->m_renderObjects[q]->m_glassBacked = glassBacked;
 					}
 				}
 			}
@@ -1744,6 +1803,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 
 void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double rgbaColor[4])
 {
+	m_data->m_pictureRevision++;
 	btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes)
 	{
@@ -1770,6 +1830,7 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 			TinyRendererObjectArray* visuals = *ptrptr;
 			if ((bodyUniqueId == visuals->m_objectUniqueId) && (linkIndex == visuals->m_linkIndex))
 			{
+				visuals->m_raycastDirty = true;
 				for (int q = 0; q < visuals->m_renderObjects.size(); q++)
 				{
 					if (shapeIndex < 0 || q == shapeIndex)
@@ -1784,6 +1845,7 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 
 void TinyRendererVisualShapeConverter::changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3])
 {
+	m_data->m_pictureRevision++;
 	float rgb[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
 	for (int i = 0; i < m_data->m_swRenderInstances.size(); i++)
 	{
@@ -1805,6 +1867,7 @@ void TinyRendererVisualShapeConverter::changeSpecularColor(int bodyUniqueId, int
 
 void TinyRendererVisualShapeConverter::setUpAxis(int axis)
 {
+	m_data->m_pictureRevision++;
 	m_data->m_upAxis = axis;
 	m_data->m_camera.setCameraUpAxis(axis);
 	m_data->m_camera.update();
@@ -1830,14 +1893,19 @@ void TinyRendererVisualShapeConverter::clearBuffers(TGAColor& clearColor)
 	for (int i = 0; i < numPixels; ++i)
 		depth[i] = -farPlane;
 
-	if (!depthOnly)
+	if (!depthOnly && numPixels)
 	{
-		for (int y = 0; y < m_data->m_swHeight; ++y)
-			for (int x = 0; x < m_data->m_swWidth; ++x)
-				m_data->m_rgbColorBuffer.set(x, y, clearColor);
+		// The first row is set pixel by pixel, then copied into every other row.
+		for (int x = 0; x < m_data->m_swWidth; ++x)
+			m_data->m_rgbColorBuffer.set(x, 0, clearColor);
+		unsigned char* rgb = m_data->m_rgbColorBuffer.buffer();
+		const size_t rowBytes = (size_t)m_data->m_swWidth * m_data->m_rgbColorBuffer.get_bytespp();
+		for (int y = 1; y < m_data->m_swHeight; ++y)
+			memcpy(rgb + y * rowBytes, rgb, rowBytes);
 
-		float* shadow = numPixels ? &m_data->m_shadowBuffer[0] : 0;
-		for (int i = 0; i < numPixels; ++i)
+		// Only the rasterised path draws into the shadow buffer.
+		float* shadow = (m_data->m_flags & ER_SWARM_RAYCAST) == 0 ? &m_data->m_shadowBuffer[0] : 0;
+		for (int i = 0; shadow && i < numPixels; ++i)
 			shadow[i] = -1e30f;
 	}
 
@@ -1855,85 +1923,120 @@ static unsigned char skyByte(float v)
 	return (unsigned char)(v * 255.f + 0.5f);
 }
 
-// Colour buffer only: each pixel's view ray is lifted to world space and either read from the
+// The sky behind one frame: each pixel's view ray is lifted to world space and either read from the
 // sun sky map, or its component along the up axis blends horizon (level or below) into zenith
 // (straight up).
-void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky, bool daylight)
+struct SkyView
 {
-	const int width = m_data->m_swWidth;
-	const int height = m_data->m_swHeight;
-	const int up = m_data->m_upAxis;
-	// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
-	// world space takes the rows of the inverse view rotation, the sun sky all three.
-	const float invP00 = 1.f / projMat[0];
-	const float invP11 = 1.f / projMat[5];
-	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
-	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+	int m_width;
+	int m_height;
+	float m_invP00;
+	float m_invP11;
+	const float* m_view;
+	const SwarmSky* m_sunSky;
+	bool m_daylight;
+	float m_horizon[3];
+	float m_rise[3];
+	float m_up[3];
+	const float* m_invRayLen;
 
-	if (sunSky)
+	// The colour of column x of buffer row y, in the row order of the rasterised path, before its flip.
+	void paint(int x, int y, unsigned char out[3]) const
 	{
-		for (int y = 0; y < height; ++y)
+		// Camera-space ray for the pixel is (ndcX / P00, ndcY / P11, -1); rotating it into
+		// world space takes the rows of the inverse view rotation, the sun sky all three.
+		const float dy = (2.f * (y + 0.5f) / m_height - 1.f) * m_invP11;
+		const float dx = (2.f * (x + 0.5f) / m_width - 1.f) * m_invP00;
+		if (m_sunSky)
 		{
-			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
-			for (int x = 0; x < width; ++x, pixel += bytespp)
-			{
-				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-				const float wx = viewMat[0] * dx + viewMat[1] * dy - viewMat[2];
-				const float wy = viewMat[4] * dx + viewMat[5] * dy - viewMat[6];
-				const float wz = viewMat[8] * dx + viewMat[9] * dy - viewMat[10];
-				if (daylight)
-					sunSky->lookupDisplay(wx, wy, wz, pixel);
-				else
-					sunSky->lookup(wx, wy, wz, pixel);
-			}
+			const float wx = m_view[0] * dx + m_view[1] * dy - m_view[2];
+			const float wy = m_view[4] * dx + m_view[5] * dy - m_view[6];
+			const float wz = m_view[8] * dx + m_view[9] * dy - m_view[10];
+			if (m_daylight)
+				m_sunSky->lookupDisplay(wx, wy, wz, out);
+			else
+				m_sunSky->lookup(wx, wy, wz, out);
+			return;
 		}
+		// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
+		float t = (m_up[0] * dx + m_up[1] * dy - m_up[2]) * m_invRayLen[y * m_width + x];
+		t = t < 0.f ? 0.f : t;
+		out[0] = skyByte(m_horizon[0] + m_rise[0] * t);
+		out[1] = skyByte(m_horizon[1] + m_rise[1] * t);
+		out[2] = skyByte(m_horizon[2] + m_rise[2] * t);
+	}
+};
+
+#ifdef SWARM_RAYCAST
+// The sky of the pixels the ray caster finds empty; its rows run in output order, so its row r is buffer row height - 1 - r.
+struct RaycastSky : public SwarmRaycast::Background
+{
+	const SkyView* m_sky;
+
+	void pixel(int row, int col, unsigned char out[3]) const
+	{
+		m_sky->paint(col, m_sky->m_height - 1 - row, out);
+	}
+};
+#endif
+
+// Fills `sky` for this camera, and the per-pixel ray lengths a flat sky reads when the frame size or projection changed.
+static void prepareSky(TinyRendererVisualShapeConverterInternalData* data, const float viewMat[16], const float projMat[16], const SwarmSky* sunSky,
+					   bool daylight, SkyView& sky)
+{
+	const int width = data->m_swWidth;
+	const int height = data->m_swHeight;
+	const int up = data->m_upAxis;
+	sky.m_width = width;
+	sky.m_height = height;
+	sky.m_invP00 = 1.f / projMat[0];
+	sky.m_invP11 = 1.f / projMat[5];
+	sky.m_view = viewMat;
+	sky.m_sunSky = sunSky;
+	sky.m_daylight = daylight;
+	sky.m_invRayLen = 0;
+	if (sunSky)
 		return;
+	for (int i = 0; i < 3; i++)
+	{
+		sky.m_horizon[i] = (float)data->m_skyHorizonColor[i];
+		sky.m_rise[i] = (float)data->m_skyZenithColor[i] - sky.m_horizon[i];
+		sky.m_up[i] = viewMat[up * 4 + i];
 	}
 
-	const float hr = (float)m_data->m_skyHorizonColor[0];
-	const float hg = (float)m_data->m_skyHorizonColor[1];
-	const float hb = (float)m_data->m_skyHorizonColor[2];
-	const float sr = (float)m_data->m_skyZenithColor[0] - hr;
-	const float sg = (float)m_data->m_skyZenithColor[1] - hg;
-	const float sb = (float)m_data->m_skyZenithColor[2] - hb;
-	const float rx = viewMat[up * 4 + 0];
-	const float ry = viewMat[up * 4 + 1];
-	const float rz = viewMat[up * 4 + 2];
-
 	// The ray lengths depend only on the resolution and projection, so they are kept between frames.
-	if (m_data->m_skyRayWidth != width || m_data->m_skyRayHeight != height || m_data->m_skyRayInvP00 != invP00 || m_data->m_skyRayInvP11 != invP11)
+	const float invP00 = sky.m_invP00;
+	const float invP11 = sky.m_invP11;
+	if (data->m_skyRayWidth != width || data->m_skyRayHeight != height || data->m_skyRayInvP00 != invP00 || data->m_skyRayInvP11 != invP11)
 	{
-		m_data->m_skyInvRayLen.resize(width * height);
+		data->m_skyInvRayLen.resize(width * height);
 		for (int y = 0; y < height; ++y)
 		{
 			const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
 			for (int x = 0; x < width; ++x)
 			{
 				const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-				m_data->m_skyInvRayLen[y * width + x] = 1.f / sqrtf(dx * dx + dy * dy + 1.f);
+				data->m_skyInvRayLen[y * width + x] = 1.f / sqrtf(dx * dx + dy * dy + 1.f);
 			}
 		}
-		m_data->m_skyRayWidth = width;
-		m_data->m_skyRayHeight = height;
-		m_data->m_skyRayInvP00 = invP00;
-		m_data->m_skyRayInvP11 = invP11;
+		data->m_skyRayWidth = width;
+		data->m_skyRayHeight = height;
+		data->m_skyRayInvP00 = invP00;
+		data->m_skyRayInvP11 = invP11;
 	}
+	sky.m_invRayLen = &data->m_skyInvRayLen[0];
+}
 
-	// The shader stores channels as R, G, B at bytes 0, 1, 2 of each pixel.
-	const float* invLen = &m_data->m_skyInvRayLen[0];
-	for (int y = 0; y < height; ++y)
-	{
-		const float dy = (2.f * (y + 0.5f) / height - 1.f) * invP11;
-		for (int x = 0; x < width; ++x, pixel += bytespp)
-		{
-			const float dx = (2.f * (x + 0.5f) / width - 1.f) * invP00;
-			float t = (rx * dx + ry * dy - rz) * invLen[y * width + x];
-			t = t < 0.f ? 0.f : t;
-			pixel[0] = skyByte(hr + sr * t);
-			pixel[1] = skyByte(hg + sg * t);
-			pixel[2] = skyByte(hb + sb * t);
-		}
-	}
+// Colour buffer only: every pixel takes its sky, for the rasterised path to draw over.
+void TinyRendererVisualShapeConverter::paintSky(const float viewMat[16], const float projMat[16], const SwarmSky* sunSky, bool daylight)
+{
+	SkyView sky;
+	prepareSky(m_data, viewMat, projMat, sunSky, daylight, sky);
+	const int bytespp = m_data->m_rgbColorBuffer.get_bytespp();
+	unsigned char* pixel = m_data->m_rgbColorBuffer.buffer();
+	for (int y = 0; y < sky.m_height; ++y)
+		for (int x = 0; x < sky.m_width; ++x, pixel += bytespp)
+			sky.paint(x, y, pixel);
 }
 
 void TinyRendererVisualShapeConverter::setBatchReadCamera(int camIndex)
@@ -2040,7 +2143,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 #ifdef SWARM_RAYCAST
-		const SwarmRaycast& raycast = m_data->syncRaycast();
+		const SwarmRaycast& raycast = m_data->syncRaycast(false);
 		// All cameras go into one tile schedule, so the threads share the whole batch, not one camera each.
 		btAlignedObjectArray<SwarmRaycast::Target> targets;
 		targets.resize(numCameras);
@@ -2053,6 +2156,7 @@ bool TinyRendererVisualShapeConverter::renderDepthBatch(const float* viewMatrice
 			targets[cam].m_depth = zbuf;
 			targets[cam].m_seg = 0;
 			targets[cam].m_rgb = 0;
+			targets[cam].m_background = 0;
 		}
 		raycast.render(&targets[0], numCameras, projMat, width, height, 0, renderThreads, (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
 #else
@@ -2178,12 +2282,24 @@ void TinyRendererVisualShapeConverter::render()
 	render(viewMat, projMat);
 }
 
+// True when two poses and scalings hold the same bits in every component a render reads.
+static bool samePose(const btTransform& a, const btVector3& aScaling, const btTransform& b, const btVector3& bScaling)
+{
+	const size_t row = 3 * sizeof(btScalar);
+	for (int r = 0; r < 3; r++)
+		if (memcmp(&a.getBasis()[r][0], &b.getBasis()[r][0], row) != 0)
+			return false;
+	return memcmp(&a.getOrigin()[0], &b.getOrigin()[0], row) == 0 && memcmp(&aScaling[0], &bScaling[0], row) == 0;
+}
+
 void TinyRendererVisualShapeConverter::syncTransform(int shapeUniqueId, const btTransform& worldTransform, const btVector3& localScaling)
 {
 	TinyRendererObjectArray** renderObjPtr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (renderObjPtr)
 	{
 		TinyRendererObjectArray* renderObj = *renderObjPtr;
+		if (!samePose(renderObj->m_worldTransform, renderObj->m_localScaling, worldTransform, localScaling))
+			renderObj->m_raycastDirty = true;
 		renderObj->m_worldTransform = worldTransform;
 		renderObj->m_localScaling = localScaling;
 	}
@@ -2326,7 +2442,13 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 			glint.m_skyZenith[i] = (float)m_data->m_skyZenithColor[i];
 		}
 	}
-	if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
+	const bool sky = (sunSky || m_data->m_hasSky) && !depthOnly && !thermal;
+	// The ray caster paints its own sky; a build without it keeps the painted one on the warning path below.
+	bool raycastSky = false;
+#ifdef SWARM_RAYCAST
+	raycastSky = (m_data->m_flags & ER_SWARM_RAYCAST) != 0;
+#endif
+	if (sky && !raycastSky)
 	{
 		paintSky(viewMat, projMat, sunSky, daylight);
 	}
@@ -2334,15 +2456,18 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 	if ((m_data->m_flags & ER_SWARM_RAYCAST) != 0)
 	{
 		// Depth, segmentation and colour come from the ray caster, already in output row order; a
-		// pixel that hits nothing keeps what clearBuffers left in it.
+		// pixel that hits nothing takes the sky, or keeps what clearBuffers left in it when there is none.
 #ifdef SWARM_RAYCAST
 		const bool noSeg = (m_data->m_flags & ER_NO_SEGMENTATION_MASK) != 0;
 		const int numPixels = m_data->m_swWidth * m_data->m_swHeight;
-		// The sky is painted for the flip the rasterised path does once it has drawn; this path
-		// writes its rows the right way up and never flips, so the sky is turned over here.
-		if ((sunSky || m_data->m_hasSky) && !depthOnly && !thermal)
-			m_data->m_rgbColorBuffer.flip_vertically();
-		SwarmRaycastShading shading;
+		// The ray caster asks for the sky only where a ray meets nothing.
+		SkyView skyView;
+		RaycastSky background;
+		background.m_sky = &skyView;
+		if (sky && numPixels)
+			prepareSky(m_data, viewMat, projMat, sunSky, daylight, skyView);
+		// Zeroed first, padding included, so ER_SWARM_FRAME_REUSE compares the terms and nothing else.
+		SwarmRaycastShading shading = SwarmRaycastShading();
 		for (int i = 0; i < 3; i++)
 		{
 			shading.m_lightDir[i] = (float)lightDirWorld[i];
@@ -2359,13 +2484,21 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_moverShadow = (m_data->m_flags & ER_SWARM_MOVER_SHADOW) != 0;
 		shading.m_textureFilter = (m_data->m_flags & ER_TEXTURE_FILTER) != 0;
 		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
+		shading.m_edgeOutline = (m_data->m_flags & ER_SWARM_EDGE_OUTLINE) != 0;
+		shading.m_creaseFill = (m_data->m_flags & ER_SWARM_CREASE_FILL) != 0;
 		shading.m_linearLight = (m_data->m_flags & ER_SWARM_LINEAR_LIGHT) != 0;
 		shading.m_daylight = daylight;
 		shading.m_sky = (daylight && sunSky && sunSky->daylightBuilt()) ? sunSky : 0;
 		shading.m_exposure = m_data->m_exposure;
 		shading.m_hazeDistance = m_data->m_hazeDistance;
 		shading.m_shadowCoreRadius = m_data->m_shadowCoreRadius;
-		shading.m_glint = glint;
+		shading.m_glint.m_enabled = glint.m_enabled;
+		shading.m_glint.m_upAxis = glint.m_upAxis;
+		for (int i = 0; i < 3; i++)
+		{
+			shading.m_glint.m_skyHorizon[i] = glint.m_skyHorizon[i];
+			shading.m_glint.m_skyZenith[i] = glint.m_skyZenith[i];
+		}
 		shading.m_thermal = thermal;
 		shading.m_airTemperature = m_data->m_airTemperature;
 		shading.m_skyTemperature = m_data->m_skyTemperature;
@@ -2376,9 +2509,44 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_depth = numPixels ? &m_data->m_depthBuffer[0] : 0;
 		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
-		m_data->syncRaycast().render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
+		target.m_background = (sky && numPixels) ? &background : 0;
+		// ER_SWARM_FRAME_REUSE: what the frame reads beyond camera, shading and scene, which a reused frame must match too.
+		struct ReuseKey
+		{
+			unsigned long long m_pictureRevision;
+			double m_skyHorizon[3];
+			double m_skyZenith[3];
+			float m_skyYaw;
+			int m_flags;
+			int m_upAxis;
+			int m_hasSky;
+			int m_hasSkyClouds;
+			int m_skyCloudSeed;
+			int m_hasPhoto;
+			int m_skyTextureId;
+			int m_sunSky;
+		} reuse;
+		memset(&reuse, 0, sizeof(reuse));
+		reuse.m_pictureRevision = m_data->m_pictureRevision;
+		for (int i = 0; i < 3; i++)
+		{
+			reuse.m_skyHorizon[i] = m_data->m_skyHorizonColor[i];
+			reuse.m_skyZenith[i] = m_data->m_skyZenithColor[i];
+		}
+		reuse.m_skyYaw = m_data->m_skyYaw;
+		reuse.m_flags = m_data->m_flags;
+		reuse.m_upAxis = m_data->m_upAxis;
+		reuse.m_hasSky = m_data->m_hasSky;
+		reuse.m_hasSkyClouds = m_data->m_hasSkyClouds;
+		reuse.m_skyCloudSeed = m_data->m_skyCloudSeed;
+		reuse.m_hasPhoto = hasPhoto;
+		reuse.m_skyTextureId = m_data->m_skyTextureId;
+		reuse.m_sunSky = sunSky != 0;
+		const bool reuseAsked = (m_data->m_flags & ER_SWARM_FRAME_REUSE) != 0;
+		m_data->syncRaycast(shading.m_moverShadow).render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
-									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
+									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0,
+									 reuseAsked ? &reuse : 0, reuseAsked ? sizeof(reuse) : 0);
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif
@@ -2593,7 +2761,9 @@ void TinyRendererVisualShapeConverter::setWidthAndHeight(int width, int height)
 	m_data->m_depthBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_shadowBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
 	m_data->m_segmentationMaskBuffer.resize(m_data->m_swWidth * m_data->m_swHeight);
-	m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
+	// Every frame writes each colour pixel before it is read, so a buffer of the right size is kept.
+	if (m_data->m_rgbColorBuffer.get_width() != width || m_data->m_rgbColorBuffer.get_height() != height)
+		m_data->m_rgbColorBuffer = TGAImage(width, height, TGAImage::RGB);
 }
 
 void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixelsRGBA, int rgbaBufferSizeInPixels,
@@ -2645,10 +2815,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 
 		if (segmentationMaskBuffer)
 		{
+			const int* src = &m_data->m_segmentationMaskBuffer[startPixelIndex];
+			const bool objectOnly = (m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				int segMask = m_data->m_segmentationMaskBuffer[i + startPixelIndex];
-				if ((m_data->m_flags & ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX) == 0)
+				int segMask = src[i];
+				if (objectOnly)
 				{
 					//if we don't explicitly request link index, clear it out
 					//object index are the lower 24bits
@@ -2664,11 +2836,12 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 		// In depth-only mode nothing was shaded, so the color buffer holds no image.
 		if (pixelsRGBA && !depthOnly)
 		{
+			const unsigned char* rgb = m_data->m_rgbColorBuffer.buffer() + (size_t)startPixelIndex * 3;
 			for (int i = 0; i < numRequestedPixels; i++)
 			{
-				pixelsRGBA[i * numBytesPerPixel] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 0];
-				pixelsRGBA[i * numBytesPerPixel + 1] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 1];
-				pixelsRGBA[i * numBytesPerPixel + 2] = m_data->m_rgbColorBuffer.buffer()[(i + startPixelIndex) * 3 + 2];
+				pixelsRGBA[i * numBytesPerPixel] = rgb[i * 3 + 0];
+				pixelsRGBA[i * numBytesPerPixel + 1] = rgb[i * 3 + 1];
+				pixelsRGBA[i * numBytesPerPixel + 2] = rgb[i * 3 + 2];
 				pixelsRGBA[i * numBytesPerPixel + 3] = 255;
 			}
 		}
@@ -2680,6 +2853,7 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 
 int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId, int linkIndex, const double* positions, int numVertices)
 {
+	m_data->m_pictureRevision++;
 	int updated = 0;
 	if (!positions || numVertices <= 0)
 		return 0;
@@ -2709,9 +2883,10 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 			}
 			model->recomputeNormals();
 			renderObj->computeLocalAABB();
+			visuals->m_raycastDirty = true;
 #ifdef SWARM_RAYCAST
-			if (m_data->m_raycast)
-				m_data->m_raycast->meshChanged(renderObj);
+			if (m_data->m_raycast && m_data->m_raycast->meshChanged(renderObj))
+				m_data->m_raycastSyncAll = true;
 #endif
 			updated++;
 		}
@@ -2721,6 +2896,7 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 
 void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 {
+	m_data->m_pictureRevision++;
 	TinyRendererObjectArray** ptrptr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (ptrptr && *ptrptr)
 	{
@@ -2744,6 +2920,7 @@ void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 
 void TinyRendererVisualShapeConverter::resetAll()
 {
+	m_data->m_pictureRevision++;
 #ifdef SWARM_RAYCAST
 	if (m_data->m_raycast)
 		m_data->m_raycast->removeAll();
@@ -2775,11 +2952,9 @@ void TinyRendererVisualShapeConverter::resetAll()
 	m_data->m_sunSky.forgetPhoto();
 	for (int i = 0; i < m_data->m_textures.size(); i++)
 	{
+		// A named texture is pinned, so the renderer's copy outlives this world and the loader keeps handing out its name.
 		if (!m_data->m_textures[i].m_name.empty())
-		{
 			TinyRender::releaseSharedTexture(m_data->m_textures[i].m_name.c_str());
-			b3ImportMeshUtility::forgetCachedTexture(m_data->m_textures[i].m_name.c_str());
-		}
 		if (!m_data->m_textures[i].m_isCached)
 		{
 			free(m_data->m_textures[i].textureData1);
@@ -2793,6 +2968,7 @@ void TinyRendererVisualShapeConverter::resetAll()
 
 void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int jointIndex, int shapeIndex, int textureUniqueId)
 {
+	m_data->m_pictureRevision++;
 	btAssert(textureUniqueId < m_data->m_textures.size());
 	if (textureUniqueId >= -1 && textureUniqueId < m_data->m_textures.size())
 	{
@@ -2805,6 +2981,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 
 			if (visualArray->m_objectUniqueId == bodyUniqueId && visualArray->m_linkIndex == jointIndex)
 			{
+				visualArray->m_raycastDirty = true;
 				for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
 				{
 					TinyRenderObjectData* renderObj = visualArray->m_renderObjects[v];
@@ -2832,6 +3009,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
 													 int textureUniqueId, float low, float high)
 {
+	m_data->m_pictureRevision++;
 	// A heat map reads the texels the plugin keeps for a loaded texture; one handed over to a mesh has none left here.
 	const unsigned char* heatTexels = 0;
 	int heatWidth = 0, heatHeight = 0;
@@ -2880,6 +3058,7 @@ void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkI
 
 int TinyRendererVisualShapeConverter::registerTexture(unsigned char* texels, int width, int height)
 {
+	m_data->m_pictureRevision++;
 	MyTexture2 texData;
 	texData.m_width = width;
 	texData.m_height = height;
@@ -2892,6 +3071,7 @@ int TinyRendererVisualShapeConverter::registerTexture(unsigned char* texels, int
 
 int TinyRendererVisualShapeConverter::loadTextureFile(const char* filename, struct CommonFileIOInterface* fileIO)
 {
+	m_data->m_pictureRevision++;
 	B3_PROFILE("loadTextureFile");
 	int width, height, n;
 	unsigned char* image = 0;

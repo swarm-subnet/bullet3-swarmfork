@@ -157,6 +157,7 @@ struct TinyRenderObjectData
 	TinyRender::Matrix placementMatrix(size_t index) const;
 	bool m_renderTreeCache;  // VISUAL_SHAPE_RENDER_TREE_CACHE: the ray-cast tree of this static body is kept on disk
 	bool m_glass;  // VISUAL_SHAPE_GLASS: a thin pane on the daylight path, sky by Fresnel plus the tinted view through
+	bool m_glassBacked;  // VISUAL_SHAPE_GLASS_BACKED: the pane is a module over a white backsheet, nothing seen through
 	TinyRenderThermal m_thermal;
 	TinyRenderGlint m_glint;
 

@@ -50,31 +50,52 @@ inline std::vector<float> gaussianKernel(float sigma)
 	return taps;
 }
 
+// `buffer` grown to `size` floats and kept for the next frame; callers write every element before reading it.
+inline float* reuse(std::vector<float>& buffer, size_t size)
+{
+	if (buffer.size() < size)
+		buffer.resize(size);
+	return &buffer[0];
+}
+
 // Separable blur with the edge pixel repeated, rows then columns; each output pixel sums its taps in one fixed order.
 // Pixels a full radius from the border skip the clamp, which reads the same samples in the same order.
 inline void blur(const float* in, float* out, int width, int height, const std::vector<float>& taps, int threads)
 {
 	const int radius = (int)taps.size() / 2;
 	const float* tap = &taps[(size_t)radius];
-	std::vector<float> rows((size_t)width * height);
+	const int inner0 = radius < width ? radius : width;
+	const int inner1 = width - radius > inner0 ? width - radius : inner0;
+	static thread_local std::vector<float> rowsBuffer;
+	float* rows = reuse(rowsBuffer, (size_t)width * height);
 #pragma omp parallel for num_threads(threads) schedule(static)
 	for (int y = 0; y < height; y++)
 	{
 		const float* line = in + (size_t)y * width;
+		float* acc = &rows[(size_t)y * width];
 		for (int x = 0; x < width; x++)
 		{
-			float acc = 0.0f;
-			if (x >= radius && x + radius < width)
-				for (int k = -radius; k <= radius; k++)
-					acc += tap[k] * line[x + k];
-			else
-				for (int k = -radius; k <= radius; k++)
-				{
-					int sx = x + k;
-					sx = sx < 0 ? 0 : (sx >= width ? width - 1 : sx);
-					acc += tap[k] * line[sx];
-				}
-			rows[(size_t)y * width + x] = acc;
+			if (x == inner0)
+				x = inner1;
+			if (x >= width)
+				break;
+			float sum = 0.0f;
+			for (int k = -radius; k <= radius; k++)
+			{
+				int sx = x + k;
+				sx = sx < 0 ? 0 : (sx >= width ? width - 1 : sx);
+				sum += tap[k] * line[sx];
+			}
+			acc[x] = sum;
+		}
+		// The inner run one tap at a time: each pixel still adds its taps from -radius up.
+		for (int x = inner0; x < inner1; x++)
+			acc[x] = 0.0f;
+		for (int k = -radius; k <= radius; k++)
+		{
+			const float t = tap[k];
+			for (int x = inner0; x < inner1; x++)
+				acc[x] += t * line[x + k];
 		}
 	}
 	// Columns a whole row at a time: each pixel still adds its taps from -radius up, so the sums are the same.

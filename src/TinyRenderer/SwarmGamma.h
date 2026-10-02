@@ -52,9 +52,15 @@ inline bool swarmSrgbReaches(float linear, int b)
 struct SwarmSrgbStart
 {
 	unsigned char m_byte[4096];
+	// Every cut swarmSrgbReaches tests, and past byte 255 one no value below 1 reaches.
+	float m_cut[257];
 
 	SwarmSrgbStart()
 	{
+		m_cut[0] = 0.0f;
+		for (int b = 1; b < 256; b++)
+			m_cut[b] = (kSwarmSrgbToLinear[b - 1] + kSwarmSrgbToLinear[b]) * 0.5f;
+		m_cut[256] = 2.0f;
 		for (int i = 0; i < 4096; i++)
 		{
 			const float linear = (float)i * (1.0f / 4096.0f);
@@ -81,10 +87,9 @@ inline unsigned char swarmLinearToSrgb(float linear)
 		return 0;
 	if (linear >= 1.0f)
 		return 255;
-	int b = kSwarmSrgbStart.m_byte[(int)(linear * 4096.0f)];
-	while (b < 255 && swarmSrgbReaches(linear, b + 1))
-		b++;
-	return (unsigned char)b;
+	// One step at most, since linear * 4096 is exact.
+	const int b = kSwarmSrgbStart.m_byte[(int)(linear * 4096.0f)];
+	return (unsigned char)(b + (linear >= kSwarmSrgbStart.m_cut[b + 1] ? 1 : 0));
 }
 
 // Linear light of a 0..1 display value, rounded to the byte a painted pixel of it would carry.

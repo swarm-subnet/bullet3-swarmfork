@@ -17,6 +17,7 @@ subject to the following restrictions:
 
 #include "btDbvtBroadphase.h"
 #include "LinearMath/btThreads.h"
+#include <string.h>
 btScalar gDbvtMargin = btScalar(0.05);
 //
 // Profiling
@@ -68,6 +69,14 @@ static inline void listremove(T* item, T*& list)
 	else
 		list = item->links[1];
 	if (item->links[1]) item->links[1]->links[0] = item->links[0];
+}
+
+// Whether a leaf holds these bounds and they are a box; a NaN bound fails every comparison.
+static inline bool holdsBounds(const btDbvtNode* leaf, const btDbvtVolume& aabb)
+{
+	const btVector3& mi = aabb.Mins();
+	const btVector3& mx = aabb.Maxs();
+	return mi.x() <= mx.x() && mi.y() <= mx.y() && mi.z() <= mx.z() && leaf->volume.Contain(aabb);
 }
 
 //
@@ -190,6 +199,7 @@ btBroadphaseProxy* btDbvtBroadphase::createProxy(const btVector3& aabbMin,
 	proxy->stage = m_stageCurrent;
 	proxy->m_uniqueId = ++m_gid;
 	proxy->leaf = m_sets[0].insert(aabb, proxy);
+	proxy->settled = holdsBounds(proxy->leaf, aabb);
 	listappend(proxy, m_stageRoots[m_stageCurrent]);
 	if (!m_deferedcollide)
 	{
@@ -314,6 +324,16 @@ void btDbvtBroadphase::setAabb(btBroadphaseProxy* absproxy,
 							   btDispatcher* /*dispatcher*/)
 {
 	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	// Same bounds on a settled dynamic-set proxy: the update below would only count the call and move the stage.
+	if (proxy->stage != STAGECOUNT && proxy->settled && !memcmp(&proxy->m_aabbMin, &aabbMin, sizeof(btVector3)) &&
+		!memcmp(&proxy->m_aabbMax, &aabbMax, sizeof(btVector3)))
+	{
+		++m_updates_call;
+		listremove(proxy, m_stageRoots[proxy->stage]);
+		proxy->stage = m_stageCurrent;
+		listappend(proxy, m_stageRoots[m_stageCurrent]);
+		return;
+	}
 	ATTRIBUTE_ALIGNED16(btDbvtVolume)
 	aabb = btDbvtVolume::FromMM(aabbMin, aabbMax);
 #if DBVT_BP_PREVENTFALSEUPDATE
@@ -358,6 +378,7 @@ void btDbvtBroadphase::setAabb(btBroadphaseProxy* absproxy,
 		proxy->m_aabbMin = aabbMin;
 		proxy->m_aabbMax = aabbMax;
 		proxy->stage = m_stageCurrent;
+		proxy->settled = holdsBounds(proxy->leaf, aabb);
 		listappend(proxy, m_stageRoots[m_stageCurrent]);
 		if (docollide)
 		{
@@ -400,6 +421,7 @@ void btDbvtBroadphase::setAabbForceUpdate(btBroadphaseProxy* absproxy,
 	proxy->m_aabbMin = aabbMin;
 	proxy->m_aabbMax = aabbMax;
 	proxy->stage = m_stageCurrent;
+	proxy->settled = holdsBounds(proxy->leaf, aabb);
 	listappend(proxy, m_stageRoots[m_stageCurrent]);
 	if (docollide)
 	{

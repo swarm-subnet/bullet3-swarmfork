@@ -5,9 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
+#include <list>
 #include <map>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+#include <xmmintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -37,6 +42,8 @@ const int kTileSize = 16;
 // scene builds fast and a large one keeps a bounded map.
 const int kShadowMapMaxCells = 4096;
 const float kShadowMapMinCell = 0.005f;
+// Side of the square blocks a shadow map is cast in, each the first time a lookup reads one of its cells.
+const int kShadowBlock = 32;
 // Daylight: the sun share a leaf passes to its back, and the coated glass curve: flat until the view grazes, then a full mirror.
 const float kLeafTransmit = 0.35f;
 const float kGlassFlat = 0.055f;
@@ -46,6 +53,8 @@ const float kGlassMirrorFromCos = 0.20f;
 const float kPaneF0 = 0.04f;
 const float kPaneBias = 2e-3f;
 const int kPaneDepth = 3;
+// VISUAL_SHAPE_GLASS_BACKED: the white backsheet behind a module's cells, as an sRGB byte, as the solar park's racking paints it.
+const float kPaneBacking = 254.0f;
 // A texel with alpha below this is a hole when cut-outs are on.
 const unsigned char kAlphaCutoff = 128;
 // A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
@@ -77,6 +86,9 @@ inline void normalize3(float v[3])
 	}
 }
 
+struct Instance;
+struct Batch;
+
 // The light's view of the static tree: a grid laid across the map at right angles to the light, and
 // for each cell how far a ray from the light side travels before it meets a drawn surface.
 struct ShadowMap
@@ -90,7 +102,16 @@ struct ShadowMap
 	float m_cell;
 	int m_cols;
 	int m_rows;
-	std::vector<float> m_depth;  // INFINITY where the ray met nothing
+	// Cast block by block while frames read the map, hence mutable behind the const lookups.
+	mutable std::unique_ptr<float[]> m_depth;  // INFINITY where the ray met nothing
+	// Per block of kShadowBlock x kShadowBlock cells: 0 not cast, 1 being cast, 2 cast.
+	mutable std::unique_ptr<std::atomic<unsigned char>[]> m_blocks;
+	int m_blockCols;
+	// The tree a block is cast against and what the hit filter reads, set before every frame.
+	RTCScene m_scene;
+	const std::vector<Instance*>* m_instances;
+	const std::vector<Batch*>* m_batches;
+	unsigned m_forestId;
 	bool m_built;
 	// Whether the cells were cast with cut-outs on; the map is recast when a frame asks for the other.
 	bool m_alphaCutout;
@@ -124,7 +145,26 @@ struct StaticMember
 	bool m_glass;
 	// The texture carries an alpha plane, so hits may be cut out.
 	bool m_hasAlpha;
+	// The render object's texture revision the shadow maps last saw.
+	unsigned m_textureRevision;
 	int m_segmentation;
+};
+
+struct CachedTree;
+// The process's mesh trees by vertex and triangle count, and the idle ones, least recently used first.
+typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
+typedef std::list<CachedTree*> IdleTrees;
+
+// A mesh tree over its own copy of the arrays, kept for the process: a later world with equal arrays gets the same tree.
+struct CachedTree
+{
+	RTCScene m_scene;
+	RTCGeometry m_geometry;
+	size_t m_triangles;
+	// Worlds drawing the tree now; at zero the tree waits at m_idle for a later world.
+	int m_users;
+	TreeCache::iterator m_entry;
+	IdleTrees::iterator m_idle;
 };
 
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
@@ -134,6 +174,8 @@ struct MeshTree
 {
 	RTCScene m_scene;
 	RTCGeometry m_geometry;
+	// The process-wide tree m_scene and m_geometry belong to, until the mesh is rewritten; 0 when they are this tree's own.
+	CachedTree* m_cached;
 	std::vector<float> m_vertices;
 	std::vector<unsigned> m_indices;
 	// Per-vertex unit normals in the mesh's own frame, and uv pairs, indexed like m_vertices.
@@ -196,6 +238,8 @@ struct Batch
 	MeshTree* m_tree;
 	// One 3x4 column-major world transform per placement, shared with Embree.
 	std::vector<float> m_transforms;
+	// Row-major inverse transpose of each placement's 3x3 part, which carries the mesh normals into world space.
+	std::vector<float> m_normalRotations;
 	float m_bodyTransform[16];
 	bool m_enabled;
 	bool m_doubleSided;
@@ -228,7 +272,89 @@ struct QueryContext
 	// Angle one pixel spans on the filtered camera rays, 0 on every other ray: a cut-out is then read over the
 	// pixel's footprint instead of one texel, so a far chain-link or leaf card fades instead of breaking into moire.
 	float m_pixelSpread;
+	// How far along its ray any camera ray of this thread got this frame, for the region a kept frame depends on.
+	float m_farthest;
 };
+
+// Casts the shadow-map cells [col0, col1) x [row0, row1) along -light; each ray depends only on the map and the tree.
+void castShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row1)
+{
+	const float dir[3] = {-map.m_lightDir[0], -map.m_lightDir[1], -map.m_lightDir[2]};
+	QueryContext ctx;
+	rtcInitRayQueryContext(&ctx.m_context);
+	ctx.m_instances = map.m_instances;
+	ctx.m_batches = map.m_batches;
+	ctx.m_forestId = map.m_forestId;
+	ctx.m_anyWinding = true;
+	ctx.m_alphaCutout = map.m_alphaCutout;
+	ctx.m_leafNoShadow = map.m_leafNoShadow;
+	ctx.m_pixelSpread = 0.0f;
+	RTCIntersectArguments args;
+	rtcInitIntersectArguments(&args);
+	args.context = &ctx.m_context;
+	for (int row = row0; row < row1; row++)
+	{
+		const float v = ((float)row + 0.5f) * map.m_cell;
+		for (int col = col0; col < col1; col++)
+		{
+			const float u = ((float)col + 0.5f) * map.m_cell;
+			RTCRayHit rayhit;
+			rayhit.ray.org_x = map.m_origin[0] + map.m_axisU[0] * u + map.m_axisV[0] * v;
+			rayhit.ray.org_y = map.m_origin[1] + map.m_axisU[1] * u + map.m_axisV[1] * v;
+			rayhit.ray.org_z = map.m_origin[2] + map.m_axisU[2] * u + map.m_axisV[2] * v;
+			rayhit.ray.dir_x = dir[0];
+			rayhit.ray.dir_y = dir[1];
+			rayhit.ray.dir_z = dir[2];
+			rayhit.ray.tnear = 0.0f;
+			rayhit.ray.tfar = INFINITY;
+			rayhit.ray.time = 0.0f;
+			rayhit.ray.mask = (unsigned)-1;
+			rayhit.ray.id = 0;
+			rayhit.ray.flags = 0;
+			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+			rtcIntersect1(map.m_scene, &rayhit, &args);
+			map.m_depth[(size_t)row * map.m_cols + col] = rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID ? INFINITY : rayhit.ray.tfar;
+		}
+	}
+}
+
+// Casts every uncast block with a cell in [col0, col1] x [row0, row1]; the first thread to claim one casts it, others wait.
+void castShadowBlocks(const ShadowMap& map, int col0, int col1, int row0, int row1)
+{
+	col0 = col0 < 0 ? 0 : col0;
+	row0 = row0 < 0 ? 0 : row0;
+	col1 = col1 >= map.m_cols ? map.m_cols - 1 : col1;
+	row1 = row1 >= map.m_rows ? map.m_rows - 1 : row1;
+	for (int blockRow = row0 / kShadowBlock; blockRow <= row1 / kShadowBlock && row0 <= row1; blockRow++)
+		for (int blockCol = col0 / kShadowBlock; blockCol <= col1 / kShadowBlock && col0 <= col1; blockCol++)
+		{
+			std::atomic<unsigned char>& state = map.m_blocks[(size_t)blockRow * map.m_blockCols + blockCol];
+			if (state.load(std::memory_order_acquire) == 2)
+				continue;
+			unsigned char expected = 0;
+			if (state.compare_exchange_strong(expected, 1, std::memory_order_acquire))
+			{
+				const int c0 = blockCol * kShadowBlock, r0 = blockRow * kShadowBlock;
+				castShadowCells(map, c0, c0 + kShadowBlock < map.m_cols ? c0 + kShadowBlock : map.m_cols, r0,
+								r0 + kShadowBlock < map.m_rows ? r0 + kShadowBlock : map.m_rows);
+				state.store(2, std::memory_order_release);
+			}
+			else
+				while (state.load(std::memory_order_acquire) != 2)
+					std::this_thread::yield();
+		}
+}
+
+// Makes sure the cells [col0, col1] x [row0, row1] are cast; cells inside one block already cast cost one load.
+inline void ensureShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row1)
+{
+	if (col0 >= 0 && row0 >= 0 && col1 < map.m_cols && row1 < map.m_rows && col0 / kShadowBlock == col1 / kShadowBlock &&
+		row0 / kShadowBlock == row1 / kShadowBlock &&
+		map.m_blocks[(size_t)(row0 / kShadowBlock) * map.m_blockCols + col0 / kShadowBlock].load(std::memory_order_acquire) == 2)
+		return;
+	castShadowBlocks(map, col0, col1, row0, row1);
+}
 
 // A double-sided cut-out surface is a leaf or grass card, which casts nothing when leaf shadows are off.
 inline bool leafCard(bool doubleSided, bool hasAlpha)
@@ -320,11 +446,28 @@ inline float placementSign(const float* t)
 	return det < 0.0f ? -1.0f : 1.0f;
 }
 
+// A hinted search's nearest and next kept hit, searched a window past the nearest so box rounding cannot reorder them.
+struct HintedSearch
+{
+	// The ray's world direction, and the coordinate size its window allows for.
+	float m_dir[3];
+	float m_largest;
+	float m_limit;
+	float m_window;
+	float m_nearest;
+	float m_next;
+	bool m_oblique;
+	RTCHit m_hit;
+};
+thread_local HintedSearch* t_hintedSearch = 0;
+// Below this ray-face cosine, at the window's coordinate size, the face's own distance rounds beyond the window.
+const float kHintMinFacing = 1.0f / 16.0f;
+
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
 // filter does the same in object space, where Embree hands over both the ray and the hit. Static
 // members also drop out here when retired or fully transparent, so the static tree is never rebuilt.
 // With cut-outs on, a hit on a see-through texel drops out too and the ray carries on behind it.
-void hitFilter(const RTCFilterFunctionNArguments* args)
+void keepHit(const RTCFilterFunctionNArguments* args)
 {
 	if (args->N != 1)
 		return;
@@ -409,6 +552,70 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
 		args->valid[0] = 0;
+}
+
+// The ray-face cosine in world space, scaled down by how far the hit frame's coordinates outgrow the window's.
+float hintFacing(const RTCFilterFunctionNArguments* args, const RTCHit* hit, const RTCRay* ray, float t, const HintedSearch& search)
+{
+	const QueryContext* ctx = (const QueryContext*)args->context;
+	const float local[3] = {hit->Ng_x, hit->Ng_y, hit->Ng_z};
+	float normal[3] = {local[0], local[1], local[2]};
+	if (!args->geometryUserPtr)
+	{
+		unsigned placement = 0;
+		const Batch* batch = hitBatch(ctx, hit, placement);
+		const Instance* inst = batch ? 0 : hitInstance(ctx, hit);
+		if (batch)
+		{
+			const float* m = &batch->m_normalRotations[(size_t)placement * 9];
+			for (int r = 0; r < 3; r++)
+				normal[r] = dot3(m + r * 3, local);
+		}
+		else if (inst)
+		{
+			// Cofactors of the instance's 3x3 part: its inverse transpose up to a scale the cosine drops.
+			const float* m = inst->m_transform;
+			const float a[3] = {m[0], m[1], m[2]}, b[3] = {m[4], m[5], m[6]}, c[3] = {m[8], m[9], m[10]};
+			float rows[3][3];
+			cross3(b, c, rows[0]);
+			cross3(c, a, rows[1]);
+			cross3(a, b, rows[2]);
+			for (int r = 0; r < 3; r++)
+				normal[r] = (rows[0][r] * local[0] + rows[1][r] * local[1]) + rows[2][r] * local[2];
+		}
+		else
+			return 0.0f;
+	}
+	const float org[3] = {ray->org_x, ray->org_y, ray->org_z};
+	const float dir[3] = {ray->dir_x, ray->dir_y, ray->dir_z};
+	const float size = sqrtf(dot3(org, org) / dot3(dir, dir)) + t;
+	const float scale = size > search.m_largest ? search.m_largest / size : 1.0f;
+	return fabsf(dot3(search.m_dir, normal)) / sqrtf(dot3(normal, normal)) * scale;
+}
+
+// The camera rays' filter: keepHit, and under a hinted search the note of each kept hit.
+void hitFilter(const RTCFilterFunctionNArguments* args)
+{
+	keepHit(args);
+	if (args->N != 1 || !args->valid[0])
+		return;
+	HintedSearch* search = t_hintedSearch;
+	if (!search)
+		return;
+	RTCRay* ray = (RTCRay*)args->ray;
+	const RTCHit* hit = (const RTCHit*)args->hit;
+	const float t = ray->tfar;
+	if (t < search->m_nearest)
+	{
+		search->m_next = search->m_nearest;
+		search->m_nearest = t;
+		search->m_hit = *hit;
+		search->m_oblique = !(hintFacing(args, hit, ray, t, *search) >= kHintMinFacing);
+	}
+	else if (t < search->m_next)
+		search->m_next = t;
+	const float end = search->m_nearest + 2.0f * search->m_window;
+	ray->tfar = end < search->m_limit ? end : search->m_limit;
 }
 
 void reportError(void* userPtr, RTCError code, const char* message)
@@ -533,6 +740,96 @@ RTCGeometry newTriangles(RTCDevice device, std::vector<float>& vertices, std::ve
 	rtcSetGeometryIntersectFilterFunction(geometry, hitFilter);
 	rtcSetGeometryOccludedFilterFunction(geometry, shadowFilter);
 	return geometry;
+}
+
+// One never-released device, since cached trees outlive their world; threads=1 so builds run only on committing threads.
+RTCDevice processDevice()
+{
+	static const RTCDevice device = rtcNewDevice("threads=1,set_affinity=0");
+	return device;
+}
+
+// Commits a scene on up to two render threads; Embree's build tasks, and so the tree, ignore the thread count.
+void joinCommit(RTCScene scene)
+{
+	// The internal scheduler of a one-thread device has room for two threads in a build.
+	const int threads = b3GetSwarmRenderThreads() < 2 ? 1 : 2;
+	// A joining thread builds with the caller's MXCSR (rounding, flush to zero, denormals are zero), then gets its own back.
+	const unsigned int callerCsr = _mm_getcsr();
+#pragma omp parallel num_threads(threads)
+	{
+		const unsigned int ownCsr = _mm_getcsr();
+		_mm_setcsr(callerCsr);
+		rtcJoinCommitScene(scene);
+		_mm_setcsr(ownCsr);
+	}
+}
+
+// Weight of idle trees kept, oldest dropped first; a tree weighs its triangles plus a fixed share, so tiny ones count.
+const size_t kTreeCacheIdleWeight = 2000000;
+const size_t kTreeCacheEntryWeight = 1000;
+
+TreeCache gTreeCache;
+IdleTrees gIdleTrees;
+size_t gIdleWeight = 0;
+
+// The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
+CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
+{
+	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
+	const std::pair<size_t, size_t> key(numVertices, numTriangles);
+	const std::pair<TreeCache::iterator, TreeCache::iterator> range = gTreeCache.equal_range(key);
+	for (TreeCache::iterator it = range.first; it != range.second; ++it)
+	{
+		CachedTree* tree = it->second;
+		if (memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
+			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
+			continue;
+		if (tree->m_users++ == 0)
+		{
+			gIdleTrees.erase(tree->m_idle);
+			gIdleWeight -= numTriangles + kTreeCacheEntryWeight;
+		}
+		return tree;
+	}
+	CachedTree* tree = new CachedTree;
+	tree->m_triangles = numTriangles;
+	tree->m_users = 1;
+	tree->m_scene = rtcNewScene(device);
+	rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
+	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
+	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
+	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3 * sizeof(float), numVertices),
+		   &vertices[0], numVertices * 3 * sizeof(float));
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, 3 * sizeof(unsigned), numTriangles),
+		   &indices[0], indices.size() * sizeof(unsigned));
+	rtcSetGeometryIntersectFilterFunction(tree->m_geometry, hitFilter);
+	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
+	rtcCommitGeometry(tree->m_geometry);
+	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
+	joinCommit(tree->m_scene);
+	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
+	return tree;
+}
+
+// A world stops drawing the tree; once idle it stays for a later world while the idle ones fit the bound.
+void releaseCachedTree(CachedTree* tree)
+{
+	if (--tree->m_users > 0)
+		return;
+	tree->m_idle = gIdleTrees.insert(gIdleTrees.end(), tree);
+	gIdleWeight += tree->m_triangles + kTreeCacheEntryWeight;
+	while (gIdleWeight > kTreeCacheIdleWeight)
+	{
+		CachedTree* drop = gIdleTrees.front();
+		gIdleTrees.pop_front();
+		gIdleWeight -= drop->m_triangles + kTreeCacheEntryWeight;
+		gTreeCache.erase(drop->m_entry);
+		rtcReleaseGeometry(drop->m_geometry);
+		rtcReleaseScene(drop->m_scene);
+		delete drop;
+	}
 }
 
 // Rotation part of the body transform, row-major, for turning a model normal into world space.
@@ -770,6 +1067,131 @@ bool setupCamera(const float viewMat[16], const float projMat[16], Camera& cam)
 	cam.m_p23 = projMat[14];
 	return true;
 }
+
+// Where a lens's first rays landed last frame (world x, y, z per pixel, NaN on a miss), the next frame's depth hint.
+struct HitMemory
+{
+	int m_width;
+	int m_height;
+	float m_proj[16];
+	std::vector<float> m_points;
+	unsigned long long m_lastUse;
+	// Frame reuse: the last request's key and, after a repeat, its frame before the camera chain and the region it reads.
+	std::vector<unsigned char> m_key;
+	bool m_kept;
+	unsigned long long m_sceneRevision;
+	unsigned long long m_movedFrom;
+	double m_apex[3];
+	double m_base[4][3];
+	double m_light[3];
+	bool m_sweep;
+	std::vector<float> m_depth;
+	std::vector<int> m_seg;
+	std::vector<unsigned char> m_rgb;
+	std::vector<float> m_radiance;
+};
+
+// Frame reuse: a kept frame is dropped once this many mover boxes wait to be tested against it.
+const size_t kReuseMaxBoxes = 1 << 16;
+
+// True unless an axis separates the box (lo, hi) from a kept frame's pyramid, swept along the light; NaN answers true.
+bool reachesFrame(const HitMemory& frame, const double lo[3], const double hi[3])
+{
+	double edges[7][3];
+	for (int k = 0; k < 4; k++)
+		for (int i = 0; i < 3; i++)
+			edges[k][i] = frame.m_base[k][i] - frame.m_apex[i];
+	for (int i = 0; i < 3; i++)
+	{
+		edges[4][i] = frame.m_base[1][i] - frame.m_base[0][i];
+		edges[5][i] = frame.m_base[3][i] - frame.m_base[0][i];
+		edges[6][i] = frame.m_light[i];
+	}
+	const int numEdges = frame.m_sweep ? 7 : 6;
+	const double unit[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+	double axes[48][3];
+	int numAxes = 0;
+	for (int k = 0; k < 3; k++)
+		memcpy(axes[numAxes++], unit[k], sizeof(axes[0]));
+	const int faces[5][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}};
+	for (int f = 0; f < 5; f++)
+	{
+		const double* a = edges[faces[f][0]];
+		const double* b = edges[faces[f][1]];
+		double* n = axes[numAxes++];
+		n[0] = a[1] * b[2] - a[2] * b[1];
+		n[1] = a[2] * b[0] - a[0] * b[2];
+		n[2] = a[0] * b[1] - a[1] * b[0];
+	}
+	for (int e = 0; e < numEdges; e++)
+		for (int k = 0; k < 3 + (frame.m_sweep && e < 6 ? 1 : 0); k++)
+		{
+			const double* a = k < 3 ? unit[k] : edges[6];
+			const double* b = edges[e];
+			double* n = axes[numAxes++];
+			n[0] = a[1] * b[2] - a[2] * b[1];
+			n[1] = a[2] * b[0] - a[0] * b[2];
+			n[2] = a[0] * b[1] - a[1] * b[0];
+		}
+	double centre[3], half[3], size = 0.0;
+	for (int i = 0; i < 3; i++)
+	{
+		centre[i] = 0.5 * (lo[i] + hi[i]);
+		half[i] = 0.5 * fabs(hi[i] - lo[i]);
+		size = fabs(lo[i]) > size ? fabs(lo[i]) : size;
+		size = fabs(hi[i]) > size ? fabs(hi[i]) : size;
+		size = fabs(frame.m_apex[i]) > size ? fabs(frame.m_apex[i]) : size;
+	}
+	// Wider than the rounding of the rays, the boxes and these sums, as the mover grid allows for.
+	const double margin = 0.05 + size * 1e-4;
+	for (int a = 0; a < numAxes; a++)
+	{
+		double* n = axes[a];
+		const double length = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+		if (!(length > 1e-12))
+			continue;
+		for (int i = 0; i < 3; i++)
+			n[i] /= length;
+		double low = n[0] * frame.m_apex[0] + n[1] * frame.m_apex[1] + n[2] * frame.m_apex[2], high = low;
+		for (int k = 0; k < 4; k++)
+		{
+			const double d = n[0] * frame.m_base[k][0] + n[1] * frame.m_base[k][1] + n[2] * frame.m_base[k][2];
+			low = d < low ? d : low;
+			high = d > high ? d : high;
+		}
+		if (frame.m_sweep)
+		{
+			// An axis across the light keeps the pyramid's extent; any other is open on the light's side.
+			const double along = n[0] * frame.m_light[0] + n[1] * frame.m_light[1] + n[2] * frame.m_light[2];
+			if (along > 1e-9)
+				high = INFINITY;
+			else if (along < -1e-9)
+				low = -INFINITY;
+		}
+		const double mid = n[0] * centre[0] + n[1] * centre[1] + n[2] * centre[2];
+		const double reach = fabs(n[0]) * half[0] + fabs(n[1]) * half[1] + fabs(n[2]) * half[2] + margin;
+		if (mid + reach < low || mid - reach > high)
+			return false;
+	}
+	return true;
+}
+
+// The movers' boxes seen from the light as a grid; a shadow ray from a point under a clear cell cannot meet a mover.
+struct MoverShade
+{
+	float m_axisU[3];
+	float m_axisV[3];
+	float m_u0;
+	float m_v0;
+	float m_perCell;
+	int m_cols;
+	int m_rows;
+	std::vector<unsigned char> m_cells;
+};
+
+// Lenses remembered at once (wide, zoom, thermal), and the smallest frame worth a memory, so the laser keeps none.
+const int kHitMemories = 4;
+const size_t kHintMinPixels = 64 * 64;
 }  // namespace
 
 struct SwarmRaycast::Data
@@ -811,6 +1233,159 @@ struct SwarmRaycast::Data
 	std::vector<StaticMember*> m_shelterDirty;
 	// Mover instances attached to the mover scene, so a frame with none skips their shadow ray.
 	int m_moverCount;
+	HitMemory m_hitMemories[kHitMemories];
+	unsigned long long m_frameCount;
+	// Per pixel: the camera-axis depth of the farthest remembered hit landing on it, -1 where none does.
+	std::vector<float> m_hintFar;
+	// The same for the share of the remembered hits each further render thread puts onto the frame.
+	std::vector<std::vector<float> > m_hintFrames;
+	MoverShade m_moverShade;
+	// Frame reuse: scene changes but mover moves, which leave old and new boxes; m_movedBase counts boxes dropped.
+	unsigned long long m_sceneRevision;
+	std::vector<double> m_moved;
+	unsigned long long m_movedBase;
+
+	// Notes a mover's old and new boxes for kept frames, dropping boxes all have seen, or the frames if too many wait.
+	void moverMoved(const MeshTree* tree, const float before[16], const float after[16])
+	{
+		size_t from = m_moved.size() / 6;
+		bool kept = false;
+		for (int i = 0; i < kHitMemories; i++)
+		{
+			const HitMemory& memory = m_hitMemories[i];
+			if (!memory.m_kept || memory.m_sceneRevision != m_sceneRevision || memory.m_movedFrom < m_movedBase)
+				continue;
+			kept = true;
+			from = memory.m_movedFrom - m_movedBase < from ? (size_t)(memory.m_movedFrom - m_movedBase) : from;
+		}
+		m_moved.erase(m_moved.begin(), m_moved.begin() + from * 6);
+		m_movedBase += from;
+		if (kept && m_moved.size() / 6 + 2 > kReuseMaxBoxes)
+		{
+			m_sceneRevision++;
+			m_movedBase += m_moved.size() / 6;
+			m_moved.clear();
+			kept = false;
+		}
+		if (!kept)
+			return;
+		RTCBounds bounds;
+		rtcGetSceneBounds(tree->m_scene, &bounds);
+		const float* transforms[2] = {before, after};
+		for (int t = 0; t < 2; t++)
+		{
+			const float* m = transforms[t];
+			double lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+			for (int k = 0; k < 8; k++)
+			{
+				const double corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+				for (int i = 0; i < 3; i++)
+				{
+					const double w = (double)m[i] * corner[0] + (double)m[4 + i] * corner[1] + (double)m[8 + i] * corner[2] + (double)m[12 + i];
+					// A NaN corner leaves its box NaN, which every kept frame counts as reached.
+					lo[i] = w < lo[i] || w != w ? w : lo[i];
+					hi[i] = w > hi[i] || w != w ? w : hi[i];
+				}
+			}
+			m_moved.insert(m_moved.end(), lo, lo + 3);
+			m_moved.insert(m_moved.end(), hi, hi + 3);
+		}
+	}
+
+	// The kept frame of this memory, put into the camera's buffers, when the request and the scene since allow it.
+	bool reuseFrame(HitMemory& memory, const std::vector<unsigned char>& key, const SwarmRaycast::Target& target, size_t numPixels)
+	{
+		if (!memory.m_kept || memory.m_key != key || memory.m_sceneRevision != m_sceneRevision || memory.m_movedFrom < m_movedBase)
+			return false;
+		for (size_t i = (size_t)(memory.m_movedFrom - m_movedBase) * 6; i < m_moved.size(); i += 6)
+			if (reachesFrame(memory, &m_moved[i], &m_moved[i + 3]))
+			{
+				memory.m_kept = false;
+				return false;
+			}
+		memcpy(target.m_depth, &memory.m_depth[0], numPixels * sizeof(float));
+		if (target.m_seg)
+			memcpy(target.m_seg, &memory.m_seg[0], numPixels * sizeof(int));
+		if (target.m_rgb)
+			memcpy(target.m_rgb, &memory.m_rgb[0], numPixels * 3);
+		return true;
+	}
+
+	// Takes the request's key and keeps its frame when it repeated the last one; farthest is how far its rays went.
+	void keepFrame(HitMemory& memory, std::vector<unsigned char>& key, const Camera& cam, const SwarmRaycast::Target& target,
+				   const std::vector<float>& radiance, float farthest, const SwarmRaycastShading* shading, int width, int height)
+	{
+		const size_t numPixels = (size_t)width * height;
+		const bool repeat = memory.m_key == key;
+		memory.m_key.swap(key);
+		memory.m_kept = false;
+		if (!repeat || !(farthest >= 0.0f && farthest < INFINITY))
+			return;
+		// A pixel wider each side, since edge probes on the left column and bottom row sample half a pixel past ndc -1.
+		double corners[4][3], centre[3];
+		const double sideX = 1.0 + 2.0 / width, sideY = 1.0 + 2.0 / height;
+		const double ndc[4][2] = {{-sideX, -sideY}, {sideX, -sideY}, {sideX, sideY}, {-sideX, sideY}};
+		for (int i = 0; i < 3; i++)
+		{
+			memory.m_apex[i] = cam.m_origin[i];
+			centre[i] = cam.m_far[0][i];
+			for (int k = 0; k < 4; k++)
+				corners[k][i] = cam.m_far[0][i] + cam.m_far[1][i] * ndc[k][0] + cam.m_far[2][i] * ndc[k][1];
+		}
+		const double farDepth = -(cam.m_viewRow2[0] * centre[0] + cam.m_viewRow2[1] * centre[1] + cam.m_viewRow2[2] * centre[2] + cam.m_viewRow2[3]);
+		double share = ((double)farthest * 1.001 + 0.05) / farDepth;
+		share = share < 1.0 ? share : 1.0;
+		bool finite = farDepth > 0.0 && share > 0.0;
+		for (int k = 0; k < 4; k++)
+			for (int i = 0; i < 3; i++)
+			{
+				memory.m_base[k][i] = memory.m_apex[i] + (corners[k][i] - memory.m_apex[i]) * share;
+				finite = finite && fabs(memory.m_base[k][i]) < INFINITY;
+			}
+		memory.m_sweep = shading && shading->m_shadow;
+		for (int i = 0; i < 3; i++)
+		{
+			memory.m_light[i] = shading ? shading->m_lightDir[i] : 0.0f;
+			finite = finite && fabs(memory.m_apex[i]) < INFINITY && fabs(memory.m_light[i]) < INFINITY;
+		}
+		if (!finite)
+			return;
+		memory.m_depth.assign(target.m_depth, target.m_depth + numPixels);
+		if (target.m_seg)
+			memory.m_seg.assign(target.m_seg, target.m_seg + numPixels);
+		if (target.m_rgb)
+			memory.m_rgb.assign(target.m_rgb, target.m_rgb + numPixels * 3);
+		memory.m_radiance = radiance;
+		memory.m_sceneRevision = m_sceneRevision;
+		memory.m_movedFrom = m_movedBase + m_moved.size() / 6;
+		memory.m_kept = true;
+	}
+
+	// The memory of the lens with this frame size and projection, or the one used longest ago, emptied for it.
+	HitMemory* hitMemory(int width, int height, const float projMat[16])
+	{
+		HitMemory* oldest = &m_hitMemories[0];
+		for (int i = 0; i < kHitMemories; i++)
+		{
+			HitMemory* memory = &m_hitMemories[i];
+			if (!memory->m_points.empty() && memory->m_width == width && memory->m_height == height &&
+				memcmp(memory->m_proj, projMat, sizeof(memory->m_proj)) == 0)
+			{
+				memory->m_lastUse = ++m_frameCount;
+				return memory;
+			}
+			if (memory->m_lastUse < oldest->m_lastUse)
+				oldest = memory;
+		}
+		oldest->m_points.clear();
+		oldest->m_key.clear();
+		oldest->m_kept = false;
+		oldest->m_width = width;
+		oldest->m_height = height;
+		memcpy(oldest->m_proj, projMat, sizeof(oldest->m_proj));
+		oldest->m_lastUse = ++m_frameCount;
+		return oldest;
+	}
 
 	void shadowChanged(StaticMember* member)
 	{
@@ -820,59 +1395,24 @@ struct SwarmRaycast::Data
 			m_shelterDirty.push_back(member);
 	}
 
-	// Casts the cells [col0, col1) x [row0, row1) of the shadow map from the start plane along -light
-	// into the static tree. Each cell is written by exactly one ray, so the thread count cannot change
-	// the bytes.
-	void castShadowCells(ShadowMap& map, int col0, int col1, int row0, int row1, int threads)
+	// Points a map at the tree its blocks are cast against and at what the hit filter reads, as they are now.
+	void bindShadowMap(ShadowMap& map)
 	{
-		const float dir[3] = {-map.m_lightDir[0], -map.m_lightDir[1], -map.m_lightDir[2]};
-#pragma omp parallel for num_threads(threads) schedule(static)
-		for (int row = row0; row < row1; row++)
-		{
-			QueryContext ctx;
-			rtcInitRayQueryContext(&ctx.m_context);
-			ctx.m_instances = &m_byGeomId;
-			ctx.m_batches = &m_batches;
-			ctx.m_forestId = m_forestId;
-			ctx.m_anyWinding = true;
-			ctx.m_alphaCutout = map.m_alphaCutout;
-			ctx.m_leafNoShadow = map.m_leafNoShadow;
-			ctx.m_pixelSpread = 0.0f;
-			RTCIntersectArguments args;
-			rtcInitIntersectArguments(&args);
-			args.context = &ctx.m_context;
-			const float v = ((float)row + 0.5f) * map.m_cell;
-			for (int col = col0; col < col1; col++)
-			{
-				const float u = ((float)col + 0.5f) * map.m_cell;
-				RTCRayHit rayhit;
-				rayhit.ray.org_x = map.m_origin[0] + map.m_axisU[0] * u + map.m_axisV[0] * v;
-				rayhit.ray.org_y = map.m_origin[1] + map.m_axisU[1] * u + map.m_axisV[1] * v;
-				rayhit.ray.org_z = map.m_origin[2] + map.m_axisU[2] * u + map.m_axisV[2] * v;
-				rayhit.ray.dir_x = dir[0];
-				rayhit.ray.dir_y = dir[1];
-				rayhit.ray.dir_z = dir[2];
-				rayhit.ray.tnear = 0.0f;
-				rayhit.ray.tfar = INFINITY;
-				rayhit.ray.time = 0.0f;
-				rayhit.ray.mask = (unsigned)-1;
-				rayhit.ray.id = 0;
-				rayhit.ray.flags = 0;
-				rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-				rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-				rtcIntersect1(m_staticShadows ? m_staticShadows : m_static, &rayhit, &args);
-				map.m_depth[(size_t)row * map.m_cols + col] = rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID ? INFINITY : rayhit.ray.tfar;
-			}
-		}
+		map.m_scene = m_staticShadows ? m_staticShadows : m_static;
+		map.m_instances = &m_byGeomId;
+		map.m_batches = &m_batches;
+		map.m_forestId = m_forestId;
 	}
 
-	// Lays the grid over `bounds` for this light, at most kShadowMapMaxCells a side, then casts every cell.
-	void buildShadowMap(ShadowMap& map, const RTCBounds& bounds, const float lightDir[3], bool alphaCutout, bool leafNoShadow, int threads)
+	// Lays the grid over `bounds` for this light, at most kShadowMapMaxCells a side; frames cast its blocks as they read them.
+	void buildShadowMap(ShadowMap& map, const RTCBounds& bounds, const float lightDir[3], bool alphaCutout, bool leafNoShadow)
 	{
+		m_sceneRevision++;
 		map.m_built = false;
 		map.m_alphaCutout = alphaCutout;
 		map.m_leafNoShadow = leafNoShadow;
-		std::vector<float>().swap(map.m_depth);
+		map.m_depth.reset();
+		map.m_blocks.reset();
 		if (!(bounds.lower_x <= bounds.upper_x) || !(bounds.lower_y <= bounds.upper_y) || !(bounds.lower_z <= bounds.upper_z))
 			return;
 		for (int i = 0; i < 3; i++)
@@ -910,12 +1450,14 @@ struct SwarmRaycast::Data
 		map.m_rows = (int)((vMax - vMin) / cell) + 3;
 		for (int i = 0; i < 3; i++)
 			map.m_origin[i] = (map.m_axisU[i] * (uMin - cell) + map.m_axisV[i] * (vMin - cell)) + lightDir[i] * (lMax + cell);
-		map.m_depth.assign((size_t)map.m_cols * map.m_rows, INFINITY);
-		castShadowCells(map, 0, map.m_cols, 0, map.m_rows, threads);
+		map.m_depth.reset(new float[(size_t)map.m_cols * map.m_rows]);
+		map.m_blockCols = (map.m_cols + kShadowBlock - 1) / kShadowBlock;
+		map.m_blocks.reset(new std::atomic<unsigned char>[(size_t)map.m_blockCols * ((map.m_rows + kShadowBlock - 1) / kShadowBlock)]());
+		bindShadowMap(map);
 		map.m_built = true;
 	}
 
-	// Recasts the cells of one map under one member's vertices, one cell wider on every side.
+	// Recasts one map's cast blocks under a member's vertices, a cell wider each side; the rest cast when first read.
 	void recastMember(ShadowMap& map, const StaticMember* member, int threads)
 	{
 		if (!map.m_built)
@@ -939,8 +1481,17 @@ struct SwarmRaycast::Data
 		const int row0 = vMin < 1.0f ? 0 : (int)vMin - 1;
 		const int col1 = uMax + 2.0f >= (float)map.m_cols ? map.m_cols : (int)uMax + 2;
 		const int row1 = vMax + 2.0f >= (float)map.m_rows ? map.m_rows : (int)vMax + 2;
-		if (col0 < col1 && row0 < row1)
-			castShadowCells(map, col0, col1, row0, row1, threads);
+		if (!(col0 < col1 && row0 < row1))
+			return;
+#pragma omp parallel for num_threads(threads) schedule(static)
+		for (int row = row0; row < row1; row++)
+			for (int blockCol = col0 / kShadowBlock; blockCol <= (col1 - 1) / kShadowBlock; blockCol++)
+				if (map.m_blocks[(size_t)(row / kShadowBlock) * map.m_blockCols + blockCol].load(std::memory_order_relaxed) == 2)
+				{
+					const int c0 = blockCol * kShadowBlock > col0 ? blockCol * kShadowBlock : col0;
+					const int c1 = (blockCol + 1) * kShadowBlock < col1 ? (blockCol + 1) * kShadowBlock : col1;
+					castShadowCells(map, c0, c1, row, row + 1);
+				}
 	}
 
 	// Recasts both maps for a new light, core or cut-out setting, otherwise only the cells under the members that changed.
@@ -951,8 +1502,10 @@ struct SwarmRaycast::Data
 		const bool coreStale = stale || coreRadius != m_coreRadius || (coreRadius > 0.0f) != m_shadowCore.m_built;
 		RTCBounds bounds;
 		rtcGetSceneBounds(m_staticShadows ? m_staticShadows : m_static, &bounds);
+		bindShadowMap(m_shadowMap);
+		bindShadowMap(m_shadowCore);
 		if (stale)
-			buildShadowMap(m_shadowMap, bounds, lightDir, alphaCutout, leafNoShadow, threads);
+			buildShadowMap(m_shadowMap, bounds, lightDir, alphaCutout, leafNoShadow);
 		else
 			for (size_t i = 0; i < m_shadowDirty.size(); i++)
 			{
@@ -963,9 +1516,11 @@ struct SwarmRaycast::Data
 		m_shadowDirty.clear();
 		if (!coreStale)
 			return;
+		m_sceneRevision++;
 		m_coreRadius = coreRadius;
 		m_shadowCore.m_built = false;
-		std::vector<float>().swap(m_shadowCore.m_depth);
+		m_shadowCore.m_depth.reset();
+		m_shadowCore.m_blocks.reset();
 		if (coreRadius > 0.0f && bounds.lower_x <= bounds.upper_x)
 		{
 			// The core is the square about the origin across the two level axes; the up axis keeps the scene's full height.
@@ -985,7 +1540,7 @@ struct SwarmRaycast::Data
 			core.upper_x = upper[0];
 			core.upper_y = upper[1];
 			core.upper_z = upper[2];
-			buildShadowMap(m_shadowCore, core, lightDir, alphaCutout, leafNoShadow, threads);
+			buildShadowMap(m_shadowCore, core, lightDir, alphaCutout, leafNoShadow);
 		}
 	}
 
@@ -995,11 +1550,12 @@ struct SwarmRaycast::Data
 	{
 		float up[3] = {0.0f, 0.0f, 0.0f};
 		up[upAxis] = 1.0f;
+		bindShadowMap(m_shelterMap);
 		if (!m_shelterMap.m_built || m_shelterMap.m_alphaCutout != alphaCutout || memcmp(m_shelterMap.m_lightDir, up, sizeof(up)) != 0)
 		{
 			RTCBounds bounds;
 			rtcGetSceneBounds(m_staticShadows ? m_staticShadows : m_static, &bounds);
-			buildShadowMap(m_shelterMap, bounds, up, alphaCutout, false, threads);
+			buildShadowMap(m_shelterMap, bounds, up, alphaCutout, false);
 		}
 		else
 			for (size_t i = 0; i < m_shelterDirty.size(); i++)
@@ -1045,6 +1601,7 @@ struct SwarmRaycast::Data
 		StaticMember* member = new StaticMember;
 		member->m_obj = obj;
 		member->m_meshKey = obj->m_model->meshKey();
+		member->m_textureRevision = obj->m_textureRevision;
 		memcpy(member->m_transform, transform, sizeof(member->m_transform));
 		copyRotation(worldTransform, member->m_rotation);
 		member->m_retired = false;
@@ -1084,9 +1641,17 @@ struct SwarmRaycast::Data
 		return tree;
 	}
 
-	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build.
+	// Commits the tree's scene, or loads its Embree image; a mesh tree another world already built comes from the cache.
 	void buildTree(MeshTree& tree, const std::vector<char>* image)
 	{
+		tree.m_cached = 0;
+		if (!tree.m_world)
+		{
+			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices);
+			tree.m_scene = tree.m_cached->m_scene;
+			tree.m_geometry = tree.m_cached->m_geometry;
+			return;
+		}
 		tree.m_scene = rtcNewScene(m_device);
 		rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST);
 		rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_MEDIUM);
@@ -1169,8 +1734,13 @@ struct SwarmRaycast::Data
 				m_sharedTrees.erase(it);
 				break;
 			}
-		rtcReleaseGeometry(tree->m_geometry);
-		rtcReleaseScene(tree->m_scene);
+		if (tree->m_cached)
+			releaseCachedTree(tree->m_cached);
+		else
+		{
+			rtcReleaseGeometry(tree->m_geometry);
+			rtcReleaseScene(tree->m_scene);
+		}
 		delete tree;
 	}
 
@@ -1184,8 +1754,15 @@ struct SwarmRaycast::Data
 		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
 		if (!tree.m_refitting)
 		{
-			rtcReleaseGeometry(tree.m_geometry);
-			rtcReleaseScene(tree.m_scene);
+			// A cached tree is never rewritten: the mesh leaves it for a scene of its own.
+			if (tree.m_cached)
+				releaseCachedTree(tree.m_cached);
+			else
+			{
+				rtcReleaseGeometry(tree.m_geometry);
+				rtcReleaseScene(tree.m_scene);
+			}
+			tree.m_cached = 0;
 			tree.m_scene = rtcNewScene(m_device);
 			rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC);
 			rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_LOW);
@@ -1203,7 +1780,8 @@ struct SwarmRaycast::Data
 
 	// worldTree asks for a fresh instance to draw its world tree from disk; the instance stays on
 	// that tree while the body keeps its pose and mesh, and carries on as a plain mover otherwise.
-	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, bool glass, int segmentation, bool worldTree)
+	// True when the instance at most moved, and the move is noted for the kept frames.
+	bool syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, bool glass, int segmentation, bool worldTree)
 	{
 		TinyRender::Model* model = obj->m_model;
 		Instance* inst = state.m_instance;
@@ -1243,11 +1821,14 @@ struct SwarmRaycast::Data
 			rtcSetGeometryInstancedScene(inst->m_shadowGeometry, inst->m_tree->m_scene);
 			changed = true;
 		}
+		bool onlyMoved = !changed;
 		// A world tree already sits in world space, so its instance carries the identity.
 		static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 		const float* instanceTransform = inst->m_tree->m_world ? identity : transform;
 		if (fresh || memcmp(instanceTransform, inst->m_transform, 16 * sizeof(float)) != 0)
 		{
+			if (onlyMoved)
+				moverMoved(inst->m_tree, inst->m_transform, instanceTransform);
 			memcpy(inst->m_transform, instanceTransform, 16 * sizeof(float));
 			if (inst->m_tree->m_world)
 				copyRotation(btTransform::getIdentity(), inst->m_rotation);
@@ -1274,7 +1855,10 @@ struct SwarmRaycast::Data
 			}
 			inst->m_enabled = enabled;
 			changed = true;
+			onlyMoved = false;
 		}
+		onlyMoved = onlyMoved && inst->m_doubleSided == doubleSided && inst->m_hasAlpha == hasAlpha && inst->m_glass == glass &&
+					inst->m_segmentation == segmentation;
 		inst->m_doubleSided = doubleSided;
 		inst->m_hasAlpha = hasAlpha;
 		inst->m_glass = glass;
@@ -1293,6 +1877,7 @@ struct SwarmRaycast::Data
 			rtcAttachGeometryByID(m_movers, inst->m_shadowGeometry, inst->m_geomId);
 			m_moverCount++;
 		}
+		return onlyMoved;
 	}
 
 	// Flagged placements remain in the map scene when moved, without changing the mover path.
@@ -1404,6 +1989,7 @@ struct SwarmRaycast::Data
 			batch->m_obj = obj;
 			batch->m_tree = acquireSharedTree(obj->m_model, false);
 			batch->m_transforms.assign(count * 12, 0.0f);
+			batch->m_normalRotations.assign(count * 9, 0.0f);
 			batch->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE_ARRAY);
 			rtcSetGeometryInstancedScene(batch->m_geometry, batch->m_tree->m_scene);
 			rtcSetSharedGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0, RTC_FORMAT_FLOAT3X4_COLUMN_MAJOR,
@@ -1438,6 +2024,13 @@ struct SwarmRaycast::Data
 							sum += frame[k * 4 + r] * local[c * 3 + k];
 						world[c * 3 + r] = sum;
 					}
+				// Inverse transpose keeps normals perpendicular under a non-uniform or mirrored placement.
+				const btMatrix3x3 basis(world[0], world[3], world[6], world[1], world[4], world[7], world[2], world[5], world[8]);
+				const btMatrix3x3 normal = basis.determinant() != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
+				float* rotation = &batch->m_normalRotations[p * 9];
+				for (int r = 0; r < 3; r++)
+					for (int c = 0; c < 3; c++)
+						rotation[r * 3 + c] = (float)normal[r][c];
 			}
 			if (!fresh)
 				rtcUpdateGeometryBuffer(batch->m_geometry, RTC_BUFFER_TYPE_TRANSFORM, 0);
@@ -1538,12 +2131,15 @@ struct SwarmRaycast::Data
 		m_staticShadows = 0;
 		m_staticShadowsDirty = false;
 		m_shadowMap.m_built = false;
-		std::vector<float>().swap(m_shadowMap.m_depth);
+		m_shadowMap.m_depth.reset();
+		m_shadowMap.m_blocks.reset();
 		m_shadowCore.m_built = false;
-		std::vector<float>().swap(m_shadowCore.m_depth);
+		m_shadowCore.m_depth.reset();
+		m_shadowCore.m_blocks.reset();
 		m_shadowDirty.clear();
 		m_shelterMap.m_built = false;
-		std::vector<float>().swap(m_shelterMap.m_depth);
+		m_shelterMap.m_depth.reset();
+		m_shelterMap.m_blocks.reset();
 		m_shelterDirty.clear();
 		for (size_t i = 0; i < m_members.size(); i++)
 		{
@@ -1582,10 +2178,17 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_shelterMap.m_built = false;
 	m_data->m_coreRadius = 0.0f;
 	m_data->m_moverCount = 0;
+	m_data->m_frameCount = 0;
+	m_data->m_sceneRevision = 0;
+	m_data->m_movedBase = 0;
+	for (int i = 0; i < kHitMemories; i++)
+	{
+		m_data->m_hitMemories[i].m_lastUse = 0;
+		m_data->m_hitMemories[i].m_kept = false;
+	}
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
 	m_data->m_cacheDir = cacheDir ? cacheDir : "";
-	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
-	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
+	m_data->m_device = processDevice();
 	if (!m_data->m_device)
 	{
 		b3Warning("SwarmRaycast: cannot create the Embree device (a CPU with AVX2 and FMA is required)");
@@ -1610,8 +2213,6 @@ SwarmRaycast::~SwarmRaycast()
 		rtcReleaseScene(m_data->m_movers);
 		rtcReleaseScene(m_data->m_top);
 	}
-	if (m_data->m_device)
-		rtcReleaseDevice(m_data->m_device);
 	delete m_data;
 }
 
@@ -1638,22 +2239,28 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	ObjectState& state = m_data->m_objects[renderObj];
 	if (!renderObj->m_placements.empty())
 	{
+		m_data->m_sceneRevision++;
 		m_data->syncBatch(state, renderObj, transform, visible, segmentation);
 		return;
 	}
 	if (renderObj->m_renderInstanced)
 	{
+		m_data->m_sceneRevision++;
 		m_data->syncSharedInstance(state, renderObj, transform, visible, segmentation);
 		return;
 	}
 	StaticMember* member = state.m_member;
 	if (member && !member->m_retired)
 	{
+		m_data->m_sceneRevision++;
 		const bool moved = memcmp(transform, member->m_transform, sizeof(transform)) != 0 || member->m_meshKey != model->meshKey();
 		if (!moved)
 		{
-			if (member->m_visible != visible)
+			// A new texture or face setting changes what the member lets through, as hiding it does.
+			if (member->m_visible != visible || member->m_doubleSided != doubleSided || member->m_hasAlpha != hasAlpha ||
+				member->m_textureRevision != renderObj->m_textureRevision)
 				m_data->shadowChanged(member);
+			member->m_textureRevision = renderObj->m_textureRevision;
 			member->m_visible = visible;
 			member->m_doubleSided = doubleSided;
 			member->m_hasAlpha = hasAlpha;
@@ -1667,6 +2274,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	else if (!member && !m_data->m_staticBuilt && !worldTree)
 	{
+		m_data->m_sceneRevision++;
 		member = m_data->addMember(renderObj, worldTransform, localScaling, transform);
 		member->m_visible = visible;
 		member->m_doubleSided = doubleSided;
@@ -1679,19 +2287,21 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	if (!member)
 		state.m_member = 0;
-	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree);
+	if (!m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree))
+		m_data->m_sceneRevision++;
 }
 
-void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
+bool SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 {
+	m_data->m_sceneRevision++;
 	// A batch's mesh tree is shared by every placement and never rewritten.
 	if (!renderObj->m_placements.empty())
-		return;
+		return false;
 	if (renderObj->m_renderInstanced)
 		m_data->m_objects[renderObj].m_deformed = true;
 	std::map<TinyRenderObjectData*, ObjectState>::iterator found = m_data->m_objects.find(renderObj);
 	if (found == m_data->m_objects.end())
-		return;
+		return false;
 	if (renderObj->m_renderInstanced)
 	{
 		// A rewritten mesh must never refit the immutable tree used by its other placements.
@@ -1699,17 +2309,20 @@ void SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 			m_data->dropInstance(found->second.m_instance);
 		found->second.m_instance = 0;
 		found->second.m_deformed = true;
-		return;
+		return false;
 	}
 	// A rewritten static member counts as moved at the next sync; a mover refits its tree.
 	if (found->second.m_member && !found->second.m_member->m_retired)
 		found->second.m_member->m_transform[15] = -1.0f;
-	if (found->second.m_instance && found->second.m_instance->m_tree)
-		found->second.m_instance->m_tree->m_dirty = true;
+	if (!found->second.m_instance || !found->second.m_instance->m_tree)
+		return false;
+	found->second.m_instance->m_tree->m_dirty = true;
+	return found->second.m_instance->m_tree->m_refs > 1;
 }
 
 void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)
 {
+	m_data->m_sceneRevision++;
 	std::map<TinyRenderObjectData*, ObjectState>::iterator found = m_data->m_objects.find(renderObj);
 	if (found == m_data->m_objects.end())
 		return;
@@ -1741,22 +2354,28 @@ void SwarmRaycast::removeAll()
 	m_data->m_byGeomId.clear();
 	m_data->m_freeGeomIds.clear();
 	m_data->createStaticScene();
+	m_data->m_sceneRevision++;
+	for (int i = 0; i < kHitMemories; i++)
+	{
+		m_data->m_hitMemories[i].m_points.clear();
+		m_data->m_hitMemories[i].m_kept = false;
+	}
 }
 
-void SwarmRaycast::commit()
+void SwarmRaycast::commit(bool moverShadows)
 {
 	if (!m_data->m_top)
 		return;
 	if (!m_data->m_staticBuilt)
 	{
-		rtcCommitScene(m_data->m_static);
+		joinCommit(m_data->m_static);
 		m_data->m_staticBuilt = true;
 		m_data->m_topDirty = true;
 	}
 	// The forest is committed before the instance that reaches it, and both parents after it.
 	if (m_data->m_forestDirty)
 	{
-		rtcCommitScene(m_data->m_forest);
+		joinCommit(m_data->m_forest);
 		rtcCommitGeometry(m_data->m_forestInstance);
 		m_data->m_forestDirty = false;
 		m_data->m_topDirty = true;
@@ -1772,7 +2391,7 @@ void SwarmRaycast::commit()
 		rtcCommitScene(m_data->m_top);
 		m_data->m_topDirty = false;
 	}
-	if (m_data->m_moversDirty)
+	if (m_data->m_moversDirty && moverShadows)
 	{
 		rtcCommitScene(m_data->m_movers);
 		m_data->m_moversDirty = false;
@@ -1797,6 +2416,7 @@ struct HitSurface
 	bool m_doubleSided;
 	bool m_hasAlpha;
 	bool m_glass;
+	bool m_glassBacked;
 	const TinyRenderThermal* m_thermal;
 };
 
@@ -1823,6 +2443,7 @@ inline bool shadowMapBlocked(const ShadowMap& map, const float point[3], const f
 		return false;
 	// Distance from the start plane along the ray direction, which is -light.
 	const float depth = -dot3(rel, map.m_lightDir);
+	ensureShadowCells(map, (int)u, (int)u, (int)v, (int)v);
 	return depth > map.m_depth[(size_t)(int)v * map.m_cols + (int)u] + map.m_cell;
 }
 
@@ -1847,7 +2468,20 @@ inline float shadowMapLit(const ShadowMap& map, const float point[3], const floa
 	const float fu = su - (float)iu, fv = sv - (float)iv;
 	const float weightU[3] = {0.5f * (1.0f - fu), 0.5f, 0.5f * fu};
 	const float weightV[3] = {0.5f * (1.0f - fv), 0.5f, 0.5f * fv};
+	ensureShadowCells(map, iu, iu + 2, iv, iv + 2);
 	float lit = 0.0f;
+	// Inside the grid the same nine cells are read in the same order without a bounds check each.
+	if (iu >= 0 && iv >= 0 && iu + 2 < map.m_cols && iv + 2 < map.m_rows)
+	{
+		for (int dv = 0; dv < 3; dv++)
+		{
+			const float* cells = &map.m_depth[(size_t)(iv + dv) * map.m_cols + iu];
+			for (int du = 0; du < 3; du++)
+				if (!(depth > cells[du]))
+					lit += weightV[dv] * weightU[du];
+		}
+		return lit;
+	}
 	for (int dv = 0; dv < 3; dv++)
 	{
 		const int row = iv + dv;
@@ -1943,16 +2577,16 @@ inline float spotIrradiance(const SwarmRaycastShading& shading, const float poin
 }
 
 // Segmentation id of a hit, plus the surface when asked for; false for a hit the scene does not know.
+// `cornersOnly` leaves out the corner normals, for a caller that only needs where the triangle is.
 bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMember*>& members,
 				const std::vector<Instance*>& instances, const std::vector<Batch*>& batches, unsigned forestId,
-				int& segmentation, HitSurface* surface)
+				int& segmentation, HitSurface* surface, bool cornersOnly = false)
 {
 	const float* vertices;
 	const unsigned* indices;
 	const float* transform = 0;
 	const float* cornerRotation = 0;
 	float placement[16];
-	float normalRotation[9];
 	if (surface)
 		surface->m_transformedNormals = false;
 	if (forestId != RTC_INVALID_GEOMETRY_ID && hit.instID[0] == forestId)
@@ -1970,17 +2604,11 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 				placement[c * 4 + r] = t[c * 3 + r];
 			placement[c * 4 + 3] = c == 3 ? 1.0f : 0.0f;
 		}
-		// Inverse transpose keeps normals perpendicular under a non-uniform or mirrored placement.
-		btMatrix3x3 basis(t[0], t[3], t[6], t[1], t[4], t[7], t[2], t[5], t[8]);
-		const btScalar det = basis.determinant();
-		const btMatrix3x3 normal = det != 0 ? basis.inverse().transpose() : btMatrix3x3::getIdentity();
-		for (int r = 0; r < 3; r++)
-			for (int c = 0; c < 3; c++)
-				normalRotation[r * 3 + c] = (float)normal[r][c];
 		surface->m_model = batch->m_obj->m_model;
 		surface->m_doubleSided = batch->m_doubleSided;
 		surface->m_hasAlpha = batch->m_hasAlpha;
 		surface->m_glass = batch->m_glass;
+		surface->m_glassBacked = batch->m_obj->m_glassBacked;
 		surface->m_thermal = &batch->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
@@ -1988,7 +2616,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		vertices = &batch->m_tree->m_vertices[0];
 		indices = &batch->m_tree->m_indices[0];
 		transform = placement;
-		cornerRotation = normalRotation;
+		cornerRotation = &batch->m_normalRotations[(size_t)hit.instPrimID[1] * 9];
 		surface->m_transformedNormals = surface->m_normals != 0;
 	}
 	else if (hit.instID[0] == staticId)
@@ -2003,6 +2631,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = member->m_doubleSided;
 		surface->m_hasAlpha = member->m_hasAlpha;
 		surface->m_glass = member->m_glass;
+		surface->m_glassBacked = member->m_obj->m_glassBacked;
 		surface->m_thermal = &member->m_obj->m_thermal;
 		surface->m_rotation = 0;
 		surface->m_normals = member->m_normals.empty() ? 0 : &member->m_normals[0];
@@ -2022,6 +2651,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_doubleSided = inst->m_doubleSided;
 		surface->m_hasAlpha = inst->m_hasAlpha;
 		surface->m_glass = inst->m_glass;
+		surface->m_glassBacked = inst->m_obj->m_glassBacked;
 		surface->m_thermal = &inst->m_obj->m_thermal;
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
@@ -2036,7 +2666,7 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 	{
 		const unsigned id = indices[(size_t)hit.primID * 3 + j];
 		surface->m_vertexIds[j] = id;
-		if (surface->m_transformedNormals)
+		if (surface->m_transformedNormals && !cornersOnly)
 		{
 			const float* n = surface->m_normals + (size_t)id * 3;
 			float* out = surface->m_cornerNormals + j * 3;
@@ -2053,32 +2683,6 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 			for (int i = 0; i < 3; i++)
 				surface->m_corners[j][i] = v[i];
 	}
-	return true;
-}
-
-// Barycentric weights of corners 1 and 2 where the ray origin + s * dir meets the triangle's plane;
-// false when the ray runs along the plane. Used for the texture footprint of the neighbouring pixels.
-// `normal` must be the triangle's normal as wound, since the weights carry its sign.
-bool planeBarycentric(const float origin[3], const float dir[3], const float corners[3][3], const float normal[3], float& u, float& v)
-{
-	float e1[3], e2[3], toCorner[3], w[3], t1[3], t2[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = corners[1][i] - corners[0][i];
-		e2[i] = corners[2][i] - corners[0][i];
-		toCorner[i] = corners[0][i] - origin[i];
-	}
-	const float denom = dot3(dir, normal);
-	const float nn = dot3(normal, normal);
-	if (denom == 0.0f || nn == 0.0f)
-		return false;
-	const float s = dot3(toCorner, normal) / denom;
-	for (int i = 0; i < 3; i++)
-		w[i] = (origin[i] + dir[i] * s) - corners[0][i];
-	cross3(w, e2, t1);
-	cross3(e1, w, t2);
-	u = dot3(t1, normal) / nn;
-	v = dot3(t2, normal) / nn;
 	return true;
 }
 
@@ -2363,6 +2967,12 @@ struct TileJob
 	bool m_filtered;
 	// Angle one pixel spans, for the cut-out footprint; 0 unless textures are filtered under daylight.
 	float m_pixelSpread;
+	// The depth hint, when the lens remembers its last frame: per pixel the farthest remembered hit landing on it.
+	const float* m_hintFar;
+	// Where every first ray lands this frame, kept for the next; each pixel writes only its own.
+	float* m_hitPoints;
+	// Where the movers can shade, when the movers answer the shadow rays; null otherwise.
+	const MoverShade* m_moverShade;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -2404,10 +3014,96 @@ struct EdgeScratch
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
+// ER_SWARM_EDGE_OUTLINE: a neighbour a quarter farther (a fifth from the far side) is an edge; leaves of one crown are not.
+const float kOutlineTolerance = 0.2f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
 
-// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// Cell of the mover grid under a point, or -1 off the grid.
+inline int moverCell(const MoverShade& shade, const float point[3])
+{
+	const float u = (dot3(point, shade.m_axisU) - shade.m_u0) * shade.m_perCell;
+	const float v = (dot3(point, shade.m_axisV) - shade.m_v0) * shade.m_perCell;
+	if (!(u >= 0.0f) || !(v >= 0.0f) || u >= (float)shade.m_cols || v >= (float)shade.m_rows)
+		return -1;
+	return (int)v * shade.m_cols + (int)u;
+}
+
+// Lays the grid over the enabled movers' widened boxes across the light; false, so every ray fires, if any is not finite.
+bool castMoverShade(const std::vector<Instance*>& instances, const float lightDir[3], MoverShade& shade)
+{
+	const float ax = fabsf(lightDir[0]), ay = fabsf(lightDir[1]), az = fabsf(lightDir[2]);
+	float helper[3] = {0.0f, 0.0f, 0.0f};
+	helper[ax <= ay && ax <= az ? 0 : (ay <= az ? 1 : 2)] = 1.0f;
+	cross3(lightDir, helper, shade.m_axisU);
+	normalize3(shade.m_axisU);
+	cross3(lightDir, shade.m_axisU, shade.m_axisV);
+	normalize3(shade.m_axisV);
+	std::vector<float> rects;
+	float lowU = INFINITY, highU = -INFINITY, lowV = INFINITY, highV = -INFINITY;
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const Instance* inst = instances[i];
+		if (!inst || inst->m_staticShared || !inst->m_enabled)
+			continue;
+		RTCBounds bounds;
+		rtcGetSceneBounds(inst->m_tree->m_scene, &bounds);
+		if (!(bounds.lower_x <= bounds.upper_x && bounds.lower_y <= bounds.upper_y && bounds.lower_z <= bounds.upper_z))
+			continue;
+		float rect[4] = {INFINITY, -INFINITY, INFINITY, -INFINITY}, size = 0.0f;
+		for (int k = 0; k < 8; k++)
+		{
+			const float corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+			float world[3];
+			transformPoint(inst->m_transform, corner, world);
+			const float u = dot3(world, shade.m_axisU), v = dot3(world, shade.m_axisV);
+			rect[0] = u < rect[0] ? u : rect[0];
+			rect[1] = u > rect[1] ? u : rect[1];
+			rect[2] = v < rect[2] ? v : rect[2];
+			rect[3] = v > rect[3] ? v : rect[3];
+			for (int j = 0; j < 3; j++)
+				size = fabsf(world[j]) > size ? fabsf(world[j]) : size;
+		}
+		const float margin = 0.05f + size * 1e-4f;
+		for (int j = 0; j < 4; j++)
+			if (!(fabsf(rect[j]) + margin < INFINITY))
+				return false;
+		rects.push_back(rect[0] - margin);
+		rects.push_back(rect[1] + margin);
+		rects.push_back(rect[2] - margin);
+		rects.push_back(rect[3] + margin);
+		lowU = rects[rects.size() - 4] < lowU ? rects[rects.size() - 4] : lowU;
+		highU = rects[rects.size() - 3] > highU ? rects[rects.size() - 3] : highU;
+		lowV = rects[rects.size() - 2] < lowV ? rects[rects.size() - 2] : lowV;
+		highV = rects[rects.size() - 1] > highV ? rects[rects.size() - 1] : highV;
+	}
+	shade.m_cols = shade.m_rows = 0;
+	shade.m_cells.clear();
+	if (rects.empty())
+		return true;
+	// At most 512 cells a side, none under 25 cm: a few movers far apart still leave most cells clear.
+	const float span = highU - lowU > highV - lowV ? highU - lowU : highV - lowV;
+	if (!(span < INFINITY))
+		return false;
+	const float cell = span / 512.0f > 0.25f ? span / 512.0f : 0.25f;
+	shade.m_u0 = lowU;
+	shade.m_v0 = lowV;
+	shade.m_perCell = 1.0f / cell;
+	shade.m_cols = (int)((highU - lowU) * shade.m_perCell) + 1;
+	shade.m_rows = (int)((highV - lowV) * shade.m_perCell) + 1;
+	shade.m_cells.assign((size_t)shade.m_cols * shade.m_rows, 0);
+	for (size_t r = 0; r < rects.size(); r += 4)
+	{
+		// Cell indices grow with u and v, so the cells under a rectangle's corners bound every cell under it.
+		const int col0 = (int)((rects[r] - lowU) * shade.m_perCell), col1 = (int)((rects[r + 1] - lowU) * shade.m_perCell);
+		const int row0 = (int)((rects[r + 2] - lowV) * shade.m_perCell), row1 = (int)((rects[r + 3] - lowV) * shade.m_perCell);
+		for (int row = row0; row <= row1 && row < shade.m_rows; row++)
+			for (int col = col0; col <= col1 && col < shade.m_cols; col++)
+				shade.m_cells[(size_t)row * shade.m_cols + col] = 1;
+	}
+	return true;
+}
+
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
 // A leaf card with leaf shadows off asks from its sunward side, since its back-light is not its own shadow.
 float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
@@ -2429,12 +3125,19 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	else
 		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
 	const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
-	if (!blocked && occluders)
+	const float origin[3] = {point[0] + unitNormal[0] * kShadowBias, point[1] + unitNormal[1] * kShadowBias, point[2] + unitNormal[2] * kShadowBias};
+	bool reachable = true;
+	if (!blocked && occluders == job.m_movers && job.m_moverShade)
+	{
+		const int cell = moverCell(*job.m_moverShade, origin);
+		reachable = cell >= 0 && job.m_moverShade->m_cells[(size_t)cell];
+	}
+	if (!blocked && occluders && reachable)
 	{
 		RTCRay ray;
-		ray.org_x = point[0] + unitNormal[0] * kShadowBias;
-		ray.org_y = point[1] + unitNormal[1] * kShadowBias;
-		ray.org_z = point[2] + unitNormal[2] * kShadowBias;
+		ray.org_x = origin[0];
+		ray.org_y = origin[1];
+		ray.org_z = origin[2];
 		ray.dir_x = shading->m_lightDir[0];
 		ray.dir_y = shading->m_lightDir[1];
 		ray.dir_z = shading->m_lightDir[2];
@@ -2452,7 +3155,7 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
 }
 
-// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above.
+// A hit's texture footprint from the right and upper neighbours' rays on its plane; woundNormal keeps the weights' sign.
 void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurface& surface, const float woundNormal[3], const RTCHit& hit,
 				 float duvdx[2], float duvdy[2])
 {
@@ -2462,13 +3165,32 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 	const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
 	const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
 	const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+	const float* origin = setup.m_cam.m_origin;
+	const float(*corners)[3] = surface.m_corners;
+	float e1[3], e2[3], toCorner[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = corners[1][i] - corners[0][i];
+		e2[i] = corners[2][i] - corners[0][i];
+		toCorner[i] = corners[0][i] - origin[i];
+	}
+	const float nn = dot3(woundNormal, woundNormal);
+	const float reach = dot3(toCorner, woundNormal);
 	for (int k = 0; k < 2; k++)
 	{
-		float neighbourDir[3], u, v;
+		float neighbourDir[3], w[3], t1[3], t2[3];
 		for (int i = 0; i < 3; i++)
 			neighbourDir[i] = rawDir[i] + steps[k][i];
-		if (!planeBarycentric(setup.m_cam.m_origin, neighbourDir, surface.m_corners, woundNormal, u, v))
+		const float denom = dot3(neighbourDir, woundNormal);
+		if (denom == 0.0f || nn == 0.0f)
 			continue;
+		const float s = reach / denom;
+		for (int i = 0; i < 3; i++)
+			w[i] = (origin[i] + neighbourDir[i] * s) - corners[0][i];
+		cross3(w, e2, t1);
+		cross3(e1, w, t2);
+		const float u = dot3(t1, woundNormal) / nn;
+		const float v = dot3(t2, woundNormal) / nn;
 		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
 		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
 	}
@@ -2485,8 +3207,6 @@ const float kSunHeating = 22.0f;
 const float kPassiveDetail = 25.0f;
 const float kSetDetail = 2.0f;
 const float kDetailLimit = 0.2f;
-// A footprint wide enough that the read is the last mip level, the texture's mean.
-const float kMeanFootprint = 1.0e4f;
 
 // Temperature a heat map gives at uv: its red byte from low to high, with the colour texture's wrap and nearest texel.
 float heatAt(const TinyRenderThermal& thermal, const TinyRender::Vec2f& uv)
@@ -2539,7 +3259,7 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	TinyRender::Vec2f uv(0.0f, 0.0f);
 	surfaceAt(surface, hit, faceNormal, true, duvdx, duvdy, normal, base, &uv);
 	const float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
-	TGAColor mean = surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(kMeanFootprint, 0.0f), TinyRender::Vec2f(0.0f, kMeanFootprint));
+	TGAColor mean = surface.m_model->diffuseMean(uv);
 	float detail = albedo - texelLuminance(mean, surface.m_model->getColorRGBA());
 	detail = detail < -kDetailLimit ? -kDetailLimit : (detail > kDetailLimit ? kDetailLimit : detail);
 
@@ -2589,12 +3309,117 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	return (1.0f - reflectance) * SwarmThermal::radiance(temperature) + reflectance * environment;
 }
 
+// How far past the farthest known hit around its pixel a hinted ray searches, for the step across a slanted surface.
+const float kHintSlack = 1.0f / 32.0f;
+const float kHintSlackMetres = 0.25f;
+
+// The camera-axis depth pixel (row, col) searches to: past the farthest remembered hit around it, else no limit.
+inline float hintReach(const float* hintFar, int width, int height, int row, int col)
+{
+	float farthest = -1.0f;
+	for (int r = row > 0 ? row - 1 : row; r <= row + 1 && r < height; r++)
+		for (int c = col > 0 ? col - 1 : col; c <= col + 1 && c < width; c++)
+		{
+			const float far = hintFar[(size_t)r * width + c];
+			farthest = far > farthest ? far : farthest;
+		}
+	return farthest < 0.0f ? INFINITY : farthest + farthest * kHintSlack + kHintSlackMetres;
+}
+
+// A remembered hit put onto this frame's pixels: the pixel it lands on keeps the farthest depth along the camera's axis.
+inline void hintPoint(const float viewProj[4][4], const float* q, int width, int height, float* hintFar)
+{
+	const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
+	if (!(w > 1e-6f))
+		return;
+	const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
+	const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
+	const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
+	const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
+	if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
+		return;
+	float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
+	far = w > far ? w : far;
+}
+
+// The same for an edge pixel's probe ray, from this frame's first rays: their 1/zEye, the far plane's for a miss.
+inline float probeReach(const float* inverseEyeDepth, int width, int height, int row, int col)
+{
+	float nearest = -INFINITY;
+	for (int r = row > 0 ? row - 1 : row; r <= row + 1 && r < height; r++)
+		for (int c = col > 0 ? col - 1 : col; c <= col + 1 && c < width; c++)
+		{
+			const float w = inverseEyeDepth[(size_t)r * width + c];
+			nearest = w > nearest ? w : nearest;
+		}
+	if (!(nearest < 0.0f))
+		return INFINITY;
+	const float farthest = -1.0f / nearest;
+	return farthest + farthest * kHintSlack + kHintSlackMetres;
+}
+
+// A camera ray's first hit, tried to `reach` plus a rounding window; any doubt reruns the full ray, so hits never change.
+void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArguments* args)
+{
+	const float end = rayhit.ray.tfar;
+	if (reach < end)
+	{
+		const float org[3] = {rayhit.ray.org_x, rayhit.ray.org_y, rayhit.ray.org_z};
+		const float dir[3] = {rayhit.ray.dir_x, rayhit.ray.dir_y, rayhit.ray.dir_z};
+		float largest = 0.0f, spread = 0.0f;
+		for (int k = 0; k < 3; k++)
+		{
+			const float size = fabsf(org[k]) + reach;
+			largest = size > largest ? size : largest;
+			const float step = size / fabsf(dir[k]);
+			spread = step > spread ? step : spread;
+		}
+		HintedSearch search;
+		for (int k = 0; k < 3; k++)
+			search.m_dir[k] = dir[k];
+		search.m_largest = largest;
+		search.m_window = (spread + largest / kHintMinFacing + reach) * (8.0f / 16777216.0f);
+		search.m_limit = reach + 2.0f * search.m_window;
+		if (search.m_limit < end)
+		{
+			search.m_nearest = search.m_next = INFINITY;
+			search.m_oblique = false;
+			rayhit.ray.tfar = search.m_limit;
+			t_hintedSearch = &search;
+			rtcIntersect1(scene, &rayhit, args);
+			t_hintedSearch = 0;
+			if (search.m_nearest <= reach && !search.m_oblique && search.m_next - search.m_nearest > search.m_window)
+			{
+				rayhit.ray.tfar = search.m_nearest;
+				rayhit.hit = search.m_hit;
+				return;
+			}
+			rayhit.ray.tfar = end;
+			rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+			rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+		}
+	}
+	rtcIntersect1(scene, &rayhit, args);
+}
+
+// Notes where a camera ray ended, its hit or its far end, for the region a kept frame depends on; a NaN sticks.
+inline void reached(RTCIntersectArguments* args, float t)
+{
+	QueryContext* ctx = (QueryContext*)args->context;
+	if (ctx->m_farthest == ctx->m_farthest && !(t <= ctx->m_farthest))
+		ctx->m_farthest = t;
+}
+
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss.
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
-			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out)
+			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
+	if (landed)
+		landed[0] = landed[1] = landed[2] = NAN;
 
 	float nearPoint[3], farPoint[3];
 	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
@@ -2613,8 +3438,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		toNear[i] = nearPoint[i] - cam.m_origin[i];
 	}
 	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
-	if (shading && shading->m_thermal)
-		out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
+	// The sky along the ray, only for a ray that ends on it: a miss, an unknown body, or what a thermal veil leaves.
+	const bool thermalSky = shading && shading->m_thermal;
 
 	RTCRayHit rayhit;
 	rayhit.ray.org_x = cam.m_origin[0];
@@ -2632,14 +3457,27 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.ray.flags = 0;
 	rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-	rtcIntersect1(job.m_top, &rayhit, args);
+	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
+	const float facing = -dot3(cam.m_viewRow2, dir);
+	firstHit(job.m_top, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
+	reached(args, rayhit.ray.tfar);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+	{
+		if (thermalSky)
+			out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 		return false;
+	}
 
 	const float t = rayhit.ray.tfar;
 	const float hx = cam.m_origin[0] + dir[0] * t;
 	const float hy = cam.m_origin[1] + dir[1] * t;
 	const float hz = cam.m_origin[2] + dir[2] * t;
+	if (landed)
+	{
+		landed[0] = hx;
+		landed[1] = hy;
+		landed[2] = hz;
+	}
 	const float zEye = ((cam.m_viewRow2[0] * hx + cam.m_viewRow2[1] * hy) + cam.m_viewRow2[2] * hz) + cam.m_viewRow2[3];
 	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
 	out.m_inverseEyeDepth = 1.0f / zEye;
@@ -2655,7 +3493,11 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	out.m_hit.m_instPrim1 = rayhit.hit.instPrimID[1];
 	out.m_shaded = shading && known;
 	if (!out.m_shaded)
+	{
+		if (thermalSky)
+			out.m_radiance = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 		return true;
+	}
 
 	// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
 	// towards the camera for shading and for the side the shadow ray leaves from.
@@ -2690,13 +3532,14 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		if (averaged && coverage < 0.97f)
 		{
 			// A veil, such as a far fence or a thin crown: its share of the pixel, and the rest from what the ray meets next.
-			float behind = out.m_radiance;
+			float behind;
 			RTCRayHit next = rayhit;
 			next.ray.tnear = t + kPaneBias;
 			next.ray.tfar = tNear + length;
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID != RTC_INVALID_GEOMETRY_ID &&
@@ -2718,6 +3561,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
 				behind = thermalHit(job, dir, back, next.hit, backFace, point2, duv2x, duv2y);
 			}
+			else
+				behind = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
 			radiance = coverage * radiance + (1.0f - coverage) * behind;
 		}
 		out.m_radiance = radiance;
@@ -2750,6 +3595,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
@@ -2797,6 +3643,28 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		HitSurface pane = surface;
 		float paneFace[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
+		if (surface.m_glassBacked)
+		{
+			// A module: its backsheet in the pane's colour, lit and shadowed as the pane, stands in for a ray behind it.
+			float normal[3], base[3], sky[3], skyLight[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			const float through = paneLight(*shading, normal, dir, sky);
+			if (shading->m_sky)
+				shading->m_sky->irradiance(normal, skyLight);
+			else
+				for (int i = 0; i < 3; i++)
+					skyLight[i] = shading->m_ambientColor[i];
+			const float nDotL = dot3(normal, shading->m_lightDir);
+			const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+			const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
+			for (int i = 0; i < 3; i++)
+			{
+				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
+			}
+			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			return true;
+		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
 		{
 			float normal[3], base[3], sky[3];
@@ -2813,6 +3681,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
@@ -2907,9 +3776,13 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			Sample sample;
 			sample.m_radiance = 0.0f;
 			const size_t offset = (size_t)row * width + col;
-			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample);
+			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
+			if (target.m_background && !(hit && sample.m_shaded))
+				target.m_background->pixel(row, col, &target.m_rgb[offset * 3]);
 			if (!hit)
 			{
 				if (scratch)
@@ -2933,8 +3806,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
-// off the straight line through its two neighbours on either axis.
-bool isEdge(const int* ids, const float* w, int width, int height, int row, int col)
+// off the straight line through its two neighbours on either axis by more than `tolerance` of its own.
+bool isEdge(const int* ids, const float* w, int width, int height, int row, int col, float tolerance)
 {
 	const size_t offset = (size_t)row * width + col;
 	const int id = ids[offset];
@@ -2942,7 +3815,7 @@ bool isEdge(const int* ids, const float* w, int width, int height, int row, int 
 	if ((hasLeft && ids[offset - 1] != id) || (hasRight && ids[offset + 1] != id) ||
 		(hasUp && ids[offset - width] != id) || (hasDown && ids[offset + width] != id))
 		return true;
-	const float limit = kEdgeTolerance * fabsf(w[offset]);
+	const float limit = tolerance * fabsf(w[offset]);
 	if (hasLeft && hasRight && fabsf((w[offset - 1] + w[offset + 1]) - 2.0f * w[offset]) > limit)
 		return true;
 	if (hasUp && hasDown && fabsf((w[offset - width] + w[offset + width]) - 2.0f * w[offset]) > limit)
@@ -2971,7 +3844,7 @@ bool projectTriangle(const TileJob& job, const Camera& cam, const HitId& hit, do
 	rtcHit.instPrimID[1] = hit.m_instPrim1;
 	int segmentation;
 	HitSurface surface;
-	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface))
+	if (!resolveHit(rtcHit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface, true))
 		return false;
 	for (int j = 0; j < 3; j++)
 	{
@@ -2992,35 +3865,29 @@ inline bool sameTriangle(const HitId& a, const HitId& b)
 	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim && a.m_inst1 == b.m_inst1 && a.m_instPrim1 == b.m_instPrim1;
 }
 
-// The last few triangles a thread put onto the frame: an edge runs through several pixels that all
-// ask for the same triangle, so each is projected once per run instead of once per pixel.
+// A thread's projected triangles for the whole frame, one slot per hash, since an edge's pixels ask for the same few.
+const int kProjectionSlots = 256;
 struct ProjectionCache
 {
-	HitId m_key[8];
-	double m_x[8][3];
-	double m_y[8][3];
-	bool m_ok[8];
-	int m_next;
-	int m_count;
+	HitId m_key[kProjectionSlots];
+	double m_x[kProjectionSlots][3];
+	double m_y[kProjectionSlots][3];
+	bool m_ok[kProjectionSlots];
+	bool m_used[kProjectionSlots];
 };
 
 bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam, const HitId& hit, const double*& x, const double*& y)
 {
-	for (int i = 0; i < cache.m_count; i++)
-		if (sameTriangle(cache.m_key[i], hit))
-		{
-			x = cache.m_x[i];
-			y = cache.m_y[i];
-			return cache.m_ok[i];
-		}
-	const int slot = cache.m_next;
-	cache.m_next = (slot + 1) % 8;
-	if (cache.m_count < 8)
-		cache.m_count++;
-	cache.m_key[slot] = hit;
-	cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
+	const unsigned mix = (hit.m_prim * 0x9E3779B1u) ^ (hit.m_instPrim1 * 0x85EBCA77u) ^ (hit.m_inst * 0xC2B2AE3Du) ^ (hit.m_geom * 0x27D4EB2Fu) ^ hit.m_inst1;
+	const int slot = (int)(mix >> 24);
 	x = cache.m_x[slot];
 	y = cache.m_y[slot];
+	if (!cache.m_used[slot] || !sameTriangle(cache.m_key[slot], hit))
+	{
+		cache.m_used[slot] = true;
+		cache.m_key[slot] = hit;
+		cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
+	}
 	return cache.m_ok[slot];
 }
 
@@ -3097,6 +3964,94 @@ struct Candidate
 	float m_depth;
 };
 
+// ER_SWARM_CREASE_FILL: a mover's widened screen box and depth, where a nearer crease keeps its probe for sub-pixel gaps.
+struct MoverRect
+{
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_depth;
+};
+const int kMoverMargin = 2;
+// A box nearer than kMoverNear guards the whole frame, unless within kAircraftReach: the aircraft's own parts.
+const float kMoverNear = 1.0f;
+const float kAircraftReach = 2.0f;
+
+// The frame rectangles of every enabled mover, the same bodies the mover shadow grid covers.
+void moverRects(const std::vector<Instance*>& instances, const Camera& cam, int width, int height, std::vector<MoverRect>& out)
+{
+	out.clear();
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const Instance* inst = instances[i];
+		if (!inst || inst->m_staticShared || !inst->m_enabled)
+			continue;
+		RTCBounds bounds;
+		rtcGetSceneBounds(inst->m_tree->m_scene, &bounds);
+		if (!(bounds.lower_x <= bounds.upper_x && bounds.lower_y <= bounds.upper_y && bounds.lower_z <= bounds.upper_z))
+			continue;
+		float nearest = INFINITY, farthest = -INFINITY, low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+		double col0 = INFINITY, col1 = -INFINITY, row0 = INFINITY, row1 = -INFINITY;
+		for (int k = 0; k < 8; k++)
+		{
+			const float corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+			float world[3];
+			transformPoint(inst->m_transform, corner, world);
+			for (int j = 0; j < 3; j++)
+			{
+				low[j] = world[j] < low[j] ? world[j] : low[j];
+				high[j] = world[j] > high[j] ? world[j] : high[j];
+			}
+			const float depth = -(((cam.m_viewRow2[0] * world[0] + cam.m_viewRow2[1] * world[1]) + cam.m_viewRow2[2] * world[2]) + cam.m_viewRow2[3]);
+			nearest = depth < nearest ? depth : nearest;
+			farthest = depth > farthest ? depth : farthest;
+			double clip[4];
+			for (int r = 0; r < 4; r++)
+				clip[r] = ((cam.m_viewProj[r][0] * world[0] + cam.m_viewProj[r][1] * world[1]) + cam.m_viewProj[r][2] * world[2]) + cam.m_viewProj[r][3];
+			if (!(clip[3] > 0.0))
+				continue;
+			// The inverse of pixelNdcX and pixelNdcY.
+			const double col = (clip[0] / clip[3] + 1.0) * 0.5 * width;
+			const double row = ((1.0 - clip[1] / clip[3]) * height - 2.0) * 0.5;
+			col0 = col < col0 ? col : col0;
+			col1 = col > col1 ? col : col1;
+			row0 = row < row0 ? row : row0;
+			row1 = row > row1 ? row : row1;
+		}
+		// Wholly behind the eye, it cannot show on the frame.
+		if (farthest <= 0.0f)
+			continue;
+		MoverRect rect;
+		if (!(nearest >= kMoverNear))
+		{
+			float gap2 = 0.0f;
+			for (int j = 0; j < 3; j++)
+			{
+				const float below = low[j] - cam.m_origin[j], above = cam.m_origin[j] - high[j];
+				const float gap = below > above ? below : above;
+				gap2 += gap > 0.0f ? gap * gap : 0.0f;
+			}
+			if (gap2 <= kAircraftReach * kAircraftReach)
+				continue;
+			rect.m_col0 = rect.m_row0 = 0;
+			rect.m_col1 = width - 1;
+			rect.m_row1 = height - 1;
+			rect.m_depth = INFINITY;
+			out.push_back(rect);
+			continue;
+		}
+		if (!(col1 >= -kMoverMargin && col0 <= width + kMoverMargin && row1 >= -kMoverMargin && row0 <= height + kMoverMargin))
+			continue;
+		// Held to the frame before the conversion, so a corner just in front of the eye cannot overflow an int.
+		rect.m_col0 = (int)floor(col0 > -1.0 ? col0 : -1.0) - kMoverMargin;
+		rect.m_col1 = (int)ceil(col1 < width ? col1 : (double)width) + kMoverMargin;
+		rect.m_row0 = (int)floor(row0 > -1.0 ? row0 : -1.0) - kMoverMargin;
+		rect.m_row1 = (int)ceil(row1 < height ? row1 : (double)height) + kMoverMargin;
+		rect.m_depth = farthest;
+		out.push_back(rect);
+	}
+}
 
 // Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
 // the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
@@ -3108,7 +4063,7 @@ struct Candidate
 // byte that enters the blend is decoded first and the blend is encoded once on the write.
 void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, const EdgeScratch& scratch,
 				int row0, int row1, int col0, int col1,
-				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache)
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache, const std::vector<MoverRect>& movers)
 {
 	const Camera& cam = setup.m_cam;
 	const int width = job.m_width;
@@ -3120,12 +4075,13 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const double halfX = 1.0 / (double)width;
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
+	const float tolerance = job.m_shading->m_edgeOutline ? kOutlineTolerance : kEdgeTolerance;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
 		for (int col = col0; col < col1; col++)
 		{
-			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col))
+			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, tolerance))
 				continue;
 			const size_t offset = (size_t)row * width + col;
 			const double ndcX = pixelNdcX(col, width);
@@ -3201,25 +4157,44 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			}
 
 			const double rest = 1.0 - covered;
-			if (rest > kCoverageEpsilon)
+			bool crease = job.m_shading->m_creaseFill && hasOwn && covered > 0.0;
+			for (int n = 0; n < 4 && crease; n++)
+				crease = neighbours[n] != offset && ids[neighbours[n]] == id && hits[neighbours[n]].m_prim != RTC_INVALID_GEOMETRY_ID;
+			// One body can span far depths, as the whole forest does: a step that passes the outline rule keeps its probe.
+			crease = crease && !isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, kOutlineTolerance);
+			const float ownEyeDepth = -1.0f / scratch.m_inverseEyeDepth[offset];
+			for (size_t m = 0; m < movers.size() && crease; m++)
+				crease = !(col >= movers[m].m_col0 && col <= movers[m].m_col1 && row >= movers[m].m_row0 && row <= movers[m].m_row1 &&
+						   ownEyeDepth < movers[m].m_depth);
+			if (rest > kCoverageEpsilon && !crease)
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
 				Sample probe;
+				unsigned char background[3];
 				if (hasOwn)
 				{
 					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
 					// that part's centre, and take the sky or clear colour when the ray meets nothing.
+					// On the left column and bottom row this samples half a pixel outside, as keepFrame allows for.
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
-					restColour = (traceRay(job, setup, px, py, args, shadowArgs, probe) && probe.m_shaded)
-									 ? probe.m_rgb
-									 : &scratch.m_background[offset * 3];
+					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
+					if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
+						restColour = probe.m_rgb;
+					else if (target.m_background)
+					{
+						target.m_background->pixel(row, col, background);
+						restColour = background;
+					}
+					else
+						restColour = &scratch.m_background[offset * 3];
 				}
 				for (int i = 0; i < 3; i++)
 					colour[i] += rest * (linear ? kSwarmSrgbToLinear[restColour[i]] : (double)restColour[i]);
 			}
 			else if (covered < 1.0)
+				// A crease under ER_SWARM_CREASE_FILL lands here too, its gap taken to look like its neighbours' triangles.
 				for (int i = 0; i < 3; i++)
 					colour[i] /= covered;
 
@@ -3237,13 +4212,70 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		}
 	}
 }
+
+// Every pixel of a camera that traces no ray takes its background, when it has one.
+void fillBackground(const SwarmRaycast::Target& target, int width, int height)
+{
+	if (!target.m_background || !target.m_rgb)
+		return;
+	for (int row = 0; row < height; row++)
+		for (int col = 0; col < width; col++)
+			target.m_background->pixel(row, col, &target.m_rgb[((size_t)row * width + col) * 3]);
+}
+
+// The camera chain on a finished frame: thermal develops the radiance; low light and near infrared work on the colour.
+void developCamera(const SwarmRaycastShading* shading, const float* radiance, int width, int height, int threads, unsigned char* rgb)
+{
+	if (!shading || !rgb)
+		return;
+	if (shading->m_thermal)
+	{
+		SwarmThermal::develop(radiance, width, height, shading->m_thermalSeed, threads, rgb);
+		return;
+	}
+	if (!shading->m_lowLight && !shading->m_nearInfrared)
+		return;
+	SwarmLowLight::Settings camera;
+	camera.m_lowLight = shading->m_lowLight;
+	camera.m_grey = shading->m_nearInfrared;
+	camera.m_photons = shading->m_sensorPhotons;
+	camera.m_readNoise = shading->m_sensorReadNoise;
+	camera.m_gainCap = shading->m_sensorGainCap;
+	camera.m_seed = shading->m_sensorSeed;
+	for (int k = 0; k < 3; k++)
+		camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
+	// Every pass splits its rows over the render threads; the bytes are the same at any count.
+	SwarmLowLight::develop(rgb, width, height, camera, threads);
+}
+
+// Everything a lone camera's frame reads but the scene, leaving out the grain seeds that only the camera chain reads.
+void frameKey(std::vector<unsigned char>& key, const void* reuseKey, size_t reuseKeyBytes, const SwarmRaycast::Target& target,
+			  const float projMat[16], int width, int height, const SwarmRaycastShading* shading, bool alphaCutout)
+{
+	const int layout[7] = {width, height, target.m_seg != 0, target.m_rgb != 0, target.m_background != 0, shading != 0, alphaCutout};
+	const unsigned char* parts[4] = {(const unsigned char*)reuseKey, (const unsigned char*)layout, (const unsigned char*)projMat, (const unsigned char*)target.m_view};
+	const size_t sizes[4] = {reuseKeyBytes, sizeof(layout), 16 * sizeof(float), 16 * sizeof(float)};
+	key.clear();
+	for (int i = 0; i < 4; i++)
+		key.insert(key.end(), parts[i], parts[i] + sizes[i]);
+	if (!shading)
+		return;
+	SwarmRaycastShading seedless = *shading;
+	seedless.m_thermalSeed = 0;
+	seedless.m_sensorSeed = 0;
+	key.insert(key.end(), (const unsigned char*)&seedless, (const unsigned char*)&seedless + sizeof(seedless));
+}
 }  // namespace
 
 void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
-						  const SwarmRaycastShading* shading, int threads, bool alphaCutout) const
+						  const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const
 {
 	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
+	{
+		for (int i = 0; i < numTargets && width > 0 && height > 0; i++)
+			fillBackground(targets[i], width, height);
 		return;
+	}
 	if (threads < 1)
 		threads = 1;
 
@@ -3260,7 +4292,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	const bool thermal = shading && shading->m_thermal;
 	// Thermal reads every texture at its footprint, for the detail it takes from the mip chain.
 	job.m_filtered = shading && (shading->m_textureFilter || thermal);
-	// The map is cast on the calling thread's schedule before the pixel loop, which then only reads it.
+	// The map is laid out here; the pixel loop casts each block of it the first time a pixel reads one.
 	job.m_shadowMap = 0;
 	job.m_shadowCore = 0;
 	job.m_shelterMap = 0;
@@ -3288,6 +4320,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		if (shading->m_moverShadow && m_data->m_moverCount > 0)
 			job.m_movers = m_data->m_movers;
 	}
+	job.m_moverShade = 0;
+	if (job.m_movers && castMoverShade(m_data->m_byGeomId, shading->m_lightDir, m_data->m_moverShade))
+		job.m_moverShade = &m_data->m_moverShade;
 	if (job.m_filtered)
 	{
 		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
@@ -3303,7 +4338,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		CameraSetup& setup = setups[(size_t)i];
 		setup.m_valid = setupCamera(targets[i].m_view, projMat, setup.m_cam);
 		if (!setup.m_valid)
+		{
+			fillBackground(targets[i], width, height);
 			continue;
+		}
 		// The unnormalised ray direction is affine in the pixel position, so the direction one pixel to
 		// the right or one row up is the pixel's own direction plus a constant step.
 		for (int k = 0; k < 3; k++)
@@ -3325,8 +4363,55 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
 	}
 
+	// A lone camera with a frame big enough keeps a memory of its lens; asked again for its kept frame, it gives it back.
+	HitMemory* memory = numTargets == 1 && setups[0].m_valid && numPixels >= kHintMinPixels ? m_data->hitMemory(width, height, projMat) : 0;
+	std::vector<unsigned char> key;
+	if (memory && reuseKey)
+	{
+		frameKey(key, reuseKey, reuseKeyBytes, targets[0], projMat, width, height, shading, alphaCutout);
+		if (m_data->reuseFrame(*memory, key, targets[0], numPixels))
+		{
+			developCamera(shading, memory->m_radiance.empty() ? 0 : &memory->m_radiance[0], width, height, threads, targets[0].m_rgb);
+			return;
+		}
+	}
+
+	// The depth hint: the same lens's last hits, put onto this frame's pixels, tell each ray about how far to search.
+	job.m_hintFar = 0;
+	job.m_hitPoints = 0;
+	float viewProj[4][4];
+	std::vector<float*> hintFrames;
+	const float* lastPoints = 0;
+	if (memory)
+	{
+		const Camera& cam = setups[0].m_cam;
+		if (memory->m_points.size() == numPixels * 3)
+		{
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 4; c++)
+					viewProj[r][c] = (float)cam.m_viewProj[r][c];
+			// One farthest-hit frame per render thread, the first being the hint, filled inside the pixel loop's region.
+			m_data->m_hintFar.resize(numPixels);
+			m_data->m_hintFrames.resize((size_t)threads - 1);
+			hintFrames.push_back(&m_data->m_hintFar[0]);
+			for (int i = 0; i < threads - 1; i++)
+			{
+				m_data->m_hintFrames[(size_t)i].resize(numPixels);
+				hintFrames.push_back(&m_data->m_hintFrames[(size_t)i][0]);
+			}
+			lastPoints = &memory->m_points[0];
+			job.m_hintFar = &m_data->m_hintFar[0];
+		}
+		memory->m_points.resize(numPixels * 3);
+		job.m_hitPoints = &memory->m_points[0];
+	}
+
 	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
 	std::vector<float> radiance(thermal ? numPixels * (size_t)numTargets : 0);
+	std::vector<std::vector<MoverRect> > movers((size_t)numTargets);
+	for (size_t i = 0; i < scratch.size() && shading->m_creaseFill; i++)
+		if (setups[i].m_valid)
+			moverRects(m_data->m_byGeomId, setups[i].m_cam, width, height, movers[i]);
 	for (size_t i = 0; i < scratch.size(); i++)
 	{
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
@@ -3336,25 +4421,23 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		scratch[i].m_ids.assign(numPixels, -1);
 		scratch[i].m_hits.assign(numPixels, none);
 		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
-		scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
+		if (!targets[i].m_background)
+			scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 	}
 
 	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera
-	// whatever the thread count, and thread t traces tiles t, t + threads, t + 2 threads, ...
+	// whatever the thread count; each thread takes the next untraced tile, whose pixels never depend on which.
 	const int tilesX = (width + kTileSize - 1) / kTileSize;
 	const int tilesY = (height + kTileSize - 1) / kTileSize;
 	const int tilesPerCamera = tilesX * tilesY;
 	const int numTiles = tilesPerCamera * numTargets;
+	std::atomic<int> nextTile[2];
+	nextTile[0] = 0;
+	nextTile[1] = 0;
+	float farthest = 0.0f;
 
 #pragma omp parallel num_threads(threads)
 	{
-#ifdef _OPENMP
-		const int tid = omp_get_thread_num();
-		const int cnt = omp_get_num_threads();
-#else
-		const int tid = 0;
-		const int cnt = 1;
-#endif
 		QueryContext ctx;
 		rtcInitRayQueryContext(&ctx.m_context);
 		ctx.m_instances = job.m_instances;
@@ -3364,6 +4447,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_alphaCutout = alphaCutout;
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
 		ctx.m_pixelSpread = job.m_pixelSpread;
+		ctx.m_farthest = 0.0f;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;
@@ -3371,12 +4455,35 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		rtcInitOccludedArguments(&shadowArgs);
 		shadowArgs.context = &ctx.m_context;
 
+		if (lastPoints)
+		{
+			// Each thread fills its own frame, then each pixel takes the maximum, the same whichever thread took which hit.
+#ifdef _OPENMP
+			const int team = omp_get_num_threads(), member = omp_get_thread_num();
+#else
+			const int team = 1, member = 0;
+#endif
+			float* own = hintFrames[(size_t)member];
+			for (size_t i = 0; i < numPixels; i++)
+				own[i] = -1.0f;
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+				hintPoint(viewProj, lastPoints + i * 3, width, height, own);
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+			{
+				float far = hintFrames[0][i];
+				for (int k = 1; k < team; k++)
+					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
+				hintFrames[0][i] = far;
+			}
+		}
+
 		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
 		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
 		const int passes = scratch.empty() ? 1 : 2;
 		ProjectionCache cache;
-		cache.m_next = 0;
-		cache.m_count = 0;
+		int cacheCamera = -1;
 		for (int pass = 0; pass < passes; pass++)
 		{
 			if (pass == 1)
@@ -3387,7 +4494,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 					if (!scratch[i].m_ids.empty())
 						scratch[i].m_rgb1.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 			}
-			for (int tile = tid; tile < numTiles; tile += cnt)
+			for (int tile = nextTile[pass]++; tile < numTiles; tile = nextTile[pass]++)
 			{
 				const int camIndex = tile / tilesPerCamera;
 				if (!setups[(size_t)camIndex].m_valid)
@@ -3402,32 +4509,27 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 				if (pass == 0)
 					renderTile(job, setups[(size_t)camIndex], targets[camIndex], edge, cameraRadiance, row0, row1, col0, col1, &args, &shadowArgs);
 				else if (edge)
-					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache);
+				{
+					// A projection belongs to one camera, so the cache starts over when this thread moves to another.
+					if (camIndex != cacheCamera)
+					{
+						memset(cache.m_used, 0, sizeof(cache.m_used));
+						cacheCamera = camIndex;
+					}
+					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache,
+							   movers[(size_t)camIndex]);
+				}
 			}
 		}
+#pragma omp critical
+		if (farthest == farthest && !(ctx.m_farthest <= farthest))
+			farthest = ctx.m_farthest;
 	}
+	if (memory && reuseKey)
+		m_data->keepFrame(*memory, key, setups[0].m_cam, targets[0], radiance, farthest, shading, width, height);
 
 	// The camera chain needs the whole frame, so it runs once every ray has landed.
-	for (int i = 0; thermal && i < numTargets; i++)
-		if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-			SwarmThermal::develop(&radiance[(size_t)i * numPixels], width, height, shading->m_thermalSeed, threads, targets[i].m_rgb);
-
-	// The low-light camera and the grey of the near infrared work on the finished frame, sky and edges included.
-	if (shading && !thermal && (shading->m_lowLight || shading->m_nearInfrared))
-	{
-		SwarmLowLight::Settings camera;
-		camera.m_lowLight = shading->m_lowLight;
-		camera.m_grey = shading->m_nearInfrared;
-		camera.m_photons = shading->m_sensorPhotons;
-		camera.m_readNoise = shading->m_sensorReadNoise;
-		camera.m_gainCap = shading->m_sensorGainCap;
-		camera.m_seed = shading->m_sensorSeed;
-		for (int k = 0; k < 3; k++)
-			camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
-		// One thread: the chain is a dozen short passes, and on a busy box the barriers between them cost more than the
-		// passes; the bytes are the same at any count.
-		for (int i = 0; i < numTargets; i++)
-			if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, 1);
-	}
+	for (int i = 0; i < numTargets; i++)
+		if (setups[(size_t)i].m_valid)
+			developCamera(shading, thermal ? &radiance[(size_t)i * numPixels] : 0, width, height, threads, targets[i].m_rgb);
 }

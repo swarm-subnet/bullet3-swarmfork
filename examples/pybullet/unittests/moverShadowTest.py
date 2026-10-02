@@ -86,6 +86,29 @@ class TestMoverShadow(unittest.TestCase):
     p.changeVisualShape(BOX, -1, rgbaColor=[1, 0, 0, 1])
     self.assertEqual(render(MOVER, 1)[0].tobytes(), shown.tobytes())
 
+  def test_grid_skips_only_rays_that_meet_no_mover(self):
+    """A frame whose movers leave most of the light's grid clear equals the frame where a mover below the floor and past
+    the far plane covers every cell, so that every lit point asks the movers."""
+    make_mover(MOVED)
+    # Along the light the floor lies over a slab 40 m down, 16 m east and 32 m south; 30 m further east it covers none.
+    shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[6, 6, 1], rgbaColor=[0, 1, 0, 1])
+    slab = p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape, basePosition=[46, -32, -40])
+    clear, _ = render(MOVER, 1)
+    p.resetBasePositionAndOrientation(slab, [16, -32, -40], [0, 0, 0, 1])
+    covered, _ = render(MOVER, 1)
+    self.assertEqual(clear.tobytes(), covered.tobytes())
+    self.assertNotEqual(clear.tobytes(), render(MAP, 1)[0].tobytes())
+
+  def test_mover_off_the_finite_range_leaves_the_others_shadow(self):
+    """A mover posed at NaN neither breaks the frame nor takes away the shadow another mover casts."""
+    make_mover(MOVED)
+    shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3, 0.3, 0.3], rgbaColor=[0, 1, 0, 1])
+    lost = p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape, basePosition=[0, 0, -40])
+    p.resetBasePositionAndOrientation(lost, [float("nan")] * 3, [0, 0, 0, 1])
+    frame, seg = render(MOVER, 1)
+    mapped, _ = render(MAP, 1)
+    self.assertGreater(int((darker(frame, mapped) & (seg == 0)).sum()), 20)
+
   def test_flag_alone_changes_nothing(self):
     """With no mover in the world the flag gives the map's bytes; without the map, without shadow=1 or on the rasterised path it is inert."""
     self.assertEqual(render(MOVER, 1)[0].tobytes(), render(MAP, 1)[0].tobytes())

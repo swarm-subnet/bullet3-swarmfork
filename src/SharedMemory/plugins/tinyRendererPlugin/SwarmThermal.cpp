@@ -171,8 +171,10 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 	const int numPixels = width * height;
 	if (numPixels <= 0)
 		return;
-	std::vector<float> frame((size_t)numPixels);
-	lens(radiance, &frame[0], width, height, threads);
+	// The frame buffers are kept for the next frame and written in full before they are read.
+	static thread_local std::vector<float> frameBuffer, greyBuffer, baseBuffer;
+	float* frame = SwarmGrain::reuse(frameBuffer, (size_t)numPixels);
+	lens(radiance, frame, width, height, threads);
 
 	// The grain is scaled at the frame's own level, where the sensor's NETD is quoted.
 	double total = 0.0;
@@ -199,8 +201,11 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 		lo = frame[(size_t)i] < lo ? frame[(size_t)i] : lo;
 		hi = frame[(size_t)i] > hi ? frame[(size_t)i] : hi;
 	}
-	std::vector<float> grey((size_t)numPixels, 0.0f);
-	if (hi > lo)
+	float* grey = SwarmGrain::reuse(greyBuffer, (size_t)numPixels);
+	if (!(hi > lo))
+		for (int i = 0; i < numPixels; i++)
+			grey[(size_t)i] = 0.0f;
+	else
 	{
 		const float toBins = (float)kBins / (hi - lo);
 		std::vector<long long> counts((size_t)kBins, 0);
@@ -239,8 +244,8 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 	}
 
 	// Detail against a wider blur; the ends stay at 0 and 1, since the blur of values in [0, 1] stays inside it.
-	std::vector<float> base((size_t)numPixels);
-	blur(&grey[0], &base[0], width, height, gaussianKernel(kDetailSigmaPx), threads);
+	float* base = SwarmGrain::reuse(baseBuffer, (size_t)numPixels);
+	blur(grey, base, width, height, gaussianKernel(kDetailSigmaPx), threads);
 #pragma omp parallel for num_threads(threads) schedule(static)
 	for (int i = 0; i < numPixels; i++)
 	{

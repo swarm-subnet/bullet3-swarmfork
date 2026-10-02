@@ -10,7 +10,10 @@
 inline double swarmExp(double x)
 {
 	const double ln2 = 0.6931471805599453;
-	int n = (int)(x / ln2 + (x < 0.0 ? -0.5 : 0.5));
+	// Within 0.345 of zero the reduction always rounds to n = 0 (x / ln2 stays inside +-0.4978), so it needs no division.
+	int n = 0;
+	if (!(x > -0.345 && x < 0.345))
+		n = (int)(x / ln2 + (x < 0.0 ? -0.5 : 0.5));
 	if (n < -1000)
 		return 0.0;
 	if (n > 1000)
@@ -37,6 +40,30 @@ inline float swarmLog2(float x)
 	const float atanh = y * (1.0f + y2 * (1.0f / 3.0f + y2 * (1.0f / 5.0f + y2 * (1.0f / 7.0f + y2 * (1.0f / 9.0f + y2 * (1.0f / 11.0f))))));
 	return (float)e + atanh * 2.8853900817779268f;
 }
+
+#if defined(__GNUC__)
+// Four floats in one vector register, with per-lane IEEE arithmetic.
+typedef float SwarmLanes __attribute__((vector_size(16)));
+typedef int SwarmLaneMask __attribute__((vector_size(16)));
+
+// Per lane: a where the mask is set, b elsewhere, as the scalar ternary picks.
+inline SwarmLanes swarmSelect(SwarmLaneMask mask, SwarmLanes a, SwarmLanes b)
+{
+	return (SwarmLanes)((mask & (SwarmLaneMask)a) | (~mask & (SwarmLaneMask)b));
+}
+
+// swarmLog2 on each lane, for lanes above zero: the same steps on the same bits.
+inline SwarmLanes swarmLog2(SwarmLanes x)
+{
+	const SwarmLaneMask bits = (SwarmLaneMask)x;
+	const SwarmLaneMask e = ((bits >> 23) & 255) - 127;
+	const SwarmLanes m = (SwarmLanes)((bits & 0x007fffff) | 0x3f800000);
+	const SwarmLanes y = (m - 1.0f) / (m + 1.0f);
+	const SwarmLanes y2 = y * y;
+	const SwarmLanes atanh = y * (1.0f + y2 * (1.0f / 3.0f + y2 * (1.0f / 5.0f + y2 * (1.0f / 7.0f + y2 * (1.0f / 9.0f + y2 * (1.0f / 11.0f))))));
+	return __builtin_convertvector(e, SwarmLanes) + atanh * 2.8853900817779268f;
+}
+#endif
 
 // atan(t) for |t| <= 1, an odd polynomial good to about 1e-5 radians.
 inline double swarmAtanUnit(double t)
@@ -92,6 +119,26 @@ struct SwarmAgx
 											{-0.164352742528393f, -0.238183969428088f, 1.40253671195648f}};
 		const float kMinEv = -12.47393f;
 		const float kMaxEv = 4.026069f;
+#if defined(__GNUC__)
+		// The channels as vector lanes, each running the scalar steps below in order, so IEEE gives the same bits.
+		const SwarmLanes zero = {0.0f, 0.0f, 0.0f, 0.0f}, one = {1.0f, 1.0f, 1.0f, 1.0f}, tiny = {1e-10f, 1e-10f, 1e-10f, 1e-10f};
+		const SwarmLanes in0 = {kInset[0][0], kInset[1][0], kInset[2][0], 0.0f};
+		const SwarmLanes in1 = {kInset[0][1], kInset[1][1], kInset[2][1], 0.0f};
+		const SwarmLanes in2 = {kInset[0][2], kInset[1][2], kInset[2][2], 0.0f};
+		SwarmLanes v = (in0 * linear[0] + in1 * linear[1]) + in2 * linear[2];
+		v = swarmSelect(v > tiny, v, tiny);
+		v = (swarmLog2(v) - kMinEv) / (kMaxEv - kMinEv);
+		v = swarmSelect(v < zero, zero, swarmSelect(v > one, one, v));
+		const SwarmLanes x2 = v * v, x4 = x2 * x2;
+		const SwarmLanes encoded = ((((15.5f * x4 * x2 - 40.14f * x4 * v) + 31.96f * x4) - 6.868f * x2 * v) + 0.4298f * x2) + (0.1191f * v - 0.00232f);
+		const SwarmLanes out0 = {kOutset[0][0], kOutset[1][0], kOutset[2][0], 0.0f};
+		const SwarmLanes out1 = {kOutset[0][1], kOutset[1][1], kOutset[2][1], 0.0f};
+		const SwarmLanes out2 = {kOutset[0][2], kOutset[1][2], kOutset[2][2], 0.0f};
+		SwarmLanes d = (out0 * encoded[0] + out1 * encoded[1]) + out2 * encoded[2];
+		d = swarmSelect(d < zero, zero, swarmSelect(d > one, one, d));
+		for (int i = 0; i < 3; i++)
+			display[i] = d[i];
+#else
 		float encoded[3];
 		for (int i = 0; i < 3; i++)
 		{
@@ -107,6 +154,7 @@ struct SwarmAgx
 			const float v = (kOutset[i][0] * encoded[0] + kOutset[i][1] * encoded[1]) + kOutset[i][2] * encoded[2];
 			display[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 		}
+#endif
 	}
 
 	// The byte for a display value: rounded to nearest, as the sky's bytes are.
