@@ -3959,6 +3959,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				{
 					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
 					// that part's centre, and take the sky or clear colour when the ray meets nothing.
+					// The square reaches half a pixel past the frame's sides on the left column and bottom row; keepFrame widens its region by one pixel for this.
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
