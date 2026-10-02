@@ -10699,7 +10699,13 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 
 		if (b3CanSubmitCommand(sm))
 		{
-			b3SharedMemoryStatusHandle statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			b3SharedMemoryStatusHandle statusHandle;
+			// a single camera falls back to the shared depth scratch, so these frames take turns with getCameraImage's
+			Py_BEGIN_ALLOW_THREADS
+			PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+			statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			PyThread_release_lock(sCameraLock);
+			Py_END_ALLOW_THREADS
 			if (b3GetStatusType(statusHandle) == CMD_CAMERA_IMAGE_COMPLETED)
 			{
 #ifdef PYBULLET_USE_NUMPY
