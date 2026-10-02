@@ -55,8 +55,7 @@ struct MyTexture2
 	std::string m_name;
 };
 
-// File textures the renderer keeps decoded for the life of the process, so the next world that names one borrows
-// the copy instead of reading and decoding the file again.
+// File textures kept decoded for the process, so the next world that names one borrows it instead of decoding again.
 static std::set<std::string> gPinnedTextures;
 
 // Hands a file-backed texture to the renderer for good: a reference by name replaces the texels, which
@@ -257,9 +256,7 @@ struct TinyRendererVisualShapeConverterInternalData
 	}
 
 #ifdef SWARM_RAYCAST
-	// Brings every render object that changed since the last call into the ray-cast scene, in the same order as a
-	// full sync, and rebuilds the top-level tree; an unchanged object would leave the scene as it is. The mover tree
-	// is brought up to date only for a frame that casts mover shadows.
+	// Syncs the render objects changed since the last call, in full-sync order; the mover tree only for mover shadows.
 	SwarmRaycast& syncRaycast(bool moverShadows)
 	{
 		if (!m_raycast)
@@ -1167,8 +1164,7 @@ struct ForestFile
 	std::vector<std::vector<float> > m_placements;
 };
 
-// Adds one placement, "x y z qx qy qz qw sx sy sz", to its mesh: the rotation from the unit quaternion, each column
-// scaled by its axis, then the origin, the placement's 3x4 column-major.
+// Adds one placement "x y z qx qy qz qw sx sy sz" to its mesh: the scaled rotation, then the origin, as a column-major 3x4.
 static void addForestPlacement(ForestFile& out, int index, const double v[10])
 {
 	const double x = v[0], y = v[1], z = v[2], qx = v[3], qy = v[4], qz = v[5], qw = v[6], sx = v[7], sy = v[8], sz = v[9];
@@ -1185,9 +1181,8 @@ static void addForestPlacement(ForestFile& out, int index, const double v[10])
 		placements.push_back((float)origin[row]);
 }
 
-// Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines, or one
-// "binary <rows>" line followed by those eleven numbers per row as little-endian doubles, which skips formatting and
-// parsing text for a large forest; '#' starts a comment. False when the file cannot be read or names no mesh.
+// Reads "mesh <obj path relative to the file>" lines, then "<mesh index> x y z qx qy qz qw sx sy sz" lines;
+// '#' starts a comment. False when the file cannot be read or names no mesh.
 static bool readForestFile(const std::string& fileName, CommonFileIOInterface* fileIO, ForestFile& out)
 {
 	char found[1024];
@@ -1213,6 +1208,7 @@ static bool readForestFile(const std::string& fileName, CommonFileIOInterface* f
 			out.m_placements.push_back(std::vector<float>());
 			continue;
 		}
+		// Or one "binary <rows>" line, then those eleven numbers per row as little-endian doubles, with no text to parse.
 		if (line.compare(0, 7, "binary ") == 0)
 		{
 			// The rows the line names must all be in the file, so a damaged count cannot ask for more memory than that.
@@ -2514,8 +2510,7 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
 		target.m_background = (sky && numPixels) ? &background : 0;
-		// ER_SWARM_FRAME_REUSE: what the frame reads beyond the camera, the shading and the scene, so a frame is handed
-		// back only for a request that matches it here too.
+		// ER_SWARM_FRAME_REUSE: what the frame reads beyond camera, shading and scene, which a reused frame must match too.
 		struct ReuseKey
 		{
 			unsigned long long m_pictureRevision;

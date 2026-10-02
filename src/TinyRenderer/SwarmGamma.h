@@ -48,11 +48,11 @@ inline bool swarmSrgbReaches(float linear, int b)
 
 // The byte for the linear light at the start of each 1/4096 slice of 0..1, filled once by halving
 // over the table. A slice is narrower than the smallest byte step, so the encode below starts at
-// most one byte under its answer and never searches. Beside it every cut swarmSrgbReaches tests,
-// and past byte 255 one no value below 1 reaches.
+// most one byte under its answer and never searches.
 struct SwarmSrgbStart
 {
 	unsigned char m_byte[4096];
+	// Every cut swarmSrgbReaches tests, and past byte 255 one no value below 1 reaches.
 	float m_cut[257];
 
 	SwarmSrgbStart()
@@ -79,15 +79,15 @@ struct SwarmSrgbStart
 };
 static const SwarmSrgbStart kSwarmSrgbStart;
 
-// The byte whose linear value is nearest to `linear`: the start byte of its slice, stepped up when
-// the next cut is reached, which is at most once since linear * 4096 is exact. A NaN or a negative
-// value encodes as 0, anything past 1 as 255.
+// The byte whose linear value is nearest to `linear`: the start byte of its slice, stepped up while
+// the next cut is still reached. A NaN or a negative value encodes as 0, anything past 1 as 255.
 inline unsigned char swarmLinearToSrgb(float linear)
 {
 	if (!(linear > 0.0f))
 		return 0;
 	if (linear >= 1.0f)
 		return 255;
+	// One step at most, since linear * 4096 is exact.
 	const int b = kSwarmSrgbStart.m_byte[(int)(linear * 4096.0f)];
 	return (unsigned char)(b + (linear >= kSwarmSrgbStart.m_cut[b + 1] ? 1 : 0));
 }

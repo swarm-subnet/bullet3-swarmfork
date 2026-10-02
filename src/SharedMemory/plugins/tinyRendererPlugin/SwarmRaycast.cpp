@@ -155,8 +155,7 @@ struct CachedTree;
 typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
 typedef std::list<CachedTree*> IdleTrees;
 
-// A mesh tree committed over its own copy of the vertex and index arrays and kept for the life of the process. A build
-// runs the same steps on the same arrays, so a later world handing over equal arrays is given the tree it would build.
+// A mesh tree over its own copy of the arrays, kept for the process: a later world with equal arrays gets the same tree.
 struct CachedTree
 {
 	RTCScene m_scene;
@@ -277,9 +276,7 @@ struct QueryContext
 	float m_farthest;
 };
 
-// Casts the cells [col0, col1) x [row0, row1) of the shadow map on this thread, from the start plane along -light
-// into the static tree. Each cell is one ray that depends only on the map and the tree, so neither the thread nor
-// the moment it is cast can change its bytes.
+// Casts the shadow-map cells [col0, col1) x [row0, row1) along -light; each ray depends only on the map and the tree.
 void castShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row1)
 {
 	const float dir[3] = {-map.m_lightDir[0], -map.m_lightDir[1], -map.m_lightDir[2]};
@@ -322,8 +319,7 @@ void castShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row
 	}
 }
 
-// Casts every block not cast yet that holds a cell of [col0, col1] x [row0, row1]. The first thread to claim a
-// block casts it and any other waits for it, so a cell is cast once, by one ray, whichever thread asks first.
+// Casts every uncast block with a cell in [col0, col1] x [row0, row1]; the first thread to claim one casts it, others wait.
 void castShadowBlocks(const ShadowMap& map, int col0, int col1, int row0, int row1)
 {
 	col0 = col0 < 0 ? 0 : col0;
@@ -450,11 +446,7 @@ inline float placementSign(const float* t)
 	return det < 0.0f ? -1.0f : 1.0f;
 }
 
-// A hinted search on this thread. Embree drops a box once its rounded entry distance passes the nearest hit so far, so
-// of two hits closer than that rounding the full search keeps whichever it met first, and a search cut short may meet
-// them in another order. The filter therefore notes the nearest kept hit and the next one, and keeps the search going a
-// window past the nearest, wide enough that every surface that rounding could put first is met; the ray goes to the
-// full search when the next hit lies inside the window or the nearest is seen too obliquely for the window to hold.
+// A hinted search's nearest and next kept hit, searched a window past the nearest so box rounding cannot reorder them.
 struct HintedSearch
 {
 	// The ray's world direction, and the coordinate size its window allows for.
@@ -468,8 +460,7 @@ struct HintedSearch
 	RTCHit m_hit;
 };
 thread_local HintedSearch* t_hintedSearch = 0;
-// Below this cosine between the ray and a face, for coordinates of the window's size, the face's own distance rounds
-// beyond the window.
+// Below this ray-face cosine, at the window's coordinate size, the face's own distance rounds beyond the window.
 const float kHintMinFacing = 1.0f / 16.0f;
 
 // TinyRenderer drops a single-sided face whose winding normal points away from the camera; the
@@ -563,9 +554,7 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		args->valid[0] = 0;
 }
 
-// The cosine between a kept hit's face and the ray in world space, where its distance rounds, scaled down by how far the
-// coordinates of the hit's own frame outgrow the window's: the face's normal goes to world space through the inverse
-// transpose of its placement or instance, and the ray's origin there, over the ray's stretch, sizes the coordinates.
+// The ray-face cosine in world space, scaled down by how far the hit frame's coordinates outgrow the window's.
 float hintFacing(const RTCFilterFunctionNArguments* args, const RTCHit* hit, const RTCRay* ray, float t, const HintedSearch& search)
 {
 	const QueryContext* ctx = (const QueryContext*)args->context;
@@ -753,17 +742,14 @@ RTCGeometry newTriangles(RTCDevice device, std::vector<float>& vertices, std::ve
 	return geometry;
 }
 
-// One Embree device for the process: a cached tree outlives the world that built it, and an instance can only draw a
-// scene of its own device. threads=1: Embree starts no thread of its own, so a build runs only on the threads that
-// commit it. Never released, since the cached trees live as long as the process.
+// One never-released device, since cached trees outlive their world; threads=1 so builds run only on committing threads.
 RTCDevice processDevice()
 {
 	static const RTCDevice device = rtcNewDevice("threads=1,set_affinity=0");
 	return device;
 }
 
-// Commits a scene on up to two render threads. Embree cuts a build into the same tasks however many threads run them,
-// and each task's result depends only on its own primitives, so the tree is the one a single thread builds.
+// Commits a scene on up to two render threads; Embree's build tasks, and so the tree, ignore the thread count.
 void joinCommit(RTCScene scene)
 {
 	// The internal scheduler of a one-thread device has room for two threads in a build.
@@ -779,8 +765,7 @@ void joinCommit(RTCScene scene)
 	}
 }
 
-// Idle cached trees are kept up to this weight, the least recently used dropped first. A tree weighs its triangles plus
-// a fixed share for its scene, geometry and allocator blocks, so many tiny trees cannot pile up either.
+// Weight of idle trees kept, oldest dropped first; a tree weighs its triangles plus a fixed share, so tiny ones count.
 const size_t kTreeCacheIdleWeight = 2000000;
 const size_t kTreeCacheEntryWeight = 1000;
 
@@ -1083,8 +1068,7 @@ bool setupCamera(const float viewMat[16], const float projMat[16], Camera& cam)
 	return true;
 }
 
-// Where a lens's first rays landed on its last frame, in world space (x, y, z per pixel, NaN for a miss). The next frame
-// from the same lens puts them back onto its own pixels to know about how far each ray has to search.
+// Where a lens's first rays landed last frame (world x, y, z per pixel, NaN on a miss), the next frame's depth hint.
 struct HitMemory
 {
 	int m_width;
@@ -1092,9 +1076,7 @@ struct HitMemory
 	float m_proj[16];
 	std::vector<float> m_points;
 	unsigned long long m_lastUse;
-	// Frame reuse: the key of the lens's last request and, once a request repeated the one before, that frame's buffers
-	// before the camera chain, the scene revision and move they were drawn at, and the region they depend on: the
-	// pyramid from the eye to the depth its rays reached, swept towards the light when hits cast shadows.
+	// Frame reuse: the last request's key and, after a repeat, its frame before the camera chain and the region it reads.
 	std::vector<unsigned char> m_key;
 	bool m_kept;
 	unsigned long long m_sceneRevision;
@@ -1112,9 +1094,7 @@ struct HitMemory
 // Frame reuse: a kept frame is dropped once this many mover boxes wait to be tested against it.
 const size_t kReuseMaxBoxes = 1 << 16;
 
-// True unless an axis separates the box (lo, hi) from the region a kept frame depends on: the pyramid of its apex and
-// base corners, swept along the light without end when the frame casts shadows. The axes are the faces and edge
-// crossings of both shapes, so a box the region misses is told apart; a NaN anywhere answers true.
+// True unless an axis separates the box (lo, hi) from a kept frame's pyramid, swept along the light; NaN answers true.
 bool reachesFrame(const HitMemory& frame, const double lo[3], const double hi[3])
 {
 	double edges[7][3];
@@ -1196,8 +1176,7 @@ bool reachesFrame(const HitMemory& frame, const double lo[3], const double hi[3]
 	return true;
 }
 
-// The movers seen from the light: a grid across the light's direction whose cells are set where a mover's box, widened
-// for rounding, lies. A shadow ray runs along the light, so one leaving a point under a clear cell cannot meet a mover.
+// The movers' boxes seen from the light as a grid; a shadow ray from a point under a clear cell cannot meet a mover.
 struct MoverShade
 {
 	float m_axisU[3];
@@ -1210,8 +1189,7 @@ struct MoverShade
 	std::vector<unsigned char> m_cells;
 };
 
-// Lenses remembered at once (the wide feed, the zoom, the thermal camera), and the smallest frame that keeps a memory:
-// the laser's few pixels gain nothing from one.
+// Lenses remembered at once (wide, zoom, thermal), and the smallest frame worth a memory, so the laser keeps none.
 const int kHitMemories = 4;
 const size_t kHintMinPixels = 64 * 64;
 }  // namespace
@@ -1257,20 +1235,17 @@ struct SwarmRaycast::Data
 	int m_moverCount;
 	HitMemory m_hitMemories[kHitMemories];
 	unsigned long long m_frameCount;
-	// Per pixel of the current frame: the depth along the camera's axis of the farthest remembered hit landing on it, -1
-	// where none does.
+	// Per pixel: the camera-axis depth of the farthest remembered hit landing on it, -1 where none does.
 	std::vector<float> m_hintFar;
 	// The same for the share of the remembered hits each further render thread puts onto the frame.
 	std::vector<std::vector<float> > m_hintFrames;
 	MoverShade m_moverShade;
-	// Frame reuse: counts every change to the scene or its shadow grids but a mover's move; each move instead leaves the
-	// mover's world box before and after it (lo, hi), m_movedBase counting the boxes dropped from the front.
+	// Frame reuse: scene changes but mover moves, which leave old and new boxes; m_movedBase counts boxes dropped.
 	unsigned long long m_sceneRevision;
 	std::vector<double> m_moved;
 	unsigned long long m_movedBase;
 
-	// Notes a mover's move for the kept frames: the box of its tree under the old transform and under the new one. Boxes
-	// every kept frame has already seen are dropped; too many waiting drop the kept frames instead.
+	// Notes a mover's old and new boxes for kept frames, dropping boxes all have seen, or the frames if too many wait.
 	void moverMoved(const MeshTree* tree, const float before[16], const float after[16])
 	{
 		size_t from = m_moved.size() / 6;
@@ -1336,8 +1311,7 @@ struct SwarmRaycast::Data
 		return true;
 	}
 
-	// Takes this request's key, and keeps the frame it drew when the request repeated the lens's last one: a camera that
-	// stays still is asked for it again, a moving one never is. farthest is how far along their rays its rays went.
+	// Takes the request's key and keeps its frame when it repeated the last one; farthest is how far its rays went.
 	void keepFrame(HitMemory& memory, std::vector<unsigned char>& key, const Camera& cam, const SwarmRaycast::Target& target,
 				   const std::vector<float>& radiance, float farthest, const SwarmRaycastShading* shading, int width, int height)
 	{
@@ -1347,8 +1321,7 @@ struct SwarmRaycast::Data
 		memory.m_kept = false;
 		if (!repeat || !(farthest >= 0.0f && farthest < INFINITY))
 			return;
-		// Every ray point lies within its distance along the ray of the eye, so no deeper than the farthest one went.
-		// The sides lie a pixel out: an edge probe on the left column or the bottom row samples up to half a pixel past ndc -1.
+		// A pixel wider each side, since edge probes on the left column and bottom row sample half a pixel past ndc -1.
 		double corners[4][3], centre[3];
 		const double sideX = 1.0 + 2.0 / width, sideY = 1.0 + 2.0 / height;
 		const double ndc[4][2] = {{-sideX, -sideY}, {sideX, -sideY}, {sideX, sideY}, {-sideX, sideY}};
@@ -1484,8 +1457,7 @@ struct SwarmRaycast::Data
 		map.m_built = true;
 	}
 
-	// Recasts the cells of one map under one member's vertices, one cell wider on every side. Only blocks already cast
-	// are recast; the others are cast as the tree is now when a frame first reads them.
+	// Recasts one map's cast blocks under a member's vertices, a cell wider each side; the rest cast when first read.
 	void recastMember(ShadowMap& map, const StaticMember* member, int threads)
 	{
 		if (!map.m_built)
@@ -1669,8 +1641,7 @@ struct SwarmRaycast::Data
 		return tree;
 	}
 
-	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build. A mesh tree is taken from the
-	// process cache, so a mesh another world already drew costs no build.
+	// Commits the tree's scene, or loads its Embree image; a mesh tree another world already built comes from the cache.
 	void buildTree(MeshTree& tree, const std::vector<char>* image)
 	{
 		tree.m_cached = 0;
@@ -3043,8 +3014,7 @@ struct EdgeScratch
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
-// ER_SWARM_EDGE_OUTLINE's slack: a neighbour more than a quarter farther away (a fifth, seen from the far side) is an
-// edge, so the leaves of one crown, a few per cent apart in depth, are not, while a crown against trees well behind it is.
+// ER_SWARM_EDGE_OUTLINE: a neighbour a quarter farther (a fifth from the far side) is an edge; leaves of one crown are not.
 const float kOutlineTolerance = 0.2f;
 // Coverage below this is left to the colour already in the pixel: it is under one colour step.
 const double kCoverageEpsilon = 1.0 / 512.0;
@@ -3059,9 +3029,7 @@ inline int moverCell(const MoverShade& shade, const float point[3])
 	return (int)v * shade.m_cols + (int)u;
 }
 
-// Lays the grid over the enabled movers for a light direction: each mover's tree bounds, carried into world space by its
-// instance, put across the light and widened well past the rounding of these sums and of the ray's own. False, and no
-// grid, when a mover or the light leaves the finite range: every lit point then asks the movers, as without the grid.
+// Lays the grid over the enabled movers' widened boxes across the light; false, so every ray fires, if any is not finite.
 bool castMoverShade(const std::vector<Instance*>& instances, const float lightDir[3], MoverShade& shade)
 {
 	const float ax = fabsf(lightDir[0]), ay = fabsf(lightDir[1]), az = fabsf(lightDir[2]);
@@ -3187,9 +3155,7 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
 }
 
-// The texture footprint of a hit, measured as TinyRenderer does at the pixel to the right and the one above: the
-// barycentric weights of corners 1 and 2 where each neighbour's ray meets the triangle's plane, skipped when that ray
-// runs along the plane. woundNormal must be the triangle's normal as wound, since the weights carry its sign.
+// A hit's texture footprint from the right and upper neighbours' rays on its plane; woundNormal keeps the weights' sign.
 void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurface& surface, const float woundNormal[3], const RTCHit& hit,
 				 float duvdx[2], float duvdy[2])
 {
@@ -3343,13 +3309,11 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	return (1.0f - reflectance) * SwarmThermal::radiance(temperature) + reflectance * environment;
 }
 
-// A hinted ray searches this far past the farthest known hit around its pixel, as a share and in metres, for the step
-// from one pixel to the next on a slanted surface; a surface found farther costs a second, full search.
+// How far past the farthest known hit around its pixel a hinted ray searches, for the step across a slanted surface.
 const float kHintSlack = 1.0f / 32.0f;
 const float kHintSlackMetres = 0.25f;
 
-// The depth along the camera's axis the ray of pixel (row, col) has to search to: past the farthest remembered hit on it
-// and its eight neighbours; no limit where none of them remembers one.
+// The camera-axis depth pixel (row, col) searches to: past the farthest remembered hit around it, else no limit.
 inline float hintReach(const float* hintFar, int width, int height, int row, int col)
 {
 	float farthest = -1.0f;
@@ -3394,12 +3358,7 @@ inline float probeReach(const float* inverseEyeDepth, int width, int height, int
 	return farthest + farthest * kHintSlack + kHintSlackMetres;
 }
 
-// The first hit of a camera ray, searched first only up to `reach` and two windows past it when that falls short of the
-// ray's end; the window is what Embree's rounding can move a box or a hit by: about 2^-24 of each coordinate over the
-// direction component it is divided by, and of the distance, with eight times that allowed. The hinted search meets
-// every surface within its reach (none is cut by the end) and around the nearest (see HintedSearch), so its nearest hit
-// is the full search's when no second hit is within a window of it. A miss, a hit past `reach`, a second hit that close
-// or a face seen nearly edge-on searches again over the whole ray, so a wrong hint costs time and never changes the hit.
+// A camera ray's first hit, tried to `reach` plus a rounding window; any doubt reruns the full ray, so hits never change.
 void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArguments* args)
 {
 	const float end = rayhit.ray.tfar;
@@ -3451,9 +3410,7 @@ inline void reached(RTCIntersectArguments* args, float t)
 		ctx->m_farthest = t;
 }
 
-// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
-// `reach`, when finite, is the depth hint for this ray along the camera's axis; `landed`, when given, takes where the ray
-// landed (NaN on a miss).
+// One camera ray through (ndcX, ndcY), false on a miss; `reach` is its depth hint, `landed` takes its hit point or NaN.
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
 {
@@ -3687,8 +3644,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
 		if (surface.m_glassBacked)
 		{
-			// A module: its cells over a white backsheet in the pane's own colour, lit as the pane is and shaded by its
-			// shadow, which is what the ray behind it would meet, so no ray goes behind it.
+			// A module: its backsheet in the pane's colour, lit and shadowed as the pane, stands in for a ray behind it.
 			float normal[3], base[3], sky[3], skyLight[3];
 			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
 			const float through = paneLight(*shading, normal, dir, sky);
@@ -3908,9 +3864,7 @@ inline bool sameTriangle(const HitId& a, const HitId& b)
 	return a.m_inst == b.m_inst && a.m_geom == b.m_geom && a.m_prim == b.m_prim && a.m_inst1 == b.m_inst1 && a.m_instPrim1 == b.m_instPrim1;
 }
 
-// The triangles a thread put onto the frame, one slot per hash of the triangle, kept for the whole
-// frame: an edge runs through several pixels that all ask for the same few triangles, so each is
-// projected about once instead of once per pixel.
+// A thread's projected triangles for the whole frame, one slot per hash, since an edge's pixels ask for the same few.
 const int kProjectionSlots = 256;
 struct ProjectionCache
 {
@@ -4009,8 +3963,7 @@ struct Candidate
 	float m_depth;
 };
 
-// ER_SWARM_CREASE_FILL: a mover's box put onto the frame, kMoverMargin pixels wider, and the farthest eye depth it
-// reaches. A crease nearer than that inside it may show the mover through a gap narrower than a pixel, so it keeps its probe.
+// ER_SWARM_CREASE_FILL: a mover's widened screen box and depth, where a nearer crease keeps its probe for sub-pixel gaps.
 struct MoverRect
 {
 	int m_col0;
@@ -4020,8 +3973,7 @@ struct MoverRect
 	float m_depth;
 };
 const int kMoverMargin = 2;
-// A box reaching nearer than kMoverNear guards the whole frame, unless it lies within kAircraftReach of the eye: those are
-// the aircraft's own parts, in front of everything it films.
+// A box nearer than kMoverNear guards the whole frame, unless within kAircraftReach: the aircraft's own parts.
 const float kMoverNear = 1.0f;
 const float kAircraftReach = 2.0f;
 
@@ -4222,7 +4174,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				{
 					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
 					// that part's centre, and take the sky or clear colour when the ray meets nothing.
-					// The square reaches half a pixel past the frame's sides on the left column and bottom row; keepFrame widens its region by one pixel for this.
+					// On the left column and bottom row this samples half a pixel outside, as keepFrame allows for.
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
@@ -4241,8 +4193,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					colour[i] += rest * (linear ? kSwarmSrgbToLinear[restColour[i]] : (double)restColour[i]);
 			}
 			else if (covered < 1.0)
-				// Also a crease under ER_SWARM_CREASE_FILL: what shows through between its neighbours' triangles is
-				// taken to look like them, which spares a probe ray on nearly every pixel of a crown at full smoothing.
+				// A crease under ER_SWARM_CREASE_FILL lands here too, its gap taken to look like its neighbours' triangles.
 				for (int i = 0; i < 3; i++)
 					colour[i] /= covered;
 
@@ -4271,8 +4222,7 @@ void fillBackground(const SwarmRaycast::Target& target, int width, int height)
 			target.m_background->pixel(row, col, &target.m_rgb[((size_t)row * width + col) * 3]);
 }
 
-// The camera chain on one camera's finished frame: thermal develops the radiance into the bytes; the low-light camera
-// and the grey of the near infrared work on the colour, sky and edges included.
+// The camera chain on a finished frame: thermal develops the radiance; low light and near infrared work on the colour.
 void developCamera(const SwarmRaycastShading* shading, const float* radiance, int width, int height, int threads, unsigned char* rgb)
 {
 	if (!shading || !rgb)
@@ -4297,8 +4247,7 @@ void developCamera(const SwarmRaycastShading* shading, const float* radiance, in
 	SwarmLowLight::develop(rgb, width, height, camera, threads);
 }
 
-// Everything a lone camera's frame reads but the scene: the caller's bytes, the frame size, projection and view, which
-// buffers it writes, cut-outs, and the shading but its grain seeds, which only the camera chain reads.
+// Everything a lone camera's frame reads but the scene, leaving out the grain seeds that only the camera chain reads.
 void frameKey(std::vector<unsigned char>& key, const void* reuseKey, size_t reuseKeyBytes, const SwarmRaycast::Target& target,
 			  const float projMat[16], int width, int height, const SwarmRaycastShading* shading, bool alphaCutout)
 {
@@ -4426,8 +4375,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		}
 	}
 
-	// The depth hint: the last frame of the same lens, its hits put onto this frame's pixels, tells each ray about how
-	// far it has to search.
+	// The depth hint: the same lens's last hits, put onto this frame's pixels, tell each ray about how far to search.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
 	float viewProj[4][4];
@@ -4441,8 +4389,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			for (int r = 0; r < 4; r++)
 				for (int c = 0; c < 4; c++)
 					viewProj[r][c] = (float)cam.m_viewProj[r][c];
-			// One frame of farthest hits per render thread, the first being the hint itself; the threads fill them inside
-			// the pixel loop's parallel region.
+			// One farthest-hit frame per render thread, the first being the hint, filled inside the pixel loop's region.
 			m_data->m_hintFar.resize(numPixels);
 			m_data->m_hintFrames.resize((size_t)threads - 1);
 			hintFrames.push_back(&m_data->m_hintFar[0]);
@@ -4478,8 +4425,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	}
 
 	// The tile grid is fixed by the frame size alone: tile k covers the same pixels of the same camera
-	// whatever the thread count. Each thread takes the next untraced tile, so none idles while another is left
-	// with the slow ones; whichever thread traces a tile, its pixels come out the same.
+	// whatever the thread count; each thread takes the next untraced tile, whose pixels never depend on which.
 	const int tilesX = (width + kTileSize - 1) / kTileSize;
 	const int tilesY = (height + kTileSize - 1) / kTileSize;
 	const int tilesPerCamera = tilesX * tilesY;
@@ -4510,8 +4456,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 
 		if (lastPoints)
 		{
-			// Each thread puts its share of the remembered hits into its own frame, then each pixel takes the farthest of
-			// the frames: a maximum, so the hint is the same whichever thread took which hit.
+			// Each thread fills its own frame, then each pixel takes the maximum, the same whichever thread took which hit.
 #ifdef _OPENMP
 			const int team = omp_get_num_threads(), member = omp_get_thread_num();
 #else

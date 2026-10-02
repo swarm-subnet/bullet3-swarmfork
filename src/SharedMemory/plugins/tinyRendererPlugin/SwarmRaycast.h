@@ -42,8 +42,7 @@ struct SwarmRaycastShading
 	bool m_edgeAntialias;
 	// ER_SWARM_EDGE_OUTLINE: with m_edgeAntialias, a pixel inside one body is an edge only where the depth jumps.
 	bool m_edgeOutline;
-	// ER_SWARM_CREASE_FILL: with m_edgeAntialias, an edge pixel inside one body fills its uncovered share from its
-	// neighbours' triangles instead of a probe ray.
+	// ER_SWARM_CREASE_FILL: with m_edgeAntialias, a crease fills its uncovered share from its neighbours, not a probe ray.
 	bool m_creaseFill;
 	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
@@ -95,13 +94,11 @@ public:
 
 	// Creates or refreshes the instance for renderObj from its model, world transform and scaling.
 	void syncObject(TinyRenderObjectData* renderObj, const btTransform& worldTransform, const btVector3& localScaling);
-	// Records that renderObj's vertices were rewritten in place; its tree is refitted at the next commit. True when that
-	// tree also serves other render objects, which then refit it at their next sync.
+	// Records renderObj's rewritten vertices for a refit at the next commit; true when other render objects share the tree.
 	bool meshChanged(TinyRenderObjectData* renderObj);
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
-	// Rebuilds the top-level tree after a batch of sync calls. The mover tree, read only by mover shadows, is rebuilt
-	// when moverShadows asks for it, from whatever the movers are by then.
+	// Rebuilds the top-level tree after a batch of sync calls; the mover tree only when moverShadows asks for it.
 	void commit(bool moverShadows);
 
 	// What a colour pixel shows where no drawn surface is shaded, asked for that pixel alone; row in output order.
@@ -112,14 +109,14 @@ public:
 
 	// One camera of a render: its view matrix and the buffers it writes. m_seg may be null, and m_rgb
 	// may be null only on a render with no shading; it is width * height * 3 bytes, rows in output
-	// order, and only hit pixels are written unless m_background is given, which then fills every other
-	// pixel. Without it a pixel no surface shades keeps the bytes it had.
+	// order, and only hit pixels are written.
 	struct Target
 	{
 		const float* m_view;
 		float* m_depth;
 		int* m_seg;
 		unsigned char* m_rgb;
+		// When given, fills every colour pixel no surface shades; without it such a pixel keeps its bytes.
 		const Background* m_background;
 	};
 
@@ -127,17 +124,12 @@ public:
 	// writes -z_clip into m_depth, objectIndex + ((linkIndex + 1) << 24) into m_seg when given,
 	// and the shaded colour into m_rgb when shading is given.
 	// Every camera shares projMat, the frame size and the light. The pixels of all cameras are cut
-	// into fixed tiles before the frame starts and each thread takes the next untraced tile; a tile's
-	// pixels depend on nothing else, so the bytes never depend on the thread count or on which thread
-	// traced which tile. With edge anti-aliasing the same tiles are walked a second time once every
-	// first ray has landed.
+	// into fixed tiles before the frame starts and each thread takes the next untraced tile, so the
+	// bytes never depend on the thread count or on which thread traced which tile. With edge anti-aliasing
+	// the same tiles are walked a second time once every first ray has landed.
 	// With alphaCutout a hit on a texel whose texture alpha is below the cut-out threshold is not a hit:
 	// the ray, and a shadow ray, carry on behind it, so colour, depth and shadow share the same holes.
-	// With reuseKey, the caller's bytes for everything else the frame reads: a lone camera asked again for its last
-	// frame (same key, size, projection, view, shading but the grain seeds, buffers and cut-outs), in a scene where
-	// nothing changed but movers whose boxes, before and after, stay clear of every ray that frame cast and of the
-	// light's way back from what they met, gets that frame's depth, mask and colour (radiance under thermal) again
-	// without tracing; the camera chain still runs with this request's seeds.
+	// With reuseKey, a lone camera asked again for an unchanged frame gets it back untraced; its camera chain still runs.
 	void render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
 				const SwarmRaycastShading* shading, int threads, bool alphaCutout = false,
 				const void* reuseKey = 0, size_t reuseKeyBytes = 0) const;
