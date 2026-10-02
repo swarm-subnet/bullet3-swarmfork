@@ -179,6 +179,8 @@ struct TinyRendererVisualShapeConverterInternalData
 	bool m_hasShadow;
 	int m_flags;
 	SimpleCamera m_camera;
+	// Counts every change to a shape, a texture or the up axis, for ER_SWARM_FRAME_REUSE; a body's move is not one.
+	unsigned long long m_pictureRevision;
 
 	// depth-only camera batch: per-camera buffers rendered in parallel
 	btAlignedObjectArray<b3AlignedObjectArray<float> > m_batchDepthBuffers;
@@ -235,6 +237,7 @@ struct TinyRendererVisualShapeConverterInternalData
 		m_hasSpotLight(false),
 		m_hasShadow(false),
 		m_flags(0),
+		m_pictureRevision(0),
 		m_batchCameraCount(1),
 		m_batchReadCamera(0)
 #ifdef SWARM_RAYCAST
@@ -1248,6 +1251,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 	int bodyUniqueId, struct CommonFileIOInterface* fileIO)
 
 {
+	m_data->m_pictureRevision++;
 	int uniqueId = orgGraphicsUniqueId;
 	btAssert(orgGraphicsUniqueId >= 0);
 	btAssert(linkPtr);  // TODO: remove if (not doing it now, because diff will be 50+ lines)
@@ -1641,6 +1645,7 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 
 int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualShapeData& visualShape, const float* vertices, int numvertices, const int* indices, int numIndices, int primitiveType, int textureId, int orgGraphicsUniqueId, int bodyUniqueId, int linkIndex)
 {
+	m_data->m_pictureRevision++;
 	btAlignedObjectArray<b3VisualShapeData>* shapes1 =
 		m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes1)
@@ -1696,6 +1701,7 @@ int TinyRendererVisualShapeConverter::registerShapeAndInstance( const b3VisualSh
 
 void TinyRendererVisualShapeConverter::updateShape(int shapeUniqueId, const btVector3* vertices, int numVertices, const btVector3* normals, int numNormals)
 {
+	m_data->m_pictureRevision++;
 	TinyRendererObjectArray** visualsPtr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (visualsPtr != 0)
 	{
@@ -1764,6 +1770,7 @@ int TinyRendererVisualShapeConverter::getVisualShapesData(int bodyUniqueId, int 
 
 void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags)
 {
+	m_data->m_pictureRevision++;
 	bool doubleSided = (flags & (eVISUAL_SHAPE_DOUBLE_SIDED | eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)) != 0;
 	bool glass = (flags & eVISUAL_SHAPE_GLASS) != 0;
 	bool glassBacked = (flags & eVISUAL_SHAPE_GLASS_BACKED) != 0;
@@ -1800,6 +1807,7 @@ void TinyRendererVisualShapeConverter::changeInstanceFlags(int bodyUniqueId, int
 
 void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double rgbaColor[4])
 {
+	m_data->m_pictureRevision++;
 	btAlignedObjectArray<b3VisualShapeData>* shapes = m_data->m_visualShapesMap[bodyUniqueId];
 	if (!shapes)
 	{
@@ -1841,6 +1849,7 @@ void TinyRendererVisualShapeConverter::changeRGBAColor(int bodyUniqueId, int lin
 
 void TinyRendererVisualShapeConverter::changeSpecularColor(int bodyUniqueId, int linkIndex, int shapeIndex, const double specularColor[3])
 {
+	m_data->m_pictureRevision++;
 	float rgb[3] = { (float)specularColor[0], (float)specularColor[1], (float)specularColor[2] };
 	for (int i = 0; i < m_data->m_swRenderInstances.size(); i++)
 	{
@@ -1862,6 +1871,7 @@ void TinyRendererVisualShapeConverter::changeSpecularColor(int bodyUniqueId, int
 
 void TinyRendererVisualShapeConverter::setUpAxis(int axis)
 {
+	m_data->m_pictureRevision++;
 	m_data->m_upAxis = axis;
 	m_data->m_camera.setCameraUpAxis(axis);
 	m_data->m_camera.update();
@@ -2460,7 +2470,8 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		background.m_sky = &skyView;
 		if (sky && numPixels)
 			prepareSky(m_data, viewMat, projMat, sunSky, daylight, skyView);
-		SwarmRaycastShading shading;
+		// Zeroed first, padding included, so ER_SWARM_FRAME_REUSE compares the terms and nothing else.
+		SwarmRaycastShading shading = SwarmRaycastShading();
 		for (int i = 0; i < 3; i++)
 		{
 			shading.m_lightDir[i] = (float)lightDirWorld[i];
@@ -2485,7 +2496,13 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_exposure = m_data->m_exposure;
 		shading.m_hazeDistance = m_data->m_hazeDistance;
 		shading.m_shadowCoreRadius = m_data->m_shadowCoreRadius;
-		shading.m_glint = glint;
+		shading.m_glint.m_enabled = glint.m_enabled;
+		shading.m_glint.m_upAxis = glint.m_upAxis;
+		for (int i = 0; i < 3; i++)
+		{
+			shading.m_glint.m_skyHorizon[i] = glint.m_skyHorizon[i];
+			shading.m_glint.m_skyZenith[i] = glint.m_skyZenith[i];
+		}
 		shading.m_thermal = thermal;
 		shading.m_airTemperature = m_data->m_airTemperature;
 		shading.m_skyTemperature = m_data->m_skyTemperature;
@@ -2497,9 +2514,44 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		target.m_seg = (noSeg || !numPixels) ? 0 : &m_data->m_segmentationMaskBuffer[0];
 		target.m_rgb = (depthOnly || !numPixels) ? 0 : m_data->m_rgbColorBuffer.buffer();
 		target.m_background = (sky && numPixels) ? &background : 0;
+		// ER_SWARM_FRAME_REUSE: what the frame reads beyond the camera, the shading and the scene, so a frame is handed
+		// back only for a request that matches it here too.
+		struct ReuseKey
+		{
+			unsigned long long m_pictureRevision;
+			double m_skyHorizon[3];
+			double m_skyZenith[3];
+			float m_skyYaw;
+			int m_flags;
+			int m_upAxis;
+			int m_hasSky;
+			int m_hasSkyClouds;
+			int m_skyCloudSeed;
+			int m_hasPhoto;
+			int m_skyTextureId;
+			int m_sunSky;
+		} reuse;
+		memset(&reuse, 0, sizeof(reuse));
+		reuse.m_pictureRevision = m_data->m_pictureRevision;
+		for (int i = 0; i < 3; i++)
+		{
+			reuse.m_skyHorizon[i] = m_data->m_skyHorizonColor[i];
+			reuse.m_skyZenith[i] = m_data->m_skyZenithColor[i];
+		}
+		reuse.m_skyYaw = m_data->m_skyYaw;
+		reuse.m_flags = m_data->m_flags;
+		reuse.m_upAxis = m_data->m_upAxis;
+		reuse.m_hasSky = m_data->m_hasSky;
+		reuse.m_hasSkyClouds = m_data->m_hasSkyClouds;
+		reuse.m_skyCloudSeed = m_data->m_skyCloudSeed;
+		reuse.m_hasPhoto = hasPhoto;
+		reuse.m_skyTextureId = m_data->m_skyTextureId;
+		reuse.m_sunSky = sunSky != 0;
+		const bool reuseAsked = (m_data->m_flags & ER_SWARM_FRAME_REUSE) != 0;
 		m_data->syncRaycast(shading.m_moverShadow).render(&target, 1, projMat, m_data->m_swWidth, m_data->m_swHeight,
 									 (depthOnly || !numPixels) ? 0 : &shading,
-									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0);
+									 b3GetSwarmRenderThreads(), (m_data->m_flags & ER_ALPHA_CUTOUT) != 0,
+									 reuseAsked ? &reuse : 0, reuseAsked ? sizeof(reuse) : 0);
 #else
 		b3Warning("ER_SWARM_RAYCAST requested but this build has no ray-cast backend");
 #endif
@@ -2806,6 +2858,7 @@ void TinyRendererVisualShapeConverter::copyCameraImageData(unsigned char* pixels
 
 int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId, int linkIndex, const double* positions, int numVertices)
 {
+	m_data->m_pictureRevision++;
 	int updated = 0;
 	if (!positions || numVertices <= 0)
 		return 0;
@@ -2848,6 +2901,7 @@ int TinyRendererVisualShapeConverter::updateVisualShapeVertices(int bodyUniqueId
 
 void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 {
+	m_data->m_pictureRevision++;
 	TinyRendererObjectArray** ptrptr = m_data->m_swRenderInstances[shapeUniqueId];
 	if (ptrptr && *ptrptr)
 	{
@@ -2871,6 +2925,7 @@ void TinyRendererVisualShapeConverter::removeVisualShape(int shapeUniqueId)
 
 void TinyRendererVisualShapeConverter::resetAll()
 {
+	m_data->m_pictureRevision++;
 #ifdef SWARM_RAYCAST
 	if (m_data->m_raycast)
 		m_data->m_raycast->removeAll();
@@ -2918,6 +2973,7 @@ void TinyRendererVisualShapeConverter::resetAll()
 
 void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int jointIndex, int shapeIndex, int textureUniqueId)
 {
+	m_data->m_pictureRevision++;
 	btAssert(textureUniqueId < m_data->m_textures.size());
 	if (textureUniqueId >= -1 && textureUniqueId < m_data->m_textures.size())
 	{
@@ -2958,6 +3014,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
 													 int textureUniqueId, float low, float high)
 {
+	m_data->m_pictureRevision++;
 	// A heat map reads the texels the plugin keeps for a loaded texture; one handed over to a mesh has none left here.
 	const unsigned char* heatTexels = 0;
 	int heatWidth = 0, heatHeight = 0;
@@ -3006,6 +3063,7 @@ void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkI
 
 int TinyRendererVisualShapeConverter::registerTexture(unsigned char* texels, int width, int height)
 {
+	m_data->m_pictureRevision++;
 	MyTexture2 texData;
 	texData.m_width = width;
 	texData.m_height = height;
@@ -3018,6 +3076,7 @@ int TinyRendererVisualShapeConverter::registerTexture(unsigned char* texels, int
 
 int TinyRendererVisualShapeConverter::loadTextureFile(const char* filename, struct CommonFileIOInterface* fileIO)
 {
+	m_data->m_pictureRevision++;
 	B3_PROFILE("loadTextureFile");
 	int width, height, n;
 	unsigned char* image = 0;

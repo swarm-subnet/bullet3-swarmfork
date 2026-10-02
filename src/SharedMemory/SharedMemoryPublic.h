@@ -919,6 +919,9 @@ enum EnumRendererAuxFlags
 	// With ER_EDGE_ANTIALIAS: only outlines are smoothed, where a neighbour landed on another body or on a surface more
 	// than a quarter farther away (a fifth for the far side's pixel), not every crease inside one body, such as a crown's.
 	ER_SWARM_EDGE_OUTLINE = 262144,
+	// Ray-cast path: a lone camera asked again for its last frame, with nothing it reads changed but bodies that moved
+	// clear of its rays and their shadows' way, gets that frame back without tracing; the camera chain runs again.
+	ER_SWARM_FRAME_REUSE = 524288,
 	// With ER_EDGE_ANTIALIAS: a crease pixel whose four neighbours all landed on its own body, without an outline's depth
 	// step, sends no probe ray; the share of it no neighbouring triangle covers takes the colour of the shares they do cover.
 	ER_SWARM_CREASE_FILL = 2097152,

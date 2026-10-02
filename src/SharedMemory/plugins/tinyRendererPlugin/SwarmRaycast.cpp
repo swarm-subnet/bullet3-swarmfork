@@ -273,6 +273,8 @@ struct QueryContext
 	// Angle one pixel spans on the filtered camera rays, 0 on every other ray: a cut-out is then read over the
 	// pixel's footprint instead of one texel, so a far chain-link or leaf card fades instead of breaking into moire.
 	float m_pixelSpread;
+	// How far along its ray any camera ray of this thread got this frame, for the region a kept frame depends on.
+	float m_farthest;
 };
 
 // Casts the cells [col0, col1) x [row0, row1) of the shadow map on this thread, from the start plane along -light
@@ -1090,7 +1092,109 @@ struct HitMemory
 	float m_proj[16];
 	std::vector<float> m_points;
 	unsigned long long m_lastUse;
+	// Frame reuse: the key of the lens's last request and, once a request repeated the one before, that frame's buffers
+	// before the camera chain, the scene revision and move they were drawn at, and the region they depend on: the
+	// pyramid from the eye to the depth its rays reached, swept towards the light when hits cast shadows.
+	std::vector<unsigned char> m_key;
+	bool m_kept;
+	unsigned long long m_sceneRevision;
+	unsigned long long m_movedFrom;
+	double m_apex[3];
+	double m_base[4][3];
+	double m_light[3];
+	bool m_sweep;
+	std::vector<float> m_depth;
+	std::vector<int> m_seg;
+	std::vector<unsigned char> m_rgb;
+	std::vector<float> m_radiance;
 };
+
+// Frame reuse: a kept frame is dropped once this many mover boxes wait to be tested against it.
+const size_t kReuseMaxBoxes = 1 << 16;
+
+// True unless an axis separates the box (lo, hi) from the region a kept frame depends on: the pyramid of its apex and
+// base corners, swept along the light without end when the frame casts shadows. The axes are the faces and edge
+// crossings of both shapes, so a box the region misses is told apart; a NaN anywhere answers true.
+bool reachesFrame(const HitMemory& frame, const double lo[3], const double hi[3])
+{
+	double edges[7][3];
+	for (int k = 0; k < 4; k++)
+		for (int i = 0; i < 3; i++)
+			edges[k][i] = frame.m_base[k][i] - frame.m_apex[i];
+	for (int i = 0; i < 3; i++)
+	{
+		edges[4][i] = frame.m_base[1][i] - frame.m_base[0][i];
+		edges[5][i] = frame.m_base[3][i] - frame.m_base[0][i];
+		edges[6][i] = frame.m_light[i];
+	}
+	const int numEdges = frame.m_sweep ? 7 : 6;
+	const double unit[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+	double axes[48][3];
+	int numAxes = 0;
+	for (int k = 0; k < 3; k++)
+		memcpy(axes[numAxes++], unit[k], sizeof(axes[0]));
+	const int faces[5][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}};
+	for (int f = 0; f < 5; f++)
+	{
+		const double* a = edges[faces[f][0]];
+		const double* b = edges[faces[f][1]];
+		double* n = axes[numAxes++];
+		n[0] = a[1] * b[2] - a[2] * b[1];
+		n[1] = a[2] * b[0] - a[0] * b[2];
+		n[2] = a[0] * b[1] - a[1] * b[0];
+	}
+	for (int e = 0; e < numEdges; e++)
+		for (int k = 0; k < 3 + (frame.m_sweep && e < 6 ? 1 : 0); k++)
+		{
+			const double* a = k < 3 ? unit[k] : edges[6];
+			const double* b = edges[e];
+			double* n = axes[numAxes++];
+			n[0] = a[1] * b[2] - a[2] * b[1];
+			n[1] = a[2] * b[0] - a[0] * b[2];
+			n[2] = a[0] * b[1] - a[1] * b[0];
+		}
+	double centre[3], half[3], size = 0.0;
+	for (int i = 0; i < 3; i++)
+	{
+		centre[i] = 0.5 * (lo[i] + hi[i]);
+		half[i] = 0.5 * fabs(hi[i] - lo[i]);
+		size = fabs(lo[i]) > size ? fabs(lo[i]) : size;
+		size = fabs(hi[i]) > size ? fabs(hi[i]) : size;
+		size = fabs(frame.m_apex[i]) > size ? fabs(frame.m_apex[i]) : size;
+	}
+	// Wider than the rounding of the rays, the boxes and these sums, as the mover grid allows for.
+	const double margin = 0.05 + size * 1e-4;
+	for (int a = 0; a < numAxes; a++)
+	{
+		double* n = axes[a];
+		const double length = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+		if (!(length > 1e-12))
+			continue;
+		for (int i = 0; i < 3; i++)
+			n[i] /= length;
+		double low = n[0] * frame.m_apex[0] + n[1] * frame.m_apex[1] + n[2] * frame.m_apex[2], high = low;
+		for (int k = 0; k < 4; k++)
+		{
+			const double d = n[0] * frame.m_base[k][0] + n[1] * frame.m_base[k][1] + n[2] * frame.m_base[k][2];
+			low = d < low ? d : low;
+			high = d > high ? d : high;
+		}
+		if (frame.m_sweep)
+		{
+			// An axis across the light keeps the pyramid's extent; any other is open on the light's side.
+			const double along = n[0] * frame.m_light[0] + n[1] * frame.m_light[1] + n[2] * frame.m_light[2];
+			if (along > 1e-9)
+				high = INFINITY;
+			else if (along < -1e-9)
+				low = -INFINITY;
+		}
+		const double mid = n[0] * centre[0] + n[1] * centre[1] + n[2] * centre[2];
+		const double reach = fabs(n[0]) * half[0] + fabs(n[1]) * half[1] + fabs(n[2]) * half[2] + margin;
+		if (mid + reach < low || mid - reach > high)
+			return false;
+	}
+	return true;
+}
 
 // The movers seen from the light: a grid across the light's direction whose cells are set where a mover's box, widened
 // for rounding, lies. A shadow ray runs along the light, so one leaving a point under a clear cell cannot meet a mover.
@@ -1159,6 +1263,130 @@ struct SwarmRaycast::Data
 	// The same for the share of the remembered hits each further render thread puts onto the frame.
 	std::vector<std::vector<float> > m_hintFrames;
 	MoverShade m_moverShade;
+	// Frame reuse: counts every change to the scene or its shadow grids but a mover's move; each move instead leaves the
+	// mover's world box before and after it (lo, hi), m_movedBase counting the boxes dropped from the front.
+	unsigned long long m_sceneRevision;
+	std::vector<double> m_moved;
+	unsigned long long m_movedBase;
+
+	// Notes a mover's move for the kept frames: the box of its tree under the old transform and under the new one. Boxes
+	// every kept frame has already seen are dropped; too many waiting drop the kept frames instead.
+	void moverMoved(const MeshTree* tree, const float before[16], const float after[16])
+	{
+		size_t from = m_moved.size() / 6;
+		bool kept = false;
+		for (int i = 0; i < kHitMemories; i++)
+		{
+			const HitMemory& memory = m_hitMemories[i];
+			if (!memory.m_kept || memory.m_sceneRevision != m_sceneRevision || memory.m_movedFrom < m_movedBase)
+				continue;
+			kept = true;
+			from = memory.m_movedFrom - m_movedBase < from ? (size_t)(memory.m_movedFrom - m_movedBase) : from;
+		}
+		m_moved.erase(m_moved.begin(), m_moved.begin() + from * 6);
+		m_movedBase += from;
+		if (kept && m_moved.size() / 6 + 2 > kReuseMaxBoxes)
+		{
+			m_sceneRevision++;
+			m_movedBase += m_moved.size() / 6;
+			m_moved.clear();
+			kept = false;
+		}
+		if (!kept)
+			return;
+		RTCBounds bounds;
+		rtcGetSceneBounds(tree->m_scene, &bounds);
+		const float* transforms[2] = {before, after};
+		for (int t = 0; t < 2; t++)
+		{
+			const float* m = transforms[t];
+			double lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+			for (int k = 0; k < 8; k++)
+			{
+				const double corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+				for (int i = 0; i < 3; i++)
+				{
+					const double w = (double)m[i] * corner[0] + (double)m[4 + i] * corner[1] + (double)m[8 + i] * corner[2] + (double)m[12 + i];
+					// A NaN corner leaves its box NaN, which every kept frame counts as reached.
+					lo[i] = w < lo[i] || w != w ? w : lo[i];
+					hi[i] = w > hi[i] || w != w ? w : hi[i];
+				}
+			}
+			m_moved.insert(m_moved.end(), lo, lo + 3);
+			m_moved.insert(m_moved.end(), hi, hi + 3);
+		}
+	}
+
+	// The kept frame of this memory, put into the camera's buffers, when the request and the scene since allow it.
+	bool reuseFrame(HitMemory& memory, const std::vector<unsigned char>& key, const SwarmRaycast::Target& target, size_t numPixels)
+	{
+		if (!memory.m_kept || memory.m_key != key || memory.m_sceneRevision != m_sceneRevision || memory.m_movedFrom < m_movedBase)
+			return false;
+		for (size_t i = (size_t)(memory.m_movedFrom - m_movedBase) * 6; i < m_moved.size(); i += 6)
+			if (reachesFrame(memory, &m_moved[i], &m_moved[i + 3]))
+			{
+				memory.m_kept = false;
+				return false;
+			}
+		memcpy(target.m_depth, &memory.m_depth[0], numPixels * sizeof(float));
+		if (target.m_seg)
+			memcpy(target.m_seg, &memory.m_seg[0], numPixels * sizeof(int));
+		if (target.m_rgb)
+			memcpy(target.m_rgb, &memory.m_rgb[0], numPixels * 3);
+		return true;
+	}
+
+	// Takes this request's key, and keeps the frame it drew when the request repeated the lens's last one: a camera that
+	// stays still is asked for it again, a moving one never is. farthest is how far along their rays its rays went.
+	void keepFrame(HitMemory& memory, std::vector<unsigned char>& key, const Camera& cam, const SwarmRaycast::Target& target,
+				   const std::vector<float>& radiance, float farthest, const SwarmRaycastShading* shading, int width, int height)
+	{
+		const size_t numPixels = (size_t)width * height;
+		const bool repeat = memory.m_key == key;
+		memory.m_key.swap(key);
+		memory.m_kept = false;
+		if (!repeat || !(farthest >= 0.0f && farthest < INFINITY))
+			return;
+		// Every ray point lies within its distance along the ray of the eye, so no deeper than the farthest one went.
+		// The sides lie a pixel out: an edge probe on the left column or the bottom row samples up to half a pixel past ndc -1.
+		double corners[4][3], centre[3];
+		const double sideX = 1.0 + 2.0 / width, sideY = 1.0 + 2.0 / height;
+		const double ndc[4][2] = {{-sideX, -sideY}, {sideX, -sideY}, {sideX, sideY}, {-sideX, sideY}};
+		for (int i = 0; i < 3; i++)
+		{
+			memory.m_apex[i] = cam.m_origin[i];
+			centre[i] = cam.m_far[0][i];
+			for (int k = 0; k < 4; k++)
+				corners[k][i] = cam.m_far[0][i] + cam.m_far[1][i] * ndc[k][0] + cam.m_far[2][i] * ndc[k][1];
+		}
+		const double farDepth = -(cam.m_viewRow2[0] * centre[0] + cam.m_viewRow2[1] * centre[1] + cam.m_viewRow2[2] * centre[2] + cam.m_viewRow2[3]);
+		double share = ((double)farthest * 1.001 + 0.05) / farDepth;
+		share = share < 1.0 ? share : 1.0;
+		bool finite = farDepth > 0.0 && share > 0.0;
+		for (int k = 0; k < 4; k++)
+			for (int i = 0; i < 3; i++)
+			{
+				memory.m_base[k][i] = memory.m_apex[i] + (corners[k][i] - memory.m_apex[i]) * share;
+				finite = finite && fabs(memory.m_base[k][i]) < INFINITY;
+			}
+		memory.m_sweep = shading && shading->m_shadow;
+		for (int i = 0; i < 3; i++)
+		{
+			memory.m_light[i] = shading ? shading->m_lightDir[i] : 0.0f;
+			finite = finite && fabs(memory.m_apex[i]) < INFINITY && fabs(memory.m_light[i]) < INFINITY;
+		}
+		if (!finite)
+			return;
+		memory.m_depth.assign(target.m_depth, target.m_depth + numPixels);
+		if (target.m_seg)
+			memory.m_seg.assign(target.m_seg, target.m_seg + numPixels);
+		if (target.m_rgb)
+			memory.m_rgb.assign(target.m_rgb, target.m_rgb + numPixels * 3);
+		memory.m_radiance = radiance;
+		memory.m_sceneRevision = m_sceneRevision;
+		memory.m_movedFrom = m_movedBase + m_moved.size() / 6;
+		memory.m_kept = true;
+	}
 
 	// The memory of the lens with this frame size and projection, or the one used longest ago, emptied for it.
 	HitMemory* hitMemory(int width, int height, const float projMat[16])
@@ -1177,6 +1405,8 @@ struct SwarmRaycast::Data
 				oldest = memory;
 		}
 		oldest->m_points.clear();
+		oldest->m_key.clear();
+		oldest->m_kept = false;
 		oldest->m_width = width;
 		oldest->m_height = height;
 		memcpy(oldest->m_proj, projMat, sizeof(oldest->m_proj));
@@ -1204,6 +1434,7 @@ struct SwarmRaycast::Data
 	// Lays the grid over `bounds` for this light, at most kShadowMapMaxCells a side; frames cast its blocks as they read them.
 	void buildShadowMap(ShadowMap& map, const RTCBounds& bounds, const float lightDir[3], bool alphaCutout, bool leafNoShadow)
 	{
+		m_sceneRevision++;
 		map.m_built = false;
 		map.m_alphaCutout = alphaCutout;
 		map.m_leafNoShadow = leafNoShadow;
@@ -1313,6 +1544,7 @@ struct SwarmRaycast::Data
 		m_shadowDirty.clear();
 		if (!coreStale)
 			return;
+		m_sceneRevision++;
 		m_coreRadius = coreRadius;
 		m_shadowCore.m_built = false;
 		m_shadowCore.m_depth.reset();
@@ -1577,7 +1809,8 @@ struct SwarmRaycast::Data
 
 	// worldTree asks for a fresh instance to draw its world tree from disk; the instance stays on
 	// that tree while the body keeps its pose and mesh, and carries on as a plain mover otherwise.
-	void syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, bool glass, int segmentation, bool worldTree)
+	// True when the instance at most moved, and the move is noted for the kept frames.
+	bool syncInstance(ObjectState& state, TinyRenderObjectData* obj, const btTransform& worldTransform, const btVector3& localScaling, const float transform[16], bool enabled, bool doubleSided, bool hasAlpha, bool glass, int segmentation, bool worldTree)
 	{
 		TinyRender::Model* model = obj->m_model;
 		Instance* inst = state.m_instance;
@@ -1617,11 +1850,14 @@ struct SwarmRaycast::Data
 			rtcSetGeometryInstancedScene(inst->m_shadowGeometry, inst->m_tree->m_scene);
 			changed = true;
 		}
+		bool onlyMoved = !changed;
 		// A world tree already sits in world space, so its instance carries the identity.
 		static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 		const float* instanceTransform = inst->m_tree->m_world ? identity : transform;
 		if (fresh || memcmp(instanceTransform, inst->m_transform, 16 * sizeof(float)) != 0)
 		{
+			if (onlyMoved)
+				moverMoved(inst->m_tree, inst->m_transform, instanceTransform);
 			memcpy(inst->m_transform, instanceTransform, 16 * sizeof(float));
 			if (inst->m_tree->m_world)
 				copyRotation(btTransform::getIdentity(), inst->m_rotation);
@@ -1648,7 +1884,10 @@ struct SwarmRaycast::Data
 			}
 			inst->m_enabled = enabled;
 			changed = true;
+			onlyMoved = false;
 		}
+		onlyMoved = onlyMoved && inst->m_doubleSided == doubleSided && inst->m_hasAlpha == hasAlpha && inst->m_glass == glass &&
+					inst->m_segmentation == segmentation;
 		inst->m_doubleSided = doubleSided;
 		inst->m_hasAlpha = hasAlpha;
 		inst->m_glass = glass;
@@ -1667,6 +1906,7 @@ struct SwarmRaycast::Data
 			rtcAttachGeometryByID(m_movers, inst->m_shadowGeometry, inst->m_geomId);
 			m_moverCount++;
 		}
+		return onlyMoved;
 	}
 
 	// Flagged placements remain in the map scene when moved, without changing the mover path.
@@ -1968,8 +2208,13 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_coreRadius = 0.0f;
 	m_data->m_moverCount = 0;
 	m_data->m_frameCount = 0;
+	m_data->m_sceneRevision = 0;
+	m_data->m_movedBase = 0;
 	for (int i = 0; i < kHitMemories; i++)
+	{
 		m_data->m_hitMemories[i].m_lastUse = 0;
+		m_data->m_hitMemories[i].m_kept = false;
+	}
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
 	m_data->m_cacheDir = cacheDir ? cacheDir : "";
 	m_data->m_device = processDevice();
@@ -2023,17 +2268,20 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	ObjectState& state = m_data->m_objects[renderObj];
 	if (!renderObj->m_placements.empty())
 	{
+		m_data->m_sceneRevision++;
 		m_data->syncBatch(state, renderObj, transform, visible, segmentation);
 		return;
 	}
 	if (renderObj->m_renderInstanced)
 	{
+		m_data->m_sceneRevision++;
 		m_data->syncSharedInstance(state, renderObj, transform, visible, segmentation);
 		return;
 	}
 	StaticMember* member = state.m_member;
 	if (member && !member->m_retired)
 	{
+		m_data->m_sceneRevision++;
 		const bool moved = memcmp(transform, member->m_transform, sizeof(transform)) != 0 || member->m_meshKey != model->meshKey();
 		if (!moved)
 		{
@@ -2055,6 +2303,7 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	else if (!member && !m_data->m_staticBuilt && !worldTree)
 	{
+		m_data->m_sceneRevision++;
 		member = m_data->addMember(renderObj, worldTransform, localScaling, transform);
 		member->m_visible = visible;
 		member->m_doubleSided = doubleSided;
@@ -2067,11 +2316,13 @@ void SwarmRaycast::syncObject(TinyRenderObjectData* renderObj, const btTransform
 	}
 	if (!member)
 		state.m_member = 0;
-	m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree);
+	if (!m_data->syncInstance(state, renderObj, worldTransform, localScaling, transform, visible, doubleSided, hasAlpha, glass, segmentation, worldTree))
+		m_data->m_sceneRevision++;
 }
 
 bool SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 {
+	m_data->m_sceneRevision++;
 	// A batch's mesh tree is shared by every placement and never rewritten.
 	if (!renderObj->m_placements.empty())
 		return false;
@@ -2100,6 +2351,7 @@ bool SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 
 void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)
 {
+	m_data->m_sceneRevision++;
 	std::map<TinyRenderObjectData*, ObjectState>::iterator found = m_data->m_objects.find(renderObj);
 	if (found == m_data->m_objects.end())
 		return;
@@ -2131,8 +2383,12 @@ void SwarmRaycast::removeAll()
 	m_data->m_byGeomId.clear();
 	m_data->m_freeGeomIds.clear();
 	m_data->createStaticScene();
+	m_data->m_sceneRevision++;
 	for (int i = 0; i < kHitMemories; i++)
+	{
 		m_data->m_hitMemories[i].m_points.clear();
+		m_data->m_hitMemories[i].m_kept = false;
+	}
 }
 
 void SwarmRaycast::commit(bool moverShadows)
@@ -3187,6 +3443,14 @@ void firstHit(RTCScene scene, RTCRayHit& rayhit, float reach, RTCIntersectArgume
 	rtcIntersect1(scene, &rayhit, args);
 }
 
+// Notes where a camera ray ended, its hit or its far end, for the region a kept frame depends on; a NaN sticks.
+inline void reached(RTCIntersectArguments* args, float t)
+{
+	QueryContext* ctx = (QueryContext*)args->context;
+	if (ctx->m_farthest == ctx->m_farthest && !(t <= ctx->m_farthest))
+		ctx->m_farthest = t;
+}
+
 // One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
 // `reach`, when finite, is the depth hint for this ray along the camera's axis; `landed`, when given, takes where the ray
 // landed (NaN on a miss).
@@ -3238,6 +3502,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
 	const float facing = -dot3(cam.m_viewRow2, dir);
 	firstHit(job.m_top, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
+	reached(args, rayhit.ray.tfar);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 	{
 		if (thermalSky)
@@ -3316,6 +3581,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID != RTC_INVALID_GEOMETRY_ID &&
@@ -3371,6 +3637,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
@@ -3457,6 +3724,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			next.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 			next.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 			rtcIntersect1(job.m_top, &next, args);
+			reached(args, next.ray.tfar);
 			int backSegmentation = -1;
 			HitSurface back;
 			if (next.hit.geomID == RTC_INVALID_GEOMETRY_ID || !resolveHit(next.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, backSegmentation, &back))
@@ -3954,6 +4222,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				{
 					// The uncovered part is what lies beyond the pixel's own surface: ask it with one ray at
 					// that part's centre, and take the sky or clear colour when the ray meets nothing.
+					// The square reaches half a pixel past the frame's sides on the left column and bottom row; keepFrame widens its region by one pixel for this.
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
@@ -4001,10 +4270,55 @@ void fillBackground(const SwarmRaycast::Target& target, int width, int height)
 		for (int col = 0; col < width; col++)
 			target.m_background->pixel(row, col, &target.m_rgb[((size_t)row * width + col) * 3]);
 }
+
+// The camera chain on one camera's finished frame: thermal develops the radiance into the bytes; the low-light camera
+// and the grey of the near infrared work on the colour, sky and edges included.
+void developCamera(const SwarmRaycastShading* shading, const float* radiance, int width, int height, int threads, unsigned char* rgb)
+{
+	if (!shading || !rgb)
+		return;
+	if (shading->m_thermal)
+	{
+		SwarmThermal::develop(radiance, width, height, shading->m_thermalSeed, threads, rgb);
+		return;
+	}
+	if (!shading->m_lowLight && !shading->m_nearInfrared)
+		return;
+	SwarmLowLight::Settings camera;
+	camera.m_lowLight = shading->m_lowLight;
+	camera.m_grey = shading->m_nearInfrared;
+	camera.m_photons = shading->m_sensorPhotons;
+	camera.m_readNoise = shading->m_sensorReadNoise;
+	camera.m_gainCap = shading->m_sensorGainCap;
+	camera.m_seed = shading->m_sensorSeed;
+	for (int k = 0; k < 3; k++)
+		camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
+	// Every pass splits its rows over the render threads; the bytes are the same at any count.
+	SwarmLowLight::develop(rgb, width, height, camera, threads);
+}
+
+// Everything a lone camera's frame reads but the scene: the caller's bytes, the frame size, projection and view, which
+// buffers it writes, cut-outs, and the shading but its grain seeds, which only the camera chain reads.
+void frameKey(std::vector<unsigned char>& key, const void* reuseKey, size_t reuseKeyBytes, const SwarmRaycast::Target& target,
+			  const float projMat[16], int width, int height, const SwarmRaycastShading* shading, bool alphaCutout)
+{
+	const int layout[7] = {width, height, target.m_seg != 0, target.m_rgb != 0, target.m_background != 0, shading != 0, alphaCutout};
+	const unsigned char* parts[4] = {(const unsigned char*)reuseKey, (const unsigned char*)layout, (const unsigned char*)projMat, (const unsigned char*)target.m_view};
+	const size_t sizes[4] = {reuseKeyBytes, sizeof(layout), 16 * sizeof(float), 16 * sizeof(float)};
+	key.clear();
+	for (int i = 0; i < 4; i++)
+		key.insert(key.end(), parts[i], parts[i] + sizes[i]);
+	if (!shading)
+		return;
+	SwarmRaycastShading seedless = *shading;
+	seedless.m_thermalSeed = 0;
+	seedless.m_sensorSeed = 0;
+	key.insert(key.end(), (const unsigned char*)&seedless, (const unsigned char*)&seedless + sizeof(seedless));
+}
 }  // namespace
 
 void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
-						  const SwarmRaycastShading* shading, int threads, bool alphaCutout) const
+						  const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const
 {
 	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
 	{
@@ -4099,16 +4413,28 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		job.m_pixelSpread = centre > 0.0 ? (float)sqrt(step / centre) : 0.0f;
 	}
 
-	// The depth hint, for a lone camera with a frame big enough: the last frame of the same lens, its hits put onto this
-	// frame's pixels, tells each ray about how far it has to search.
+	// A lone camera with a frame big enough keeps a memory of its lens; asked again for its kept frame, it gives it back.
+	HitMemory* memory = numTargets == 1 && setups[0].m_valid && numPixels >= kHintMinPixels ? m_data->hitMemory(width, height, projMat) : 0;
+	std::vector<unsigned char> key;
+	if (memory && reuseKey)
+	{
+		frameKey(key, reuseKey, reuseKeyBytes, targets[0], projMat, width, height, shading, alphaCutout);
+		if (m_data->reuseFrame(*memory, key, targets[0], numPixels))
+		{
+			developCamera(shading, memory->m_radiance.empty() ? 0 : &memory->m_radiance[0], width, height, threads, targets[0].m_rgb);
+			return;
+		}
+	}
+
+	// The depth hint: the last frame of the same lens, its hits put onto this frame's pixels, tells each ray about how
+	// far it has to search.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
 	float viewProj[4][4];
 	std::vector<float*> hintFrames;
 	const float* lastPoints = 0;
-	if (numTargets == 1 && setups[0].m_valid && numPixels >= kHintMinPixels)
+	if (memory)
 	{
-		HitMemory* memory = m_data->hitMemory(width, height, projMat);
 		const Camera& cam = setups[0].m_cam;
 		if (memory->m_points.size() == numPixels * 3)
 		{
@@ -4161,6 +4487,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	std::atomic<int> nextTile[2];
 	nextTile[0] = 0;
 	nextTile[1] = 0;
+	float farthest = 0.0f;
 
 #pragma omp parallel num_threads(threads)
 	{
@@ -4173,6 +4500,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_alphaCutout = alphaCutout;
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
 		ctx.m_pixelSpread = job.m_pixelSpread;
+		ctx.m_farthest = 0.0f;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;
@@ -4247,28 +4575,15 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 				}
 			}
 		}
+#pragma omp critical
+		if (farthest == farthest && !(ctx.m_farthest <= farthest))
+			farthest = ctx.m_farthest;
 	}
+	if (memory && reuseKey)
+		m_data->keepFrame(*memory, key, setups[0].m_cam, targets[0], radiance, farthest, shading, width, height);
 
 	// The camera chain needs the whole frame, so it runs once every ray has landed.
-	for (int i = 0; thermal && i < numTargets; i++)
-		if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-			SwarmThermal::develop(&radiance[(size_t)i * numPixels], width, height, shading->m_thermalSeed, threads, targets[i].m_rgb);
-
-	// The low-light camera and the grey of the near infrared work on the finished frame, sky and edges included.
-	if (shading && !thermal && (shading->m_lowLight || shading->m_nearInfrared))
-	{
-		SwarmLowLight::Settings camera;
-		camera.m_lowLight = shading->m_lowLight;
-		camera.m_grey = shading->m_nearInfrared;
-		camera.m_photons = shading->m_sensorPhotons;
-		camera.m_readNoise = shading->m_sensorReadNoise;
-		camera.m_gainCap = shading->m_sensorGainCap;
-		camera.m_seed = shading->m_sensorSeed;
-		for (int k = 0; k < 3; k++)
-			camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
-		// Every pass splits its rows over the render threads; the bytes are the same at any count.
-		for (int i = 0; i < numTargets; i++)
-			if (setups[(size_t)i].m_valid && targets[i].m_rgb)
-				SwarmLowLight::develop(targets[i].m_rgb, width, height, camera, threads);
-	}
+	for (int i = 0; i < numTargets; i++)
+		if (setups[(size_t)i].m_valid)
+			developCamera(shading, thermal ? &radiance[(size_t)i * numPixels] : 0, width, height, threads, targets[i].m_rgb);
 }
