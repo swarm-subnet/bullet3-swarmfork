@@ -13869,6 +13869,16 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "CNSFileIO", eCNSFileIO);
 
 	sCameraLock = PyThread_allocate_lock();
+	if (!sCameraLock)
+	{
+		PyErr_SetString(PyExc_ImportError, "pybullet could not allocate its render lock");
+#if PY_MAJOR_VERSION >= 3
+		Py_DECREF(m);
+		return NULL;
+#else
+		return;
+#endif
+	}
 	SpamError = PyErr_NewException("pybullet.error", NULL, NULL);
 	Py_INCREF(SpamError);
 	PyModule_AddObject(m, "error", SpamError);
