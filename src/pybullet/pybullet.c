@@ -63,6 +63,8 @@
 #endif
 
 static PyObject* SpamError;
+// The renderer keeps process-wide scratch and lazy caches, so frames drawn without the GIL still take turns.
+static PyThread_type_lock sCameraLock = 0;
 #define B3_MAX_NUM_END_EFFECTORS 128
 #define MAX_PHYSICS_CLIENTS 1024
 static b3PhysicsClientHandle sPhysicsClients1[MAX_PHYSICS_CLIENTS] = {0};
@@ -10446,7 +10448,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 
 		// the frame touches no Python object, so other threads run while it is drawn
 		Py_BEGIN_ALLOW_THREADS
+		PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+		PyThread_release_lock(sCameraLock);
 		Py_END_ALLOW_THREADS
 		statusType = b3GetStatusType(statusHandle);
 		if (statusType == CMD_CAMERA_IMAGE_COMPLETED)
@@ -13793,7 +13797,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS_BACKED", eVISUAL_SHAPE_GLASS_BACKED);
 	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
 	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
-	// Present when getCameraImage lets go of the GIL while the frame is drawn.
+	// Present when getCameraImage lets go of the GIL while the frame is drawn; frames still never overlap each other.
 	PyModule_AddIntConstant(m, "CAMERA_RELEASES_GIL", 1);
 
 	PyModule_AddIntConstant(m, "MAX_RAY_INTERSECTION_BATCH_SIZE", MAX_RAY_INTERSECTION_BATCH_SIZE_STREAMING);
@@ -13856,6 +13860,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ZipFileIO", eZipFileIO);
 	PyModule_AddIntConstant(m, "CNSFileIO", eCNSFileIO);
 
+	sCameraLock = PyThread_allocate_lock();
 	SpamError = PyErr_NewException("pybullet.error", NULL, NULL);
 	Py_INCREF(SpamError);
 	PyModule_AddObject(m, "error", SpamError);
