@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds Embree 4.4.1 as static libraries for the ray-cast depth backend: one AVX2 code path, no runtime
-# dispatch, every hardware reciprocal replaced by IEEE division (exact_division.patch), single-threaded
-# tree builds, and a built tree saved and loaded as one image (tree_cache.patch). The compiled copy is kept
-# in a cache keyed by Embree version, patches, this script (the flags) and the compiler, and copied into
-# prefix/ next to this script; a key already in the cache is never rebuilt. setup.py runs this on every
-# build and it returns at once when prefix/ carries the current key.
+# dispatch, no multiply-add fused by the compiler, every hardware reciprocal replaced by IEEE division
+# (exact_division.patch), single-threaded tree builds, and a built tree saved and loaded as one image
+# (tree_cache.patch). The compiled copy is kept in a cache keyed by Embree version, patches, this script (the
+# flags) and the compiler, and copied into prefix/ next to this script; a key already in the cache is never
+# rebuilt. setup.py runs this on every build and it returns at once when prefix/ carries the current key.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,8 +12,11 @@ PREFIX_DIR="${SCRIPT_DIR}/prefix"
 VERSION=4.4.1
 ARCHIVE_SHA256=dcf338cc61b636c871ccf370e673bfd380c5ecb71ce49ad50f28e1d4ec9995dc
 CACHE_ROOT="${SWARM_BULLET3_EMBREE_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/swarm-bullet3/embree}"
+# Profile feedback follows the engine's (setup.py passes its mode); Embree's profiles sit in pgo_data/embree.
+PGO_MODE="${SWARM_BULLET3_PGO:-off}"
+PGO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)/pgo_data/embree"
 
-# The key changes whenever the version, a patch, the flags in this file or the compiler cmake will pick change.
+# The key changes whenever the version, a patch, the flags in this file, the compiler cmake will pick or the profile change.
 read -r -a cc_cmd <<< "${CC:-cc}"
 read -r -a cxx_cmd <<< "${CXX:-c++}"
 KEY="$( {
@@ -22,6 +25,13 @@ KEY="$( {
     "${cc_cmd[@]}" --version | head -n 1
     "${cxx_cmd[@]}" --version | head -n 1
     "${cxx_cmd[@]}" -dumpmachine
+    echo "pgo ${PGO_MODE}"
+    # A training build writes its profiles to the absolute folder compiled in, so that folder is part of its key.
+    if [[ "${PGO_MODE}" == generate ]]; then
+        echo "${PGO_DIR}"
+    elif [[ "${PGO_MODE}" == use && -d "${PGO_DIR}" ]]; then
+        find "${PGO_DIR}" -name '*.gcda' -print0 | sort -z | xargs -0 -r sha256sum | cut -d' ' -f1
+    fi
 } | sha256sum | cut -c1-16)"
 
 if [[ -f "${PREFIX_DIR}/KEY" && "$(cat "${PREFIX_DIR}/KEY")" == "${KEY}" ]]; then
@@ -45,6 +55,20 @@ if [[ ! -f "${CACHED}/lib/libembree4.a" ]]; then
 
     # Source and build trees live under one fixed path per key, so a rebuild of the same key gives the same bytes.
     WORK_DIR="${CACHE_ROOT}/build-${KEY}"
+    # GCC checks each profile against the absolute source path, so training and use builds share one tree path.
+    PGO_FLAGS=""
+    if [[ "${PGO_MODE}" == generate || "${PGO_MODE}" == use ]]; then
+        WORK_DIR="${CACHE_ROOT}/build-pgo"
+        # One shared tree, so a second profile build on this cache waits instead of deleting it mid-build.
+        exec 9>"${CACHE_ROOT}/build-pgo.lock"
+        flock 9
+        PGO_FLAGS="-fprofile-dir=${PGO_DIR} -fprofile-prefix-path=${WORK_DIR}/build"
+        if [[ "${PGO_MODE}" == generate ]]; then
+            PGO_FLAGS+=" -fprofile-generate"
+        else
+            PGO_FLAGS+=" -fprofile-use -fprofile-correction -fprofile-partial-training"
+        fi
+    fi
     SOURCE_DIR="${WORK_DIR}/src"
     BUILD_DIR="${WORK_DIR}/build"
     INSTALL_DIR="${WORK_DIR}/install"
@@ -63,8 +87,11 @@ if [[ ! -f "${CACHED}/lib/libembree4.a" ]]; then
     fi
 
     # One ISA compiled in and MAX_ISA=NONE: the library holds a single AVX2 code path and never dispatches.
+    # Embree's flags would leave GCC's C++ default -ffp-contract=fast: multiply-adds Embree never wrote, fused per compiler.
     cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DEMBREE_IGNORE_CMAKE_CXX_FLAGS=OFF \
+        "-DCMAKE_CXX_FLAGS=-ffp-contract=off ${PGO_FLAGS}" \
         -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \

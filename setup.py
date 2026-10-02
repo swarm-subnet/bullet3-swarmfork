@@ -178,11 +178,13 @@ if not _PGO_MODE:
 _PGO_FLAGS = ''
 if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
   if _compiler_accepts(_cc_argv(), '-fprofile-prefix-path=' + _SOURCE_ROOT):
-    _PGO_FLAGS = '-fprofile-dir=pgo_data -fprofile-prefix-path=' + _SOURCE_ROOT + ' '
+    # Absolute, so a trained process writes its profile here and not into whatever folder it ran in.
+    _PGO_FLAGS = '-fprofile-dir=' + _PGO_DIR + ' -fprofile-prefix-path=' + _SOURCE_ROOT + ' '
     if _PGO_MODE == 'generate':
       _PGO_FLAGS += '-fprofile-generate '
     else:
-      _PGO_FLAGS += '-fprofile-use -fprofile-correction '
+      # Functions the training never entered are compiled as without a profile, not for size: the wheel serves every family.
+      _PGO_FLAGS += '-fprofile-use -fprofile-correction -fprofile-partial-training '
   else:
     print("swarm-bullet3: compiler rejects -fprofile-prefix-path, pgo disabled")
     _PGO_MODE = 'off'
@@ -538,7 +540,8 @@ if _platform == "linux" or _platform == "linux2":
     _EMBREE_DIR = os.path.join('examples', 'ThirdPartyLibs', 'embree')
     _EMBREE_PREFIX = os.path.join(_EMBREE_DIR, 'prefix')
     # The script keeps prefix/ in step with its cache key and returns at once when it already matches.
-    subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
+    subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))],
+                          env=dict(os.environ, SWARM_BULLET3_PGO=_PGO_MODE))
     CXX_FLAGS += '-DSWARM_RAYCAST '
     sources = sources + ['src/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp',
                          'src/SharedMemory/plugins/tinyRendererPlugin/SwarmThermal.cpp',

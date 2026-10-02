@@ -2,11 +2,12 @@
 set -e -x
 
 # use this docker command; the cache mount keeps the compiled Embree between runs
-# sudo docker run -it -v $(pwd):/io -v $HOME/.cache/swarm-bullet3:/root/.cache/swarm-bullet3 quay.io/pypa/manylinux2014_x86_64
+# sudo docker run -it -v $(pwd):/io -v $HOME/.cache/swarm-bullet3:/root/.cache/swarm-bullet3 quay.io/pypa/manylinux_2_34_x86_64@sha256:9d908a868fbfcc5f3bba8810ccbf57b3b8153e0967d2b40b0764b0cbc093ffbc
 
 # x86-64-v3 (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE: Intel Haswell 2013+, AMD Zen) is the published floor: faster than -O2 with bit-identical output.
 export SWARM_BULLET3_OPT_LEVEL=v3
-export SWARM_BULLET3_PGO=off
+# SWARM_BULLET3_PGO=use builds with the committed pgo_data/ profiles (tags without a profile build without one).
+export SWARM_BULLET3_PGO=${SWARM_BULLET3_PGO:-off}
 export SWARM_BULLET3_CCACHE=off
 
 # Compile wheels
