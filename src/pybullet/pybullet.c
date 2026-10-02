@@ -63,6 +63,8 @@
 #endif
 
 static PyObject* SpamError;
+// The renderer keeps process-wide scratch and lazy caches, so frames drawn without the GIL still take turns.
+static PyThread_type_lock sCameraLock = 0;
 #define B3_MAX_NUM_END_EFFECTORS 128
 #define MAX_PHYSICS_CLIENTS 1024
 static b3PhysicsClientHandle sPhysicsClients1[MAX_PHYSICS_CLIENTS] = {0};
@@ -10444,7 +10446,12 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		b3SharedMemoryStatusHandle statusHandle;
 		int statusType;
 
+		// the frame touches no Python object, so other threads run while it is drawn
+		Py_BEGIN_ALLOW_THREADS
+		PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+		PyThread_release_lock(sCameraLock);
+		Py_END_ALLOW_THREADS
 		statusType = b3GetStatusType(statusHandle);
 		if (statusType == CMD_CAMERA_IMAGE_COMPLETED)
 		{
@@ -10692,7 +10699,13 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 
 		if (b3CanSubmitCommand(sm))
 		{
-			b3SharedMemoryStatusHandle statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			b3SharedMemoryStatusHandle statusHandle;
+			// a single camera falls back to the shared depth scratch, so these frames take turns with getCameraImage's
+			Py_BEGIN_ALLOW_THREADS
+			PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+			statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			PyThread_release_lock(sCameraLock);
+			Py_END_ALLOW_THREADS
 			if (b3GetStatusType(statusHandle) == CMD_CAMERA_IMAGE_COMPLETED)
 			{
 #ifdef PYBULLET_USE_NUMPY
@@ -13792,6 +13805,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS_BACKED", eVISUAL_SHAPE_GLASS_BACKED);
 	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
 	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
+	// Present when getCameraImage lets go of the GIL while the frame is drawn; frames still never overlap each other.
+	PyModule_AddIntConstant(m, "CAMERA_RELEASES_GIL", 1);
 
 	PyModule_AddIntConstant(m, "MAX_RAY_INTERSECTION_BATCH_SIZE", MAX_RAY_INTERSECTION_BATCH_SIZE_STREAMING);
 
@@ -13853,6 +13868,17 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ZipFileIO", eZipFileIO);
 	PyModule_AddIntConstant(m, "CNSFileIO", eCNSFileIO);
 
+	sCameraLock = PyThread_allocate_lock();
+	if (!sCameraLock)
+	{
+		PyErr_SetString(PyExc_ImportError, "pybullet could not allocate its render lock");
+#if PY_MAJOR_VERSION >= 3
+		Py_DECREF(m);
+		return NULL;
+#else
+		return;
+#endif
+	}
 	SpamError = PyErr_NewException("pybullet.error", NULL, NULL);
 	Py_INCREF(SpamError);
 	PyModule_AddObject(m, "error", SpamError);
