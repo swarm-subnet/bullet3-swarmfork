@@ -13748,6 +13748,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_LOW_LIGHT", ER_SWARM_LOW_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_NEAR_INFRARED", ER_SWARM_NEAR_INFRARED);
 	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
+	PyModule_AddIntConstant(m, "ER_SWARM_FRAME_REUSE", ER_SWARM_FRAME_REUSE);
+	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);
