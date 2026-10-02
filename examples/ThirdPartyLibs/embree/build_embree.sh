@@ -59,6 +59,9 @@ if [[ ! -f "${CACHED}/lib/libembree4.a" ]]; then
     PGO_FLAGS=""
     if [[ "${PGO_MODE}" == generate || "${PGO_MODE}" == use ]]; then
         WORK_DIR="${CACHE_ROOT}/build-pgo"
+        # One shared tree, so a second profile build on this cache waits instead of deleting it mid-build.
+        exec 9>"${CACHE_ROOT}/build-pgo.lock"
+        flock 9
         PGO_FLAGS="-fprofile-dir=${PGO_DIR} -fprofile-prefix-path=${WORK_DIR}/build"
         if [[ "${PGO_MODE}" == generate ]]; then
             PGO_FLAGS+=" -fprofile-generate"
