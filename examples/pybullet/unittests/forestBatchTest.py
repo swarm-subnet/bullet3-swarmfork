@@ -77,6 +77,13 @@ def separate_world(folder, base=(0, 0, 0)):
   return bodies
 
 
+def identity_hash(folder):
+  """Hash of the forest frame drawn with every picture flag, the frame the thread and process checks compare."""
+  forest_world(folder)
+  buffers = frame(RAY | MAP | DAY | CUTOUT | p.ER_EDGE_ANTIALIAS | p.ER_TEXTURE_FILTER, eye=(0, -6, 6))
+  return hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()
+
+
 def child(threads):
   """Hash of a forest frame rendered in a fresh process at a thread count."""
   env = dict(os.environ, SWARM_RENDER_THREADS=threads)
@@ -178,6 +185,15 @@ class TestForestBatch(unittest.TestCase):
     _, _, mask = frame(flags=RAY, shadow=0, eye=(0, -6, 6))
     self.assertEqual(int((mask > 0).sum()), 0)
 
+  def test_later_world_draws_what_a_fresh_process_draws(self):
+    """A forest drawn after other worlds in the process, its mesh trees kept from them, gives a fresh process's bytes."""
+    for _ in range(2):
+      forest_world(self.folder)
+      frame(flags=RAY, eye=(0, -6, 6))
+      p.disconnect()
+      p.connect(p.DIRECT)
+    self.assertEqual(identity_hash(self.folder), child("2"))
+
   def test_threads_give_the_same_bytes(self):
     """Fresh processes render identical colour, depth and mask at one, two and four threads."""
     hashes = [child(t) for t in ("1", "2", "4")]
@@ -189,9 +205,7 @@ if __name__ == "__main__":
   if len(sys.argv) > 1 and sys.argv[1] == "identity":
     p.connect(p.DIRECT)
     with tempfile.TemporaryDirectory() as folder:
-      forest_world(folder)
-      buffers = frame(RAY | MAP | DAY | CUTOUT | p.ER_EDGE_ANTIALIAS | p.ER_TEXTURE_FILTER, eye=(0, -6, 6))
-      print(json.dumps(hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()))
+      print(json.dumps(identity_hash(folder)))
     p.disconnect()
   else:
     unittest.main()

@@ -123,6 +123,16 @@ protected:
 
 	btVector3 m_customDebugColorRGB;
 
+	///a static object's last bounds update and its inputs, reused by btCollisionWorld::updateAabbs while unchanged
+	btTransform m_staticAabbTransform;
+	btVector3 m_staticAabbMin;
+	btVector3 m_staticAabbMax;
+	const btCollisionShape* m_staticAabbShape;
+	btScalar m_staticAabbThreshold;
+	int m_staticAabbRevision;
+
+	friend class btCollisionWorld;
+
 public:
 	BT_DECLARE_ALIGNED_ALLOCATOR();
 

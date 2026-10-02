@@ -5261,6 +5261,7 @@ bool PhysicsServerCommandProcessor::processCreateCollisionShapeCommand(const str
 							{
 								heightfieldDest[i] = datafl[i];
 							}
+							m_data->m_dynamicsWorld->invalidateStaticAabbs();
 							//update graphics
 
 							btAlignedObjectArray<GLInstanceVertex> gfxVertices;
@@ -11095,6 +11096,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 							compound->getChildShape(s)->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
 						}
 					}
+					m_data->m_dynamicsWorld->invalidateStaticAabbs();
 				}
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_DYNAMIC_TYPE)
 				{
@@ -11221,6 +11223,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 						if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_COLLISION_MARGIN)
 						{
 							mb->getLinkCollider(linkIndex)->getCollisionShape()->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
+							m_data->m_dynamicsWorld->invalidateStaticAabbs();
 						}
 					}
 
@@ -11390,6 +11393,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_COLLISION_MARGIN)
 				{
 					rb->getCollisionShape()->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
+					m_data->m_dynamicsWorld->invalidateStaticAabbs();
 				}
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_DYNAMIC_TYPE)
 				{
@@ -12022,6 +12026,7 @@ bool PhysicsServerCommandProcessor::processInitPoseCommand(const struct SharedMe
 			btVector3 scaling(clientCmd.m_initPoseArgs.m_scaling[0], clientCmd.m_initPoseArgs.m_scaling[1], clientCmd.m_initPoseArgs.m_scaling[2]);
 
 			mb->getBaseCollider()->getCollisionShape()->setLocalScaling(scaling);
+			m_data->m_dynamicsWorld->invalidateStaticAabbs();
 			//refresh broadphase
 			m_data->m_dynamicsWorld->getBroadphase()->getOverlappingPairCache()->cleanProxyFromPairs(
 				mb->getBaseCollider()->getBroadphaseHandle(),

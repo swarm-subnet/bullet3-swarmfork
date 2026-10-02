@@ -6,11 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+#include <xmmintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -148,6 +150,24 @@ struct StaticMember
 	int m_segmentation;
 };
 
+struct CachedTree;
+// The process's mesh trees by vertex and triangle count, and the idle ones, least recently used first.
+typedef std::multimap<std::pair<size_t, size_t>, CachedTree*> TreeCache;
+typedef std::list<CachedTree*> IdleTrees;
+
+// A mesh tree committed over its own copy of the vertex and index arrays and kept for the life of the process. A build
+// runs the same steps on the same arrays, so a later world handing over equal arrays is given the tree it would build.
+struct CachedTree
+{
+	RTCScene m_scene;
+	RTCGeometry m_geometry;
+	size_t m_triangles;
+	// Worlds drawing the tree now; at zero the tree waits at m_idle for a later world.
+	int m_users;
+	TreeCache::iterator m_entry;
+	IdleTrees::iterator m_idle;
+};
+
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
 // instead holds one static body's triangles in world space, drawn through an identity instance,
 // so its tree can be kept on disk under the body's mesh and pose.
@@ -155,6 +175,8 @@ struct MeshTree
 {
 	RTCScene m_scene;
 	RTCGeometry m_geometry;
+	// The process-wide tree m_scene and m_geometry belong to, until the mesh is rewritten; 0 when they are this tree's own.
+	CachedTree* m_cached;
 	std::vector<float> m_vertices;
 	std::vector<unsigned> m_indices;
 	// Per-vertex unit normals in the mesh's own frame, and uv pairs, indexed like m_vertices.
@@ -731,6 +753,100 @@ RTCGeometry newTriangles(RTCDevice device, std::vector<float>& vertices, std::ve
 	return geometry;
 }
 
+// One Embree device for the process: a cached tree outlives the world that built it, and an instance can only draw a
+// scene of its own device. threads=1: Embree starts no thread of its own, so a build runs only on the threads that
+// commit it. Never released, since the cached trees live as long as the process.
+RTCDevice processDevice()
+{
+	static const RTCDevice device = rtcNewDevice("threads=1,set_affinity=0");
+	return device;
+}
+
+// Commits a scene on up to two render threads. Embree cuts a build into the same tasks however many threads run them,
+// and each task's result depends only on its own primitives, so the tree is the one a single thread builds.
+void joinCommit(RTCScene scene)
+{
+	// The internal scheduler of a one-thread device has room for two threads in a build.
+	const int threads = b3GetSwarmRenderThreads() < 2 ? 1 : 2;
+	// A joining thread builds with the caller's MXCSR (rounding, flush to zero, denormals are zero), then gets its own back.
+	const unsigned int callerCsr = _mm_getcsr();
+#pragma omp parallel num_threads(threads)
+	{
+		const unsigned int ownCsr = _mm_getcsr();
+		_mm_setcsr(callerCsr);
+		rtcJoinCommitScene(scene);
+		_mm_setcsr(ownCsr);
+	}
+}
+
+// Idle cached trees are kept up to this weight, the least recently used dropped first. A tree weighs its triangles plus
+// a fixed share for its scene, geometry and allocator blocks, so many tiny trees cannot pile up either.
+const size_t kTreeCacheIdleWeight = 2000000;
+const size_t kTreeCacheEntryWeight = 1000;
+
+TreeCache gTreeCache;
+IdleTrees gIdleTrees;
+size_t gIdleWeight = 0;
+
+// The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
+CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
+{
+	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
+	const std::pair<size_t, size_t> key(numVertices, numTriangles);
+	const std::pair<TreeCache::iterator, TreeCache::iterator> range = gTreeCache.equal_range(key);
+	for (TreeCache::iterator it = range.first; it != range.second; ++it)
+	{
+		CachedTree* tree = it->second;
+		if (memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
+			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
+			continue;
+		if (tree->m_users++ == 0)
+		{
+			gIdleTrees.erase(tree->m_idle);
+			gIdleWeight -= numTriangles + kTreeCacheEntryWeight;
+		}
+		return tree;
+	}
+	CachedTree* tree = new CachedTree;
+	tree->m_triangles = numTriangles;
+	tree->m_users = 1;
+	tree->m_scene = rtcNewScene(device);
+	rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
+	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
+	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
+	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3 * sizeof(float), numVertices),
+		   &vertices[0], numVertices * 3 * sizeof(float));
+	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, 3 * sizeof(unsigned), numTriangles),
+		   &indices[0], indices.size() * sizeof(unsigned));
+	rtcSetGeometryIntersectFilterFunction(tree->m_geometry, hitFilter);
+	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
+	rtcCommitGeometry(tree->m_geometry);
+	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
+	joinCommit(tree->m_scene);
+	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
+	return tree;
+}
+
+// A world stops drawing the tree; once idle it stays for a later world while the idle ones fit the bound.
+void releaseCachedTree(CachedTree* tree)
+{
+	if (--tree->m_users > 0)
+		return;
+	tree->m_idle = gIdleTrees.insert(gIdleTrees.end(), tree);
+	gIdleWeight += tree->m_triangles + kTreeCacheEntryWeight;
+	while (gIdleWeight > kTreeCacheIdleWeight)
+	{
+		CachedTree* drop = gIdleTrees.front();
+		gIdleTrees.pop_front();
+		gIdleWeight -= drop->m_triangles + kTreeCacheEntryWeight;
+		gTreeCache.erase(drop->m_entry);
+		rtcReleaseGeometry(drop->m_geometry);
+		rtcReleaseScene(drop->m_scene);
+		delete drop;
+	}
+}
+
 // Rotation part of the body transform, row-major, for turning a model normal into world space.
 void copyRotation(const btTransform& worldTransform, float out[9])
 {
@@ -1144,6 +1260,8 @@ struct SwarmRaycast::Data
 	// Per pixel of the current frame: the depth along the camera's axis of the farthest remembered hit landing on it, -1
 	// where none does.
 	std::vector<float> m_hintFar;
+	// The same for the share of the remembered hits each further render thread puts onto the frame.
+	std::vector<std::vector<float> > m_hintFrames;
 	MoverShade m_moverShade;
 	// Frame reuse: counts every change to the scene or its shadow grids but a mover's move; each move instead leaves the
 	// mover's world box before and after it (lo, hi), m_movedBase counting the boxes dropped from the front.
@@ -1551,9 +1669,18 @@ struct SwarmRaycast::Data
 		return tree;
 	}
 
-	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build.
+	// Commits the tree's scene over its blocks; a loaded Embree image replaces the build. A mesh tree is taken from the
+	// process cache, so a mesh another world already drew costs no build.
 	void buildTree(MeshTree& tree, const std::vector<char>* image)
 	{
+		tree.m_cached = 0;
+		if (!tree.m_world)
+		{
+			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices);
+			tree.m_scene = tree.m_cached->m_scene;
+			tree.m_geometry = tree.m_cached->m_geometry;
+			return;
+		}
 		tree.m_scene = rtcNewScene(m_device);
 		rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST);
 		rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_MEDIUM);
@@ -1636,8 +1763,13 @@ struct SwarmRaycast::Data
 				m_sharedTrees.erase(it);
 				break;
 			}
-		rtcReleaseGeometry(tree->m_geometry);
-		rtcReleaseScene(tree->m_scene);
+		if (tree->m_cached)
+			releaseCachedTree(tree->m_cached);
+		else
+		{
+			rtcReleaseGeometry(tree->m_geometry);
+			rtcReleaseScene(tree->m_scene);
+		}
 		delete tree;
 	}
 
@@ -1651,8 +1783,15 @@ struct SwarmRaycast::Data
 		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
 		if (!tree.m_refitting)
 		{
-			rtcReleaseGeometry(tree.m_geometry);
-			rtcReleaseScene(tree.m_scene);
+			// A cached tree is never rewritten: the mesh leaves it for a scene of its own.
+			if (tree.m_cached)
+				releaseCachedTree(tree.m_cached);
+			else
+			{
+				rtcReleaseGeometry(tree.m_geometry);
+				rtcReleaseScene(tree.m_scene);
+			}
+			tree.m_cached = 0;
 			tree.m_scene = rtcNewScene(m_device);
 			rtcSetSceneFlags(tree.m_scene, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_DYNAMIC);
 			rtcSetSceneBuildQuality(tree.m_scene, RTC_BUILD_QUALITY_LOW);
@@ -2078,8 +2217,7 @@ SwarmRaycast::SwarmRaycast()
 	}
 	const char* cacheDir = getenv("SWARM_BVH_CACHE_DIR");
 	m_data->m_cacheDir = cacheDir ? cacheDir : "";
-	// threads=1 keeps every tree build on the calling thread, so the same input gives the same tree everywhere.
-	m_data->m_device = rtcNewDevice("threads=1,set_affinity=0");
+	m_data->m_device = processDevice();
 	if (!m_data->m_device)
 	{
 		b3Warning("SwarmRaycast: cannot create the Embree device (a CPU with AVX2 and FMA is required)");
@@ -2104,8 +2242,6 @@ SwarmRaycast::~SwarmRaycast()
 		rtcReleaseScene(m_data->m_movers);
 		rtcReleaseScene(m_data->m_top);
 	}
-	if (m_data->m_device)
-		rtcReleaseDevice(m_data->m_device);
 	delete m_data;
 }
 
@@ -2261,14 +2397,14 @@ void SwarmRaycast::commit(bool moverShadows)
 		return;
 	if (!m_data->m_staticBuilt)
 	{
-		rtcCommitScene(m_data->m_static);
+		joinCommit(m_data->m_static);
 		m_data->m_staticBuilt = true;
 		m_data->m_topDirty = true;
 	}
 	// The forest is committed before the instance that reaches it, and both parents after it.
 	if (m_data->m_forestDirty)
 	{
-		rtcCommitScene(m_data->m_forest);
+		joinCommit(m_data->m_forest);
 		rtcCommitGeometry(m_data->m_forestInstance);
 		m_data->m_forestDirty = false;
 		m_data->m_topDirty = true;
@@ -3214,6 +3350,22 @@ inline float hintReach(const float* hintFar, int width, int height, int row, int
 	return farthest < 0.0f ? INFINITY : farthest + farthest * kHintSlack + kHintSlackMetres;
 }
 
+// A remembered hit put onto this frame's pixels: the pixel it lands on keeps the farthest depth along the camera's axis.
+inline void hintPoint(const float viewProj[4][4], const float* q, int width, int height, float* hintFar)
+{
+	const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
+	if (!(w > 1e-6f))
+		return;
+	const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
+	const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
+	const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
+	const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
+	if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
+		return;
+	float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
+	far = w > far ? w : far;
+}
+
 // The same for an edge pixel's probe ray, from this frame's first rays: their 1/zEye, the far plane's for a miss.
 inline float probeReach(const float* inverseEyeDepth, int width, int height, int row, int col)
 {
@@ -4028,9 +4180,8 @@ void developCamera(const SwarmRaycastShading* shading, const float* radiance, in
 	camera.m_seed = shading->m_sensorSeed;
 	for (int k = 0; k < 3; k++)
 		camera.m_whiteBalance[k] = shading->m_whiteBalance[k];
-	// One thread: the chain is a dozen short passes, and on a busy box the barriers between them cost more than the
-	// passes; the bytes are the same at any count.
-	SwarmLowLight::develop(rgb, width, height, camera, 1);
+	// Every pass splits its rows over the render threads; the bytes are the same at any count.
+	SwarmLowLight::develop(rgb, width, height, camera, threads);
 }
 
 // Everything a lone camera's frame reads but the scene: the caller's bytes, the frame size, projection and view, which
@@ -4166,33 +4317,29 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	// far it has to search.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
+	float viewProj[4][4];
+	std::vector<float*> hintFrames;
+	const float* lastPoints = 0;
 	if (memory)
 	{
 		const Camera& cam = setups[0].m_cam;
 		if (memory->m_points.size() == numPixels * 3)
 		{
-			float viewProj[4][4];
 			for (int r = 0; r < 4; r++)
 				for (int c = 0; c < 4; c++)
 					viewProj[r][c] = (float)cam.m_viewProj[r][c];
-			std::vector<float>& hintFar = m_data->m_hintFar;
-			hintFar.assign(numPixels, -1.0f);
-			for (size_t i = 0; i < numPixels; i++)
+			// One frame of farthest hits per render thread, the first being the hint itself; the threads fill them inside
+			// the pixel loop's parallel region.
+			m_data->m_hintFar.resize(numPixels);
+			m_data->m_hintFrames.resize((size_t)threads - 1);
+			hintFrames.push_back(&m_data->m_hintFar[0]);
+			for (int i = 0; i < threads - 1; i++)
 			{
-				const float* q = &memory->m_points[i * 3];
-				const float w = ((viewProj[3][0] * q[0] + viewProj[3][1] * q[1]) + viewProj[3][2] * q[2]) + viewProj[3][3];
-				if (!(w > 1e-6f))
-					continue;
-				const float ndcX = (((viewProj[0][0] * q[0] + viewProj[0][1] * q[1]) + viewProj[0][2] * q[2]) + viewProj[0][3]) / w;
-				const float ndcY = (((viewProj[1][0] * q[0] + viewProj[1][1] * q[1]) + viewProj[1][2] * q[2]) + viewProj[1][3]) / w;
-				const float x = (ndcX + 1.0f) * 0.5f * (float)width + 0.5f;
-				const float y = (1.0f - ndcY) * 0.5f * (float)height - 0.5f;
-				if (!(x >= 0.0f && y >= 0.0f && x < (float)width && y < (float)height))
-					continue;
-				float& far = hintFar[(size_t)(int)y * width + (size_t)(int)x];
-				far = w > far ? w : far;
+				m_data->m_hintFrames[(size_t)i].resize(numPixels);
+				hintFrames.push_back(&m_data->m_hintFrames[(size_t)i][0]);
 			}
-			job.m_hintFar = &hintFar[0];
+			lastPoints = &memory->m_points[0];
+			job.m_hintFar = &m_data->m_hintFar[0];
 		}
 		memory->m_points.resize(numPixels * 3);
 		job.m_hitPoints = &memory->m_points[0];
@@ -4243,6 +4390,31 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		RTCOccludedArguments shadowArgs;
 		rtcInitOccludedArguments(&shadowArgs);
 		shadowArgs.context = &ctx.m_context;
+
+		if (lastPoints)
+		{
+			// Each thread puts its share of the remembered hits into its own frame, then each pixel takes the farthest of
+			// the frames: a maximum, so the hint is the same whichever thread took which hit.
+#ifdef _OPENMP
+			const int team = omp_get_num_threads(), member = omp_get_thread_num();
+#else
+			const int team = 1, member = 0;
+#endif
+			float* own = hintFrames[(size_t)member];
+			for (size_t i = 0; i < numPixels; i++)
+				own[i] = -1.0f;
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+				hintPoint(viewProj, lastPoints + i * 3, width, height, own);
+#pragma omp for schedule(static)
+			for (long long i = 0; i < (long long)numPixels; i++)
+			{
+				float far = hintFrames[0][i];
+				for (int k = 1; k < team; k++)
+					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
+				hintFrames[0][i] = far;
+			}
+		}
 
 		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
 		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
