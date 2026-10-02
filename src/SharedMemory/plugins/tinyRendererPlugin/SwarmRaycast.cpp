@@ -3410,7 +3410,8 @@ inline void reached(RTCIntersectArguments* args, float t)
 		ctx->m_farthest = t;
 }
 
-// One camera ray through (ndcX, ndcY), false on a miss; `reach` is its depth hint, `landed` takes its hit point or NaN.
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss.
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
 {
