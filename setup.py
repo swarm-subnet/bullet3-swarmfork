@@ -183,7 +183,7 @@ if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
     if _PGO_MODE == 'generate':
       _PGO_FLAGS += '-fprofile-generate '
     else:
-      # Code the training never ran is compiled as without a profile, not for size: the wheel serves every family.
+      # Functions the training never entered are compiled as without a profile, not for size: the wheel serves every family.
       _PGO_FLAGS += '-fprofile-use -fprofile-correction -fprofile-partial-training '
   else:
     print("swarm-bullet3: compiler rejects -fprofile-prefix-path, pgo disabled")
