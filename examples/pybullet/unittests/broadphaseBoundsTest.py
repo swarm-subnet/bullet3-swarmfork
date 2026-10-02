@@ -60,6 +60,24 @@ class BroadphaseBoundsTest(unittest.TestCase):
     finally:
       p.disconnect(cli)
 
+  def test_a_wider_collision_margin_widens_the_bounds_of_a_body_that_stays_put(self):
+    """A fixed hull slab that has been still for many steps gets a wider collision margin: the next step's broadphase
+    bounds reach as far as the new margin."""
+    cli = p.connect(p.DIRECT)
+    try:
+      corners = [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-0.1, 0.1)]
+      hull = p.createCollisionShape(p.GEOM_MESH, vertices=corners, physicsClientId=cli)
+      slab = p.createMultiBody(0, hull, basePosition=[0, 0, 0], useMaximalCoordinates=True, physicsClientId=cli)
+      above = ([-0.5, -0.5, 0.3], [0.5, 0.5, 0.35])
+      for _ in range(10):
+        p.stepSimulation(physicsClientId=cli)
+      self.assertNotIn(slab, _overlapping(cli, *above))
+      p.changeDynamics(slab, -1, collisionMargin=0.5, physicsClientId=cli)
+      p.stepSimulation(physicsClientId=cli)
+      self.assertIn(slab, _overlapping(cli, *above))
+    finally:
+      p.disconnect(cli)
+
 
 if __name__ == "__main__":
   unittest.main()

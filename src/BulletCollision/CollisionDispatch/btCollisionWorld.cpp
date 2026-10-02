@@ -36,6 +36,7 @@ subject to the following restrictions:
 #include "LinearMath/btSerializer.h"
 #include "BulletCollision/CollisionShapes/btConvexPolyhedron.h"
 #include "BulletCollision/CollisionDispatch/btCollisionObjectWrapper.h"
+#include <string.h>
 
 //#define DISABLE_DBVT_COMPOUNDSHAPE_RAYCAST_ACCELERATION
 
@@ -68,7 +69,8 @@ btCollisionWorld::btCollisionWorld(btDispatcher* dispatcher, btBroadphaseInterfa
 	: m_dispatcher1(dispatcher),
 	  m_broadphasePairCache(pairCache),
 	  m_debugDrawer(0),
-	  m_forceUpdateAllAabbs(true)
+	  m_forceUpdateAllAabbs(true),
+	  m_staticAabbRevision(0)
 {
 }
 
@@ -171,6 +173,16 @@ void btCollisionWorld::updateSingleAabb(btCollisionObject* colObj)
 
 	btBroadphaseInterface* bp = (btBroadphaseInterface*)m_broadphasePairCache;
 
+	if (colObj->isStaticObject())
+	{
+		colObj->m_staticAabbTransform = colObj->getWorldTransform();
+		colObj->m_staticAabbMin = minAabb;
+		colObj->m_staticAabbMax = maxAabb;
+		colObj->m_staticAabbShape = colObj->getCollisionShape();
+		colObj->m_staticAabbThreshold = gContactBreakingThreshold;
+		colObj->m_staticAabbRevision = m_staticAabbRevision;
+	}
+
 	//moving objects should be moderately sized, probably something wrong if not
 	if (colObj->isStaticObject() || ((maxAabb - minAabb).length2() < btScalar(1e12)))
 	{
@@ -206,7 +218,17 @@ void btCollisionWorld::updateAabbs()
 		//only update aabb of active objects
 		if (m_forceUpdateAllAabbs || colObj->isActive())
 		{
-			updateSingleAabb(colObj);
+			// An unchanged static object gets the bounds of its last update without asking the shape again.
+			if (colObj->isStaticObject() && colObj->m_staticAabbShape == colObj->getCollisionShape() &&
+				colObj->m_staticAabbRevision == m_staticAabbRevision && colObj->m_staticAabbThreshold == gContactBreakingThreshold &&
+				!memcmp(&colObj->m_staticAabbTransform, &colObj->getWorldTransform(), sizeof(btTransform)))
+			{
+				m_broadphasePairCache->setAabb(colObj->getBroadphaseHandle(), colObj->m_staticAabbMin, colObj->m_staticAabbMax, m_dispatcher1);
+			}
+			else
+			{
+				updateSingleAabb(colObj);
+			}
 		}
 	}
 }

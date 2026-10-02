@@ -48,7 +48,10 @@ btCollisionObject::btCollisionObject()
 	  m_ccdSweptSphereRadius(btScalar(0.)),
 	  m_ccdMotionThreshold(btScalar(0.)),
 	  m_checkCollideWith(false),
-	  m_updateRevision(0)
+	  m_updateRevision(0),
+	  m_staticAabbShape(0),
+	  m_staticAabbThreshold(0),
+	  m_staticAabbRevision(0)
 {
 	m_worldTransform.setIdentity();
 	m_interpolationWorldTransform.setIdentity();
