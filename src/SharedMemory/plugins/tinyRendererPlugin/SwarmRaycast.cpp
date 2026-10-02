@@ -3741,6 +3741,93 @@ struct Candidate
 	float m_depth;
 };
 
+// ER_SWARM_CREASE_FILL: a mover's box put onto the frame, kMoverMargin pixels wider, and the farthest eye depth it
+// reaches. A crease nearer than that inside it may show the mover through a gap narrower than a pixel, so it keeps its probe.
+struct MoverRect
+{
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_depth;
+};
+const int kMoverMargin = 2;
+// A box reaching nearer than kMoverNear guards the whole frame, unless it lies within kAircraftReach of the eye: those are
+// the aircraft's own parts, in front of everything it films.
+const float kMoverNear = 1.0f;
+const float kAircraftReach = 2.0f;
+
+// The frame rectangles of every enabled mover, the same bodies the mover shadow grid covers.
+void moverRects(const std::vector<Instance*>& instances, const Camera& cam, int width, int height, std::vector<MoverRect>& out)
+{
+	out.clear();
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const Instance* inst = instances[i];
+		if (!inst || inst->m_staticShared || !inst->m_enabled)
+			continue;
+		RTCBounds bounds;
+		rtcGetSceneBounds(inst->m_tree->m_scene, &bounds);
+		if (!(bounds.lower_x <= bounds.upper_x && bounds.lower_y <= bounds.upper_y && bounds.lower_z <= bounds.upper_z))
+			continue;
+		float nearest = INFINITY, farthest = -INFINITY, low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+		double col0 = INFINITY, col1 = -INFINITY, row0 = INFINITY, row1 = -INFINITY;
+		for (int k = 0; k < 8; k++)
+		{
+			const float corner[3] = {k & 1 ? bounds.upper_x : bounds.lower_x, k & 2 ? bounds.upper_y : bounds.lower_y, k & 4 ? bounds.upper_z : bounds.lower_z};
+			float world[3];
+			transformPoint(inst->m_transform, corner, world);
+			for (int j = 0; j < 3; j++)
+			{
+				low[j] = world[j] < low[j] ? world[j] : low[j];
+				high[j] = world[j] > high[j] ? world[j] : high[j];
+			}
+			const float depth = -(((cam.m_viewRow2[0] * world[0] + cam.m_viewRow2[1] * world[1]) + cam.m_viewRow2[2] * world[2]) + cam.m_viewRow2[3]);
+			nearest = depth < nearest ? depth : nearest;
+			farthest = depth > farthest ? depth : farthest;
+			double clip[4];
+			for (int r = 0; r < 4; r++)
+				clip[r] = ((cam.m_viewProj[r][0] * world[0] + cam.m_viewProj[r][1] * world[1]) + cam.m_viewProj[r][2] * world[2]) + cam.m_viewProj[r][3];
+			if (!(clip[3] > 0.0))
+				continue;
+			// The inverse of pixelNdcX and pixelNdcY.
+			const double col = (clip[0] / clip[3] + 1.0) * 0.5 * width;
+			const double row = ((1.0 - clip[1] / clip[3]) * height - 2.0) * 0.5;
+			col0 = col < col0 ? col : col0;
+			col1 = col > col1 ? col : col1;
+			row0 = row < row0 ? row : row0;
+			row1 = row > row1 ? row : row1;
+		}
+		MoverRect rect;
+		if (!(nearest >= kMoverNear))
+		{
+			float gap2 = 0.0f;
+			for (int j = 0; j < 3; j++)
+			{
+				const float below = low[j] - cam.m_origin[j], above = cam.m_origin[j] - high[j];
+				const float gap = below > above ? below : above;
+				gap2 += gap > 0.0f ? gap * gap : 0.0f;
+			}
+			if (gap2 <= kAircraftReach * kAircraftReach)
+				continue;
+			rect.m_col0 = rect.m_row0 = 0;
+			rect.m_col1 = width - 1;
+			rect.m_row1 = height - 1;
+			rect.m_depth = INFINITY;
+			out.push_back(rect);
+			continue;
+		}
+		if (!(col1 >= -kMoverMargin && col0 <= width + kMoverMargin && row1 >= -kMoverMargin && row0 <= height + kMoverMargin))
+			continue;
+		// Held to the frame before the conversion, so a corner just in front of the eye cannot overflow an int.
+		rect.m_col0 = (int)floor(col0 > -1.0 ? col0 : -1.0) - kMoverMargin;
+		rect.m_col1 = (int)ceil(col1 < width ? col1 : (double)width) + kMoverMargin;
+		rect.m_row0 = (int)floor(row0 > -1.0 ? row0 : -1.0) - kMoverMargin;
+		rect.m_row1 = (int)ceil(row1 < height ? row1 : (double)height) + kMoverMargin;
+		rect.m_depth = farthest;
+		out.push_back(rect);
+	}
+}
 
 // Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
 // the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
@@ -3752,7 +3839,7 @@ struct Candidate
 // byte that enters the blend is decoded first and the blend is encoded once on the write.
 void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, const EdgeScratch& scratch,
 				int row0, int row1, int col0, int col1,
-				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache)
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, ProjectionCache& cache, const std::vector<MoverRect>& movers)
 {
 	const Camera& cam = setup.m_cam;
 	const int width = job.m_width;
@@ -3851,6 +3938,10 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				crease = neighbours[n] != offset && ids[neighbours[n]] == id && hits[neighbours[n]].m_prim != RTC_INVALID_GEOMETRY_ID;
 			// One body can span far depths, as the whole forest does: a step that passes the outline rule keeps its probe.
 			crease = crease && !isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, kOutlineTolerance);
+			const float ownEyeDepth = -1.0f / scratch.m_inverseEyeDepth[offset];
+			for (size_t m = 0; m < movers.size() && crease; m++)
+				crease = !(col >= movers[m].m_col0 && col <= movers[m].m_col1 && row >= movers[m].m_row0 && row <= movers[m].m_row1 &&
+						   ownEyeDepth < movers[m].m_depth);
 			if (rest > kCoverageEpsilon && !crease)
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
@@ -4040,6 +4131,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 
 	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
 	std::vector<float> radiance(thermal ? numPixels * (size_t)numTargets : 0);
+	std::vector<std::vector<MoverRect> > movers((size_t)numTargets);
+	for (size_t i = 0; i < scratch.size() && shading->m_creaseFill; i++)
+		if (setups[i].m_valid)
+			moverRects(m_data->m_byGeomId, setups[i].m_cam, width, height, movers[i]);
 	for (size_t i = 0; i < scratch.size(); i++)
 	{
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
@@ -4144,7 +4239,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 						memset(cache.m_used, 0, sizeof(cache.m_used));
 						cacheCamera = camIndex;
 					}
-					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache);
+					refineTile(job, setups[(size_t)camIndex], targets[camIndex], *edge, row0, row1, col0, col1, &args, &shadowArgs, cache,
+							   movers[(size_t)camIndex]);
 				}
 			}
 		}

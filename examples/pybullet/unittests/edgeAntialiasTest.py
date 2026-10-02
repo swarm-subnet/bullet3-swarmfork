@@ -272,6 +272,25 @@ class TestCreaseFill(unittest.TestCase):
     self.assertTrue((rgb_f[outline] == rgb_aa[outline]).all())
     self.assertGreater(int((rgb_f != rgb_aa).any(axis=2).sum()), 10)
 
+  def test_creases_in_front_of_a_mover_keep_their_probe(self):
+    """A body added after the first frame, a mover, behind the leaves: the creases over it come out as the full blend,
+    where without it some did not."""
+    before_aa, _, _ = render(self.AA, **self.EYE)
+    before_f, _, _ = render(self.FILL, **self.EYE)
+    box = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.3, 0.3, 0.3], rgbaColor=[1, 0, 0, 1])
+    p.createMultiBody(baseMass=0, baseVisualShapeIndex=box, basePosition=[0.2, 0.2, 0.9])
+    rgb_aa, _, _ = render(self.AA, **self.EYE)
+    rgb_f, _, _ = render(self.FILL, **self.EYE)
+    view = np.array(p.computeViewMatrix(list(self.EYE["eye"]), list(self.EYE["target"]), [0, 0, 1])).reshape(4, 4).T
+    proj = np.array(p.computeProjectionMatrixFOV(70, 1.0, 0.1, 30.0)).reshape(4, 4).T
+    corners = np.array([[0.2 + x, 0.2 + y, 0.9 + z, 1.0] for x in (-0.3, 0.3) for y in (-0.3, 0.3) for z in (-0.3, 0.3)])
+    clip = corners @ (proj @ view).T
+    cols = (clip[:, 0] / clip[:, 3] + 1.0) * 0.5 * SIZE
+    rows = ((1.0 - clip[:, 1] / clip[:, 3]) * SIZE - 2.0) * 0.5
+    region = (slice(int(np.ceil(rows.min())), int(np.floor(rows.max())) + 1), slice(int(np.ceil(cols.min())), int(np.floor(cols.max())) + 1))
+    self.assertTrue((before_f[region] != before_aa[region]).any())
+    self.assertTrue((rgb_f[region] == rgb_aa[region]).all())
+
 
 def colour_hash():
   """Prints the sha256 of one shadowed, filtered, anti-aliased colour frame on the ray-cast path."""
