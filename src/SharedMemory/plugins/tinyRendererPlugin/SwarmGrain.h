@@ -50,8 +50,7 @@ inline std::vector<float> gaussianKernel(float sigma)
 	return taps;
 }
 
-// `buffer` grown to at least `size` floats and kept for the next frame, so a frame pays no allocation, zero fill or
-// page faults. Callers write every element before reading it, and keep the buffer to the calling thread.
+// `buffer` grown to `size` floats and kept for the next frame; callers write every element before reading it.
 inline float* reuse(std::vector<float>& buffer, size_t size)
 {
 	if (buffer.size() < size)
@@ -60,8 +59,7 @@ inline float* reuse(std::vector<float>& buffer, size_t size)
 }
 
 // Separable blur with the edge pixel repeated, rows then columns; each output pixel sums its taps in one fixed order.
-// Pixels a full radius from the border skip the clamp, which reads the same samples in the same order, and take their
-// taps a whole run of pixels at a time, each pixel still adding its taps from -radius up.
+// Pixels a full radius from the border skip the clamp, which reads the same samples in the same order.
 inline void blur(const float* in, float* out, int width, int height, const std::vector<float>& taps, int threads)
 {
 	const int radius = (int)taps.size() / 2;
@@ -90,6 +88,7 @@ inline void blur(const float* in, float* out, int width, int height, const std::
 			}
 			acc[x] = sum;
 		}
+		// The inner run one tap at a time: each pixel still adds its taps from -radius up.
 		for (int x = inner0; x < inner1; x++)
 			acc[x] = 0.0f;
 		for (int k = -radius; k <= radius; k++)

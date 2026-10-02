@@ -604,10 +604,10 @@ void Model::load_texture(std::string filename, const char *suffix, TGAImage &img
 	}
 }
 
-// Wraps a texture coordinate into [0, 1). A float's fraction is exact in float, so this is modf's value without the
-// double round trip; an infinity has no fraction, as modf says.
+// Wraps a texture coordinate into [0, 1).
 static float wrapUnit(float value)
 {
+	// A float's fraction is exact in float: modf's value without the double round trip, and none for an infinity.
 	float f = value - std::trunc(value);
 	if (f != f)
 		f = value != value ? value : 0.f;
@@ -750,8 +750,7 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	return c;
 }
 
-// The level a footprint radius squared of rho2 texels asks for, log2 from the float's own bits, and the next coarser
-// one with its 8-bit weight; the coarser level is read only when that weight is not zero.
+// Two mip levels and the 8-bit weight of the coarser one, which is read only when that weight is not zero.
 struct MipPick
 {
 	TGAImage* m_a;
@@ -759,6 +758,7 @@ struct MipPick
 	int m_weight;
 };
 
+// The levels a footprint radius squared of rho2 texels asks for, log2 from the float's own bits.
 static MipPick pickLevels(SharedTexture& tex, float rho2)
 {
 	float lambda = 0.f;

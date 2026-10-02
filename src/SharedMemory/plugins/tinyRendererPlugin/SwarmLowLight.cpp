@@ -32,8 +32,7 @@ inline float luma(const float* c)
 	return (0.2126f * c[0] + 0.7152f * c[1]) + 0.0722f * c[2];
 }
 
-// A field of grain blurred to `sigma` pixels into `field`: white Gaussian draws and the blur. The return is the factor
-// that puts back the blur's loss of variance, which for a separable kernel is the sum of its squared taps once per axis.
+// White Gaussian grain blurred to `sigma` pixels into `field`; returns the factor that puts back the blur's lost variance.
 float grainField(unsigned int seed, int width, int height, float sigma, int threads, float* field)
 {
 	const size_t numPixels = (size_t)width * height;
@@ -61,8 +60,7 @@ void SwarmLowLight::develop(unsigned char* rgb, int width, int height, const Set
 	if (numPixels <= 0)
 		return;
 
-	// Linear light from the bytes, white balanced; in near infrared one grey channel. Every buffer below is kept for the
-	// next frame and written in full before it is read.
+	// Linear light from the bytes, white balanced; in near infrared one grey channel.
 	static thread_local std::vector<float> lightBuffer, fineBuffer, yBuffer, sigmaBuffer, detailBuffer, keepBuffer, ySmoothBuffer;
 	static thread_local std::vector<float> cbBuffer, crBuffer, cbSmoothBuffer, crSmoothBuffer;
 	float* light = SwarmGrain::reuse(lightBuffer, (size_t)numPixels * 3);

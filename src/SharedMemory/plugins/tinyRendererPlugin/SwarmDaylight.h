@@ -120,8 +120,7 @@ struct SwarmAgx
 		const float kMinEv = -12.47393f;
 		const float kMaxEv = 4.026069f;
 #if defined(__GNUC__)
-		// The three channels as lanes of one vector: every lane runs the scalar steps below in the same order, and each
-		// IEEE operation rounds a lane as it rounds a scalar, so the bits are the same.
+		// The channels as vector lanes, each running the scalar steps below in order, so IEEE gives the same bits.
 		const SwarmLanes zero = {0.0f, 0.0f, 0.0f, 0.0f}, one = {1.0f, 1.0f, 1.0f, 1.0f}, tiny = {1e-10f, 1e-10f, 1e-10f, 1e-10f};
 		const SwarmLanes in0 = {kInset[0][0], kInset[1][0], kInset[2][0], 0.0f};
 		const SwarmLanes in1 = {kInset[0][1], kInset[1][1], kInset[2][1], 0.0f};
