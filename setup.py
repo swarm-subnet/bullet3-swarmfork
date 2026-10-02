@@ -178,11 +178,13 @@ if not _PGO_MODE:
 _PGO_FLAGS = ''
 if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
   if _compiler_accepts(_cc_argv(), '-fprofile-prefix-path=' + _SOURCE_ROOT):
-    _PGO_FLAGS = '-fprofile-dir=pgo_data -fprofile-prefix-path=' + _SOURCE_ROOT + ' '
+    # Absolute, so a trained process writes its profile here and not into whatever folder it ran in.
+    _PGO_FLAGS = '-fprofile-dir=' + _PGO_DIR + ' -fprofile-prefix-path=' + _SOURCE_ROOT + ' '
     if _PGO_MODE == 'generate':
       _PGO_FLAGS += '-fprofile-generate '
     else:
-      _PGO_FLAGS += '-fprofile-use -fprofile-correction '
+      # Code the training never ran is compiled as without a profile, not for size: the wheel serves every family.
+      _PGO_FLAGS += '-fprofile-use -fprofile-correction -fprofile-partial-training '
   else:
     print("swarm-bullet3: compiler rejects -fprofile-prefix-path, pgo disabled")
     _PGO_MODE = 'off'
