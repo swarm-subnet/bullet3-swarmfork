@@ -2246,11 +2246,13 @@ inline float shadowMapLit(const ShadowMap& map, const float point[3], const floa
 	// Inside the grid the same nine cells are read in the same order without a bounds check each.
 	if (iu >= 0 && iv >= 0 && iu + 2 < map.m_cols && iv + 2 < map.m_rows)
 	{
-		const float* cells = &map.m_depth[(size_t)iv * map.m_cols + iu];
-		for (int dv = 0; dv < 3; dv++, cells += map.m_cols)
+		for (int dv = 0; dv < 3; dv++)
+		{
+			const float* cells = &map.m_depth[(size_t)(iv + dv) * map.m_cols + iu];
 			for (int du = 0; du < 3; du++)
 				if (!(depth > cells[du]))
 					lit += weightV[dv] * weightU[du];
+		}
 		return lit;
 	}
 	for (int dv = 0; dv < 3; dv++)
