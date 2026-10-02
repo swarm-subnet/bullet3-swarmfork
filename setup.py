@@ -540,7 +540,8 @@ if _platform == "linux" or _platform == "linux2":
     _EMBREE_DIR = os.path.join('examples', 'ThirdPartyLibs', 'embree')
     _EMBREE_PREFIX = os.path.join(_EMBREE_DIR, 'prefix')
     # The script keeps prefix/ in step with its cache key and returns at once when it already matches.
-    subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))])
+    subprocess.check_call([os.path.abspath(os.path.join(_EMBREE_DIR, 'build_embree.sh'))],
+                          env=dict(os.environ, SWARM_BULLET3_PGO=_PGO_MODE))
     CXX_FLAGS += '-DSWARM_RAYCAST '
     sources = sources + ['src/SharedMemory/plugins/tinyRendererPlugin/SwarmRaycast.cpp',
                          'src/SharedMemory/plugins/tinyRendererPlugin/SwarmThermal.cpp',
