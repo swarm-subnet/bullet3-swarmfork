@@ -3798,6 +3798,9 @@ void moverRects(const std::vector<Instance*>& instances, const Camera& cam, int 
 			row0 = row < row0 ? row : row0;
 			row1 = row > row1 ? row : row1;
 		}
+		// Wholly behind the eye, it cannot show on the frame.
+		if (farthest <= 0.0f)
+			continue;
 		MoverRect rect;
 		if (!(nearest >= kMoverNear))
 		{
