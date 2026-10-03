@@ -63,6 +63,47 @@ inline SwarmLanes swarmLog2(SwarmLanes x)
 	const SwarmLanes atanh = y * (1.0f + y2 * (1.0f / 3.0f + y2 * (1.0f / 5.0f + y2 * (1.0f / 7.0f + y2 * (1.0f / 9.0f + y2 * (1.0f / 11.0f))))));
 	return __builtin_convertvector(e, SwarmLanes) + atanh * 2.8853900817779268f;
 }
+
+// Eight floats, eight ints, four doubles and four 64-bit ints in one vector register each, with per-lane IEEE arithmetic.
+typedef float SwarmLanes8 __attribute__((vector_size(32)));
+typedef int SwarmLaneMask8 __attribute__((vector_size(32)));
+typedef double SwarmDoubles4 __attribute__((vector_size(32)));
+typedef long long SwarmLongs4 __attribute__((vector_size(32)));
+
+// Per lane: a where the mask is set, b elsewhere.
+inline SwarmLanes8 swarmSelect(SwarmLaneMask8 mask, SwarmLanes8 a, SwarmLanes8 b)
+{
+	return (SwarmLanes8)((mask & (SwarmLaneMask8)a) | (~mask & (SwarmLaneMask8)b));
+}
+
+// swarmLog2 on each of eight lanes above zero: the same steps on the same bits.
+inline SwarmLanes8 swarmLog2(SwarmLanes8 x)
+{
+	const SwarmLaneMask8 bits = (SwarmLaneMask8)x;
+	const SwarmLaneMask8 e = ((bits >> 23) & 255) - 127;
+	const SwarmLanes8 m = (SwarmLanes8)((bits & 0x007fffff) | 0x3f800000);
+	const SwarmLanes8 y = (m - 1.0f) / (m + 1.0f);
+	const SwarmLanes8 y2 = y * y;
+	const SwarmLanes8 atanh = y * (1.0f + y2 * (1.0f / 3.0f + y2 * (1.0f / 5.0f + y2 * (1.0f / 7.0f + y2 * (1.0f / 9.0f + y2 * (1.0f / 11.0f))))));
+	return __builtin_convertvector(e, SwarmLanes8) + atanh * 2.8853900817779268f;
+}
+
+// swarmExp on each of four lanes: the same reduction, the same series and the same exponent bits as one call.
+inline SwarmDoubles4 swarmExp(SwarmDoubles4 x)
+{
+	const double ln2 = 0.6931471805599453;
+	const SwarmDoubles4 zero = {0.0, 0.0, 0.0, 0.0};
+	const SwarmLongs4 outside = ~((x > -0.345) & (x < 0.345));
+	const SwarmLongs4 below = x < 0.0;
+	const SwarmDoubles4 half = (SwarmDoubles4)((below & (SwarmLongs4)(zero - 0.5)) | (~below & (SwarmLongs4)(zero + 0.5)));
+	SwarmLongs4 n = __builtin_convertvector(x / ln2 + half, SwarmLongs4) & outside;
+	const SwarmLongs4 under = n < -1000;
+	n = n > 1000 ? (SwarmLongs4){1000, 1000, 1000, 1000} : n;
+	const SwarmDoubles4 r = x - __builtin_convertvector(n, SwarmDoubles4) * ln2;
+	const SwarmDoubles4 p = 1.0 + r * (1.0 + r * (1.0 / 2.0 + r * (1.0 / 6.0 + r * (1.0 / 24.0 + r * (1.0 / 120.0 + r * (1.0 / 720.0 + r * (1.0 / 5040.0 + r * (1.0 / 40320.0 + r * (1.0 / 362880.0)))))))));
+	const SwarmDoubles4 scaled = p * (SwarmDoubles4)((n + 1023) << 52);
+	return (SwarmDoubles4)(~under & (SwarmLongs4)scaled);
+}
 #endif
 
 // atan(t) for |t| <= 1, an odd polynomial good to about 1e-5 radians.
@@ -156,6 +197,38 @@ struct SwarmAgx
 		}
 #endif
 	}
+
+#if defined(__GNUC__)
+	// apply on eight colours at once, one colour per lane and one vector per channel: each lane runs the scalar steps
+	// above in their order, so IEEE gives each colour the bits apply gives it.
+	static void apply8(const SwarmLanes8 linear[3], SwarmLanes8 display[3])
+	{
+		static const float kInset[3][3] = {{0.544814746488245f, 0.373787398372697f, 0.0813978551390581f},
+										   {0.140416948464053f, 0.754137554567394f, 0.105445496968552f},
+										   {0.0888104196149096f, 0.178871756420858f, 0.732317823964232f}};
+		static const float kOutset[3][3] = {{1.96488741169489f, -0.855988495690215f, -0.108898916004672f},
+											{-0.299313364904742f, 1.32639796461980f, -0.0270845997150571f},
+											{-0.164352742528393f, -0.238183969428088f, 1.40253671195648f}};
+		const float kMinEv = -12.47393f;
+		const float kMaxEv = 4.026069f;
+		const SwarmLanes8 zero = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}, one = zero + 1.0f, tiny = zero + 1e-10f;
+		SwarmLanes8 encoded[3];
+		for (int i = 0; i < 3; i++)
+		{
+			SwarmLanes8 v = (kInset[i][0] * linear[0] + kInset[i][1] * linear[1]) + kInset[i][2] * linear[2];
+			v = swarmSelect(v > tiny, v, tiny);
+			v = (swarmLog2(v) - kMinEv) / (kMaxEv - kMinEv);
+			v = swarmSelect(v < zero, zero, swarmSelect(v > one, one, v));
+			const SwarmLanes8 x2 = v * v, x4 = x2 * x2;
+			encoded[i] = ((((15.5f * x4 * x2 - 40.14f * x4 * v) + 31.96f * x4) - 6.868f * x2 * v) + 0.4298f * x2) + (0.1191f * v - 0.00232f);
+		}
+		for (int i = 0; i < 3; i++)
+		{
+			const SwarmLanes8 v = (kOutset[i][0] * encoded[0] + kOutset[i][1] * encoded[1]) + kOutset[i][2] * encoded[2];
+			display[i] = swarmSelect(v < zero, zero, swarmSelect(v > one, one, v));
+		}
+	}
+#endif
 
 	// The byte for a display value: rounded to nearest, as the sky's bytes are.
 	static unsigned char toByte(float display)

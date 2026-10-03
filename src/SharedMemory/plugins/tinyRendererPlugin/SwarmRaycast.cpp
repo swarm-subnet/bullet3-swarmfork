@@ -3087,26 +3087,43 @@ float paneLight(const SwarmRaycastShading& shading, const float normal[3], const
 	return 1.0f - reflect;
 }
 
-// Linear light to the byte: haze by distance towards the horizon colour, exposure, the film curve.
-void daylightWrite(const SwarmRaycastShading& shading, const float litIn[3], const float viewDir[3], float distance, unsigned char out[3])
+// A daylight colour on its way to the byte: its linear light, the horizon colour its haze blends towards and its distance.
+struct DaylightColour
 {
-	float lit[3] = {litIn[0], litIn[1], litIn[2]};
+	float m_lit[3];
+	float m_horizon[3];
+	float m_distance;
+};
+
+// Everything the byte of a lit colour needs from the scene: the horizon colour is only looked up under haze.
+void daylightPrepare(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, DaylightColour& colour)
+{
+	for (int i = 0; i < 3; i++)
+		colour.m_lit[i] = lit[i];
+	colour.m_distance = distance;
+	if (!(shading.m_hazeDistance > 0.0f))
+		return;
+	if (shading.m_sky)
+	{
+		// The haze takes the sky's colour just above the horizon in the direction of view.
+		float level[3] = {viewDir[0], viewDir[1], viewDir[2]};
+		level[shading.m_glint.m_upAxis] = 0.02f;
+		shading.m_sky->radiance(level[0], level[1], level[2], colour.m_horizon);
+	}
+	else
+		for (int i = 0; i < 3; i++)
+			colour.m_horizon[i] = swarmUnitToLinear(shading.m_glint.m_skyHorizon[i]);
+}
+
+// Linear light to the byte: haze by distance towards the horizon colour, exposure, the film curve.
+void daylightFinish(const SwarmRaycastShading& shading, const DaylightColour& colour, unsigned char out[3])
+{
+	float lit[3] = {colour.m_lit[0], colour.m_lit[1], colour.m_lit[2]};
 	if (shading.m_hazeDistance > 0.0f)
 	{
-		const float haze = 1.0f - (float)swarmExp(-(double)distance / (double)shading.m_hazeDistance);
-		float horizonColour[3];
-		if (shading.m_sky)
-		{
-			// The haze takes the sky's colour just above the horizon in the direction of view.
-			float level[3] = {viewDir[0], viewDir[1], viewDir[2]};
-			level[shading.m_glint.m_upAxis] = 0.02f;
-			shading.m_sky->radiance(level[0], level[1], level[2], horizonColour);
-		}
-		else
-			for (int i = 0; i < 3; i++)
-				horizonColour[i] = swarmUnitToLinear(shading.m_glint.m_skyHorizon[i]);
+		const float haze = 1.0f - (float)swarmExp(-(double)colour.m_distance / (double)shading.m_hazeDistance);
 		for (int i = 0; i < 3; i++)
-			lit[i] = lit[i] + (horizonColour[i] - lit[i]) * haze;
+			lit[i] = lit[i] + (colour.m_horizon[i] - lit[i]) * haze;
 	}
 
 	float exposed[3], display[3];
@@ -3115,6 +3132,66 @@ void daylightWrite(const SwarmRaycastShading& shading, const float litIn[3], con
 	SwarmAgx::apply(exposed, display);
 	for (int i = 0; i < 3; i++)
 		out[i] = SwarmAgx::toByte(display[i]);
+}
+
+// The byte of a lit colour in one go.
+void daylightWrite(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, unsigned char out[3])
+{
+	DaylightColour colour;
+	daylightPrepare(shading, lit, viewDir, distance, colour);
+	daylightFinish(shading, colour, out);
+}
+
+// daylightFinish for many colours: eight at a time in vector lanes where the compiler has them, each lane the steps of
+// one colour in their order, so every byte is the one daylightFinish writes.
+void daylightFinishAll(const SwarmRaycastShading& shading, const DaylightColour* colours, int count, unsigned char* const* outs)
+{
+	int k = 0;
+#if defined(__GNUC__)
+	const bool haze = shading.m_hazeDistance > 0.0f;
+	for (; k + 8 <= count; k += 8)
+	{
+		SwarmLanes8 lit[3], display[3];
+		for (int i = 0; i < 3; i++)
+			for (int l = 0; l < 8; l++)
+				lit[i][l] = colours[k + l].m_lit[i];
+		if (haze)
+		{
+			SwarmDoubles4 low, high;
+			for (int l = 0; l < 4; l++)
+			{
+				low[l] = -(double)colours[k + l].m_distance;
+				high[l] = -(double)colours[k + 4 + l].m_distance;
+			}
+			low = swarmExp(low / (double)shading.m_hazeDistance);
+			high = swarmExp(high / (double)shading.m_hazeDistance);
+			SwarmLanes8 haze8;
+			for (int l = 0; l < 4; l++)
+			{
+				haze8[l] = 1.0f - (float)low[l];
+				haze8[4 + l] = 1.0f - (float)high[l];
+			}
+			for (int i = 0; i < 3; i++)
+			{
+				SwarmLanes8 horizon;
+				for (int l = 0; l < 8; l++)
+					horizon[l] = colours[k + l].m_horizon[i];
+				lit[i] = lit[i] + (horizon - lit[i]) * haze8;
+			}
+		}
+		for (int i = 0; i < 3; i++)
+			lit[i] = lit[i] * shading.m_exposure;
+		SwarmAgx::apply8(lit, display);
+		for (int i = 0; i < 3; i++)
+		{
+			const SwarmLaneMask8 bytes = __builtin_convertvector(display[i] * 255.0f + 0.5f, SwarmLaneMask8);
+			for (int l = 0; l < 8; l++)
+				outs[k + l][i] = (unsigned char)bytes[l];
+		}
+	}
+#endif
+	for (; k < count; k++)
+		daylightFinish(shading, colours[k], outs[k]);
 }
 
 // Daylight shading of one hit, in linear light: sky by direction plus sun, glass reflecting the sky, haze by distance, the film curve on the write.
@@ -3198,7 +3275,22 @@ struct Sample
 	unsigned char m_rgb[3];
 	// ER_SWARM_THERMAL: the in-band radiance reaching the camera along the ray, the sky's on a miss.
 	float m_radiance;
+	// A daylight colour left for its tile's batched write instead of written to m_rgb, when the caller asks for that.
+	bool m_deferred;
+	DaylightColour m_colour;
 };
+
+// A lit daylight colour's byte now, or the colour kept in the sample for its tile's batched write.
+inline void daylightOut(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, Sample& out, bool defer)
+{
+	if (!defer)
+	{
+		daylightWrite(shading, lit, viewDir, distance, out.m_rgb);
+		return;
+	}
+	daylightPrepare(shading, lit, viewDir, distance, out.m_colour);
+	out.m_deferred = true;
+}
 
 // Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
 // id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
@@ -3764,11 +3856,12 @@ void treesHit(const TileJob& job, RTCRayHit& rayhit, const FoundHit& found, RTCI
 // replaces the search for the first hit: shaded as it stands, a miss, or searched with its own along-ray reach.
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0,
-			  const FoundHit* found = 0, SurfaceMemo* memo = 0)
+			  const FoundHit* found = 0, SurfaceMemo* memo = 0, bool deferColour = false)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
+	out.m_deferred = false;
 	if (landed)
 		landed[0] = landed[1] = landed[2] = NAN;
 
@@ -4013,7 +4106,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			}
 			for (int i = 0; i < 3; i++)
 				lit[i] = coverage * lit[i] + (1.0f - coverage) * behind[i];
-			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			daylightOut(*shading, lit, dir, t, out, deferColour);
 			return true;
 		}
 	}
@@ -4046,7 +4139,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
 				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
 			}
-			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			daylightOut(*shading, lit, dir, t, out, deferColour);
 			return true;
 		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
@@ -4115,10 +4208,19 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				lit[i] += weight[i] * behind[i];
 			break;
 		}
-		daylightWrite(*shading, lit, dir, t, out.m_rgb);
+		daylightOut(*shading, lit, dir, t, out, deferColour);
 		return true;
 	}
 
+	if (deferColour && shading->m_daylight)
+	{
+		// shadeDaylight's steps, with the write left for the tile.
+		float normal[3], base[3], lit[3];
+		surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+		daylightLight(*shading, surface, normal, base, dir, shadow, lit);
+		daylightOut(*shading, lit, dir, t, out, true);
+		return true;
+	}
 	const float point[3] = {hx, hy, hz};
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
 	return true;
@@ -4904,6 +5006,11 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
 	SurfaceMemo memo;
 	memo.m_valid = false;
+	// Daylight colours wait here and are written together once the tile's samples are in.
+	const bool defer = job.m_shading && job.m_shading->m_daylight && !radiance;
+	DaylightColour waiting[kTileSize * kTileSize];
+	unsigned char* waitingOut[kTileSize * kTileSize];
+	int numWaiting = 0;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, job.m_height);
@@ -4917,7 +5024,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			if (job.m_raster)
 				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
 			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo);
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo, defer);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
@@ -4937,11 +5044,18 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				scratch->m_hits[offset] = sample.m_hit;
 				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
-			if (sample.m_shaded && !radiance)
+			if (sample.m_shaded && !radiance && sample.m_deferred)
+			{
+				waiting[numWaiting] = sample.m_colour;
+				waitingOut[numWaiting++] = &target.m_rgb[offset * 3];
+			}
+			else if (sample.m_shaded && !radiance)
 				for (int i = 0; i < 3; i++)
 					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
 		}
 	}
+	if (numWaiting)
+		daylightFinishAll(*job.m_shading, waiting, numWaiting, waitingOut);
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
