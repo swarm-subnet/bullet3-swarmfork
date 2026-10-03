@@ -7,6 +7,9 @@
 #include <iostream>
 #include <sstream>
 #include "Bullet3Common/b3Logging.h"
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace TinyRender
 {
@@ -857,6 +860,192 @@ TGAColor Model::diffuseFiltered(Vec2f uvf, Vec2f duvdx, Vec2f duvdy, int maxTaps
 	for (int i = 0; i < (int)bytespp; i++)
 		out.bgra[i] = (unsigned char)((sum[i] + taps / 2) / taps);
 	return out;
+}
+
+#if defined(__AVX2__)
+typedef float FilterLanes __attribute__((vector_size(32)));
+typedef int FilterInts __attribute__((vector_size(32)));
+typedef long long FilterLongs __attribute__((vector_size(32)));
+typedef int FilterInts4 __attribute__((vector_size(16)));
+typedef unsigned FilterUints __attribute__((vector_size(32)));
+
+// Per lane: a where the mask is set, b elsewhere.
+static inline FilterLanes filterSelect(FilterInts mask, FilterLanes a, FilterLanes b)
+{
+	return (FilterLanes)((mask & (FilterInts)a) | (~mask & (FilterInts)b));
+}
+
+static inline FilterInts filterSelect(FilterInts mask, FilterInts a, FilterInts b)
+{
+	return (mask & a) | (~mask & b);
+}
+
+// wrapUnit on each lane.
+static inline FilterLanes wrapUnit8(FilterLanes value)
+{
+	const FilterLanes zero = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+	FilterLanes f = value - (FilterLanes)_mm256_round_ps((__m256)value, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+	f = filterSelect(f != f, filterSelect(value != value, value, zero), f);
+	return filterSelect(f < zero, f + 1.f, f);
+}
+
+// sampleBilinear on each lane, from the level of its own texture each lane names. A texel's bytes come from one
+// four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it.
+static inline void bilinear8(SharedTexture* const tex[8], FilterInts level, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4])
+{
+	FilterLongs baseLo, baseHi;
+	FilterInts w, h;
+	for (int l = 0; l < 8; l++)
+	{
+		TGAImage& img = level[l] == 0 ? tex[l]->img_ : *tex[l]->mips_[level[l] - 1];
+		const long long base = (long long)(size_t)img.buffer();
+		if (l < 4)
+			baseLo[l] = base;
+		else
+			baseHi[l - 4] = base;
+		w[l] = img.get_width();
+		h[l] = img.get_height();
+	}
+	const FilterLanes x = u * __builtin_convertvector(w, FilterLanes) - 0.5f;
+	const FilterLanes y = v * __builtin_convertvector(h, FilterLanes) - 0.5f;
+	const FilterLanes fx = (FilterLanes)_mm256_round_ps((__m256)x, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+	const FilterLanes fy = (FilterLanes)_mm256_round_ps((__m256)y, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+	const FilterInts wx = __builtin_convertvector((x - fx) * 256.f, FilterInts);
+	const FilterInts wy = __builtin_convertvector((y - fy) * 256.f, FilterInts);
+	const FilterInts x0r = __builtin_convertvector(fx, FilterInts), y0r = __builtin_convertvector(fy, FilterInts);
+	const FilterInts zero = {0, 0, 0, 0, 0, 0, 0, 0};
+	const FilterInts xin = (x0r >= 0) & (x0r < w), yin = (y0r >= 0) & (y0r < h);
+	FilterInts x0 = filterSelect(xin, x0r, filterSelect(x0r == -1, w - 1, x0r));
+	FilterInts y0 = filterSelect(yin, y0r, filterSelect(y0r == -1, h - 1, y0r));
+	if (_mm256_movemask_ps((__m256)((~xin & (x0r != -1)) | (~yin & (y0r != -1)))))
+		for (int l = 0; l < 8; l++)
+		{
+			x0[l] = wrapTexel(x0r[l], w[l]);
+			y0[l] = wrapTexel(y0r[l], h[l]);
+		}
+	const FilterInts x1 = filterSelect(x0 + 1 == w, zero, x0 + 1), y1 = filterSelect(y0 + 1 == h, zero, y0 + 1);
+	const FilterInts lastTexel = (w * h - 1) * bpp;
+	const FilterInts at[4] = {(x0 + y0 * w) * bpp, (x1 + y0 * w) * bpp, (x0 + y1 * w) * bpp, (x1 + y1 * w) * bpp};
+	FilterInts texel[4];
+	for (int q = 0; q < 4; q++)
+	{
+		const FilterInts early = (at[q] == lastTexel) & (bpp == 3);
+		const FilterInts from = at[q] - (early & 1);
+		const FilterInts4 lo = {from[0], from[1], from[2], from[3]}, hi = {from[4], from[5], from[6], from[7]};
+		const __m128i a = _mm256_i64gather_epi32((const int*)0, (__m256i)(baseLo + __builtin_convertvector(lo, FilterLongs)), 1);
+		const __m128i b = _mm256_i64gather_epi32((const int*)0, (__m256i)(baseHi + __builtin_convertvector(hi, FilterLongs)), 1);
+		const FilterInts bytes = (FilterInts)_mm256_set_m128i(b, a);
+		texel[q] = filterSelect(early, (FilterInts)((FilterUints)bytes >> 8), bytes);
+	}
+	const FilterInts w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy), w01 = (256 - wx) * wy, w11 = wx * wy;
+	for (int c = 0; c < 4; c++)
+	{
+		const int s = 8 * c;
+		out[c] = (((texel[0] >> s) & 255) * w00 + ((texel[1] >> s) & 255) * w10 + ((texel[2] >> s) & 255) * w01 + ((texel[3] >> s) & 255) * w11 + 32768) >> 16;
+	}
+}
+
+// diffuseFiltered on eight reads with maxTaps above one, every lane its read's steps in their order.
+static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f* duvdx, const Vec2f* duvdy, int maxTaps, TGAColor* out)
+{
+	FilterLanes u, v, dx0, dx1, dy0, dy1, wf, hf;
+	FilterInts last, bpp;
+	for (int l = 0; l < 8; l++)
+	{
+		u[l] = uvf[l][0], v[l] = uvf[l][1];
+		dx0[l] = duvdx[l][0], dx1[l] = duvdx[l][1], dy0[l] = duvdy[l][0], dy1[l] = duvdy[l][1];
+		wf[l] = (float)tex[l]->img_.get_width(), hf[l] = (float)tex[l]->img_.get_height();
+		last[l] = (int)tex[l]->mips_.size();
+		bpp[l] = tex[l]->img_.get_bytespp();
+	}
+	const FilterLanes zf = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+	const FilterInts one = {1, 1, 1, 1, 1, 1, 1, 1}, zero = one - 1;
+	u = wrapUnit8(u);
+	v = wrapUnit8(v);
+	const FilterLanes sx = dx0 * wf, tx = dx1 * hf, sy = dy0 * wf, ty = dy1 * hf;
+	const FilterLanes rx2 = sx * sx + tx * tx, ry2 = sy * sy + ty * ty;
+	const FilterLanes rho2 = filterSelect(rx2 > ry2, rx2, ry2);
+	const FilterInts xMajor = rx2 >= ry2;
+	const FilterLanes major2 = filterSelect(xMajor, rx2, ry2), minor2 = filterSelect(xMajor, ry2, rx2);
+	const FilterLanes ratio = (FilterLanes)_mm256_sqrt_ps((__m256)(major2 / minor2));
+	FilterInts taps = __builtin_convertvector(ratio, FilterInts);
+	taps = filterSelect(__builtin_convertvector(taps, FilterLanes) < ratio, taps + 1, taps);
+	const FilterInts tapLimit = one * maxTaps;
+	taps = filterSelect(taps > tapLimit, tapLimit, filterSelect(taps < one, one, taps));
+	taps = filterSelect((minor2 > zf) & (major2 > minor2), taps, one);
+	const FilterLanes tapsf = __builtin_convertvector(taps, FilterLanes);
+	const FilterLanes perTap2 = major2 / (tapsf * tapsf);
+	const FilterLanes rho = filterSelect(taps > one, filterSelect(perTap2 > minor2, perTap2, minor2), rho2);
+	const FilterLanes along0 = filterSelect(xMajor, dx0, dy0), along1 = filterSelect(xMajor, dx1, dy1);
+	// pickLevels on each lane.
+	const FilterInts bits = (FilterInts)rho;
+	const FilterLanes mant = (FilterLanes)((bits & 0x007fffff) | 0x3f800000);
+	const FilterLanes lambda = filterSelect(rho > 1.f, 0.5f * (__builtin_convertvector(((bits >> 23) & 255) - 127, FilterLanes) + (mant - 1.f)), zf);
+	FilterInts level = __builtin_convertvector(lambda, FilterInts);
+	FilterLanes frac = lambda - __builtin_convertvector(level, FilterLanes);
+	const FilterInts over = level >= last;
+	level = filterSelect(over, last, level);
+	frac = filterSelect(over, zf, frac);
+	const FilterInts weight = __builtin_convertvector(frac * 256.f, FilterInts);
+	const FilterInts coarser = filterSelect(level + 1 > last, last, level + 1);
+	const bool blend = _mm256_movemask_ps((__m256)(weight != 0)) != 0;
+	int most = 1;
+	for (int l = 0; l < 8; l++)
+		most = taps[l] > most ? taps[l] : most;
+	FilterInts sum[4] = {zero, zero, zero, zero};
+	for (int k = 0; k < most; k++)
+	{
+		const FilterLanes f = ((float)k + 0.5f) / tapsf - 0.5f;
+		const FilterInts many = taps > one;
+		const FilterLanes uk = filterSelect(many, wrapUnit8(u + along0 * f), u), vk = filterSelect(many, wrapUnit8(v + along1 * f), v);
+		FilterInts a[4], b[4];
+		bilinear8(tex, level, uk, vk, bpp, a);
+		if (blend)
+		{
+			bilinear8(tex, coarser, uk, vk, bpp, b);
+			for (int c = 0; c < 4; c++)
+				a[c] = filterSelect(weight != 0, (a[c] * (256 - weight) + b[c] * weight + 128) >> 8, a[c]);
+		}
+		const FilterInts active = (zero + k) < taps;
+		for (int c = 0; c < 4; c++)
+			sum[c] += filterSelect(active, a[c], zero);
+	}
+	for (int c = 0; c < 4; c++)
+	{
+		// Whole numbers under 2^24 divide exactly in float, so the truncated quotient is the integer division's.
+		const FilterInts many = __builtin_convertvector(__builtin_convertvector(sum[c] + (taps >> 1), FilterLanes) / tapsf, FilterInts);
+		const FilterInts byte = filterSelect(taps > one, many, sum[c]);
+		for (int l = 0; l < 8; l++)
+			out[l].bgra[c] = c < bpp[l] ? (unsigned char)byte[l] : 0;
+	}
+	for (int l = 0; l < 8; l++)
+		out[l].bytespp = (unsigned char)bpp[l];
+}
+#endif
+
+void Model::diffuseFilteredMany(Model* const* models, const Vec2f* uv, const Vec2f* duvdx, const Vec2f* duvdy, int count, int maxTaps, TGAColor* out)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	for (; maxTaps > 1 && k + 8 <= count; k += 8)
+	{
+		SharedTexture* tex[8];
+		bool lanes = true;
+		for (int l = 0; l < 8 && lanes; l++)
+		{
+			tex[l] = models[k + l]->m_diffuse;
+			lanes = tex[l] && tex[l]->mipsBuilt_ && tex[l]->img_.get_width() && tex[l]->img_.get_height() &&
+					(tex[l]->img_.get_bytespp() == 3 || tex[l]->img_.get_bytespp() == 4);
+		}
+		if (lanes)
+			filtered8(tex, uv + k, duvdx + k, duvdy + k, maxTaps, out + k);
+		else
+			for (int l = 0; l < 8; l++)
+				out[k + l] = models[k + l]->diffuseFiltered(uv[k + l], duvdx[k + l], duvdy[k + l], maxTaps);
+	}
+#endif
+	for (; k < count; k++)
+		out[k] = models[k]->diffuseFiltered(uv[k], duvdx[k], duvdy[k], maxTaps);
 }
 
 TGAColor Model::diffuseMean(Vec2f uvf)

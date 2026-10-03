@@ -2978,13 +2978,12 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
-// The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
-void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
-			   float normal[3], float base[3], TinyRender::Vec2f* uvOut = 0)
+// A hit's shading normal turned to the camera and its texture coordinates, from its barycentric (u, v): the surface
+// up to its texture read.
+void surfaceFrame(const HitSurface& surface, float u, float v, const float faceNormal[3], float normal[3], TinyRender::Vec2f& uv)
 {
-	TinyRender::Model* model = surface.m_model;
-	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
-	TinyRender::Vec2f uv(0.0f, 0.0f);
+	const float weights[3] = {1.0f - u - v, u, v};
+	uv = TinyRender::Vec2f(0.0f, 0.0f);
 	for (int i = 0; i < 3; i++)
 		normal[i] = 0.0f;
 	for (int j = 0; j < 3; j++)
@@ -3006,13 +3005,26 @@ void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNor
 	if (dot3(normal, faceNormal) < 0.0f)
 		for (int i = 0; i < 3; i++)
 			normal[i] = -normal[i];
+}
 
-	TGAColor color = filtered
-						 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
-						 : model->diffuse(uv);
-	const TinyRender::Vec4f& rgba = model->getColorRGBA();
+// The linear tint of a surface from the texel read at its hit: texture times object colour.
+void surfaceTint(const HitSurface& surface, TGAColor color, float base[3])
+{
+	const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
 	for (int i = 0; i < 3; i++)
 		base[i] = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+}
+
+// The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
+void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
+			   float normal[3], float base[3], TinyRender::Vec2f* uvOut = 0)
+{
+	TinyRender::Vec2f uv;
+	surfaceFrame(surface, hit.u, hit.v, faceNormal, normal, uv);
+	TGAColor color = filtered
+						 ? surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
+						 : surface.m_model->diffuse(uv);
+	surfaceTint(surface, color, base);
 	if (uvOut)
 		*uvOut = uv;
 }
@@ -3265,6 +3277,21 @@ struct HitId
 
 // What one ray brings back: the clip depth and its reciprocal eye depth, the segmentation id and
 // triangle of its hit, and the shaded colour when the job carries a light and the body is known.
+// What a daylight hit's shading needs once its tile reads the textures: the surface, where on its triangle the hit
+// lies, the face normal, the texture footprint, the view direction, the shadow and the distance.
+struct ShadeWait
+{
+	HitSurface m_surface;
+	float m_u;
+	float m_v;
+	float m_faceNormal[3];
+	float m_duvdx[2];
+	float m_duvdy[2];
+	float m_dir[3];
+	float m_shadow;
+	float m_distance;
+};
+
 struct Sample
 {
 	float m_depth;
@@ -3278,6 +3305,9 @@ struct Sample
 	// A daylight colour left for its tile's batched write instead of written to m_rgb, when the caller asks for that.
 	bool m_deferred;
 	DaylightColour m_colour;
+	// A daylight hit whose shading waits for its tile, so the tile reads its samples' textures together.
+	bool m_shadeDeferred;
+	ShadeWait m_shade;
 };
 
 // A lit daylight colour's byte now, or the colour kept in the sample for its tile's batched write.
@@ -3862,6 +3892,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	const SwarmRaycastShading* shading = job.m_shading;
 	const bool filtered = job.m_filtered;
 	out.m_deferred = false;
+	out.m_shadeDeferred = false;
 	if (landed)
 		landed[0] = landed[1] = landed[2] = NAN;
 
@@ -4214,11 +4245,24 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 
 	if (deferColour && shading->m_daylight)
 	{
-		// shadeDaylight's steps, with the write left for the tile.
-		float normal[3], base[3], lit[3];
-		surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
-		daylightLight(*shading, surface, normal, base, dir, shadow, lit);
-		daylightOut(*shading, lit, dir, t, out, true);
+		// shadeDaylight's steps are left for the tile, which reads the textures of its samples together.
+		ShadeWait& wait = out.m_shade;
+		wait.m_surface = surface;
+		wait.m_u = rayhit.hit.u;
+		wait.m_v = rayhit.hit.v;
+		for (int i = 0; i < 3; i++)
+		{
+			wait.m_faceNormal[i] = faceNormal[i];
+			wait.m_dir[i] = dir[i];
+		}
+		for (int i = 0; i < 2; i++)
+		{
+			wait.m_duvdx[i] = duvdx[i];
+			wait.m_duvdy[i] = duvdy[i];
+		}
+		wait.m_shadow = shadow;
+		wait.m_distance = t;
+		out.m_shadeDeferred = true;
 		return true;
 	}
 	const float point[3] = {hx, hy, hz};
@@ -5011,6 +5055,9 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	DaylightColour waiting[kTileSize * kTileSize];
 	unsigned char* waitingOut[kTileSize * kTileSize];
 	int numWaiting = 0;
+	ShadeWait shades[kTileSize * kTileSize];
+	unsigned char* shadeOut[kTileSize * kTileSize];
+	int numShades = 0;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, job.m_height);
@@ -5044,7 +5091,12 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				scratch->m_hits[offset] = sample.m_hit;
 				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
-			if (sample.m_shaded && !radiance && sample.m_deferred)
+			if (sample.m_shaded && !radiance && sample.m_shadeDeferred)
+			{
+				shades[numShades] = sample.m_shade;
+				shadeOut[numShades++] = &target.m_rgb[offset * 3];
+			}
+			else if (sample.m_shaded && !radiance && sample.m_deferred)
 			{
 				waiting[numWaiting] = sample.m_colour;
 				waitingOut[numWaiting++] = &target.m_rgb[offset * 3];
@@ -5052,6 +5104,37 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			else if (sample.m_shaded && !radiance)
 				for (int i = 0; i < 3; i++)
 					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
+		}
+	}
+	if (numShades)
+	{
+		// The waiting hits' normals and texture coordinates, their textures read together, then their light, which
+		// joins the colours waiting for the write.
+		TinyRender::Model* models[kTileSize * kTileSize];
+		TinyRender::Vec2f uvs[kTileSize * kTileSize], duvdx[kTileSize * kTileSize], duvdy[kTileSize * kTileSize];
+		TGAColor texels[kTileSize * kTileSize];
+		float normals[kTileSize * kTileSize][3];
+		for (int i = 0; i < numShades; i++)
+		{
+			const ShadeWait& wait = shades[i];
+			models[i] = wait.m_surface.m_model;
+			surfaceFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+			duvdx[i] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
+			duvdy[i] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
+		}
+		if (job.m_filtered)
+			TinyRender::Model::diffuseFilteredMany(models, uvs, duvdx, duvdy, numShades, 4, texels);
+		else
+			for (int i = 0; i < numShades; i++)
+				texels[i] = models[i]->diffuse(uvs[i]);
+		for (int i = 0; i < numShades; i++)
+		{
+			const ShadeWait& wait = shades[i];
+			float base[3], lit[3];
+			surfaceTint(wait.m_surface, texels[i], base);
+			daylightLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
+			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting]);
+			waitingOut[numWaiting++] = shadeOut[i];
 		}
 	}
 	if (numWaiting)
