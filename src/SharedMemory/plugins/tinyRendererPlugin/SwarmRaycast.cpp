@@ -3654,6 +3654,23 @@ struct FoundHit
 	RTCHit m_hit;
 	const TreeCandidate* m_trees;
 	int m_numTrees;
+	// The sample's camera ray as painting worked it out, so it is not worked out again: false when there is none.
+	bool m_ray;
+	const float* m_dir;
+	const float* m_rawDir;
+	float m_tNear;
+	float m_length;
+};
+
+// The last triangle a tile's rays landed on and what resolving it gave, for the next sample that lands on it too.
+struct SurfaceMemo
+{
+	bool m_valid;
+	unsigned m_key[5];
+	bool m_known;
+	int m_segmentation;
+	HitSurface m_surface;
+	float m_woundNormal[3];
 };
 
 // Nearer entry first, then the lesser batch and placement, so the order never depends on the order the trees were filed.
@@ -3747,7 +3764,7 @@ void treesHit(const TileJob& job, RTCRayHit& rayhit, const FoundHit& found, RTCI
 // replaces the search for the first hit: shaded as it stands, a miss, or searched with its own along-ray reach.
 bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
 			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0,
-			  const FoundHit* found = 0)
+			  const FoundHit* found = 0, SurfaceMemo* memo = 0)
 {
 	const Camera& cam = setup.m_cam;
 	const SwarmRaycastShading* shading = job.m_shading;
@@ -3756,7 +3773,19 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		landed[0] = landed[1] = landed[2] = NAN;
 
 	float dir[3], rawDir[3], tNear, length;
-	if (!pixelRay(cam, ndcX, ndcY, dir, rawDir, tNear, length))
+	if (found)
+	{
+		if (!found->m_ray)
+			return false;
+		for (int i = 0; i < 3; i++)
+		{
+			dir[i] = found->m_dir[i];
+			rawDir[i] = found->m_rawDir[i];
+		}
+		tNear = found->m_tNear;
+		length = found->m_length;
+	}
+	else if (!pixelRay(cam, ndcX, ndcY, dir, rawDir, tNear, length))
 		return false;
 	// The sky along the ray, only for a ray that ends on it: a miss, an unknown body, or what a thermal veil leaves.
 	const bool thermalSky = shading && shading->m_thermal;
@@ -3811,8 +3840,39 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	out.m_inverseEyeDepth = 1.0f / zEye;
 
 	int segmentation = -1;
-	HitSurface surface;
-	const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, shading ? &surface : 0);
+	HitSurface ownSurface;
+	HitSurface& surface = memo && shading ? memo->m_surface : ownSurface;
+	float ownWound[3];
+	float* woundNormal = memo && shading ? memo->m_woundNormal : ownWound;
+	bool known;
+	const unsigned key[5] = {rayhit.hit.instID[0], rayhit.hit.geomID, rayhit.hit.primID, rayhit.hit.instID[1], rayhit.hit.instPrimID[1]};
+	if (memo && shading && memo->m_valid && memcmp(memo->m_key, key, sizeof(key)) == 0)
+	{
+		known = memo->m_known;
+		segmentation = memo->m_segmentation;
+	}
+	else
+	{
+		known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, shading ? &surface : 0);
+		// The triangle's own normal, kept as wound for the barycentric solve.
+		if (shading && known)
+		{
+			float e1[3], e2[3];
+			for (int i = 0; i < 3; i++)
+			{
+				e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+				e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+			}
+			cross3(e1, e2, woundNormal);
+		}
+		if (memo && shading)
+		{
+			memo->m_valid = true;
+			memcpy(memo->m_key, key, sizeof(key));
+			memo->m_known = known;
+			memo->m_segmentation = segmentation;
+		}
+	}
 	out.m_segmentation = segmentation;
 	out.m_hit.m_inst = rayhit.hit.instID[0];
 	out.m_hit.m_geom = rayhit.hit.geomID;
@@ -3830,15 +3890,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		return true;
 	}
 
-	// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
-	// towards the camera for shading and for the side the shadow ray leaves from.
-	float woundNormal[3], faceNormal[3], e1[3], e2[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
-		e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
-	}
-	cross3(e1, e2, woundNormal);
+	// The wound normal turned towards the camera for shading and for the side the shadow ray leaves from.
+	float faceNormal[3];
 	const bool awayFromCamera = dot3(woundNormal, dir) > 0.0f;
 	for (int i = 0; i < 3; i++)
 		faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
@@ -4612,6 +4665,12 @@ struct TilePaint
 	TreeCandidate m_trees[kTileSize * kTileSize][kTreeCandidates];
 	int m_numTrees[kTileSize * kTileSize];
 	bool m_wide[kTileSize * kTileSize];
+	// Each sample's camera ray, worked out once for painting and shading both; m_ray is false where it has none.
+	bool m_ray[kTileSize * kTileSize];
+	float m_dir[kTileSize * kTileSize][3];
+	float m_rawDir[kTileSize * kTileSize][3];
+	float m_tNear[kTileSize * kTileSize];
+	float m_length[kTileSize * kTileSize];
 };
 
 // Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
@@ -4679,7 +4738,9 @@ bool paintedCutOut(const RasterFrame& frame, const RasterTri& tri, const float d
 void paintTile(const RasterFrame& frame, const Camera& cam, int width, int height, int row0, int row1, int col0, int col1, TilePaint& paint)
 {
 	const int tile = (row0 / kTileSize) * frame.m_tilesX + col0 / kTileSize;
-	float dir[kTileSize * kTileSize][3], tNear[kTileSize * kTileSize], tFar[kTileSize * kTileSize];
+	float(*dir)[3] = paint.m_dir;
+	float* tNear = paint.m_tNear;
+	float tFar[kTileSize * kTileSize];
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
@@ -4691,9 +4752,9 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 			paint.m_rayNear[k] = INFINITY;
 			paint.m_numTrees[k] = 0;
 			paint.m_wide[k] = false;
-			float rawDir[3], length;
-			if (pixelRay(cam, pixelNdcX(col, width), ndcY, dir[k], rawDir, tNear[k], length))
-				tFar[k] = tNear[k] + length;
+			paint.m_ray[k] = pixelRay(cam, pixelNdcX(col, width), ndcY, dir[k], paint.m_rawDir[k], tNear[k], paint.m_length[k]);
+			if (paint.m_ray[k])
+				tFar[k] = tNear[k] + paint.m_length[k];
 			else
 			{
 				dir[k][0] = dir[k][1] = dir[k][2] = 0.0f;
@@ -4794,6 +4855,11 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 // or a miss.
 void paintedFound(const TilePaint& paint, int k, FoundHit& found)
 {
+	found.m_ray = paint.m_ray[k];
+	found.m_dir = paint.m_dir[k];
+	found.m_rawDir = paint.m_rawDir[k];
+	found.m_tNear = paint.m_tNear[k];
+	found.m_length = paint.m_length[k];
 	const RasterTri* tri = paint.m_tri[k];
 	const bool search = paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k];
 	found.m_painted = tri != 0;
@@ -4836,6 +4902,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	TilePaint paint;
 	if (job.m_raster)
 		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
+	SurfaceMemo memo;
+	memo.m_valid = false;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, job.m_height);
@@ -4849,7 +4917,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			if (job.m_raster)
 				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
 			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0);
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
