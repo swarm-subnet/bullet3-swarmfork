@@ -1027,7 +1027,7 @@ void Model::diffuseFilteredMany(Model* const* models, const Vec2f* uv, const Vec
 {
 	int k = 0;
 #if defined(__AVX2__)
-	for (; maxTaps > 1 && k + 8 <= count; k += 8)
+	for (; k + 8 <= count; k += 8)
 	{
 		SharedTexture* tex[8];
 		bool lanes = true;

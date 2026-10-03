@@ -2892,19 +2892,14 @@ void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface
 				   const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
 				   float distance, unsigned char out[3]);
 
-void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
-			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
-			  float distance, const float point[3], unsigned char out[3])
+// The fragment shader's interpolated normal, normalised but not turned to the camera, and its texture coordinates, from
+// a hit's barycentric (u, v): shadeHit up to its texture read.
+void shadeHitFrame(const HitSurface& surface, float u, float v, const float faceNormal[3], float normal[3], TinyRender::Vec2f& uv)
 {
-	if (shading.m_daylight)
-	{
-		shadeDaylight(shading, surface, hit, faceNormal, viewDir, shadow, filtered, duvdx, duvdy, distance, out);
-		return;
-	}
-	TinyRender::Model* model = surface.m_model;
-	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
-	float normal[3] = {0.0f, 0.0f, 0.0f};
-	TinyRender::Vec2f uv(0.0f, 0.0f);
+	const float weights[3] = {1.0f - u - v, u, v};
+	for (int i = 0; i < 3; i++)
+		normal[i] = 0.0f;
+	uv = TinyRender::Vec2f(0.0f, 0.0f);
 	for (int j = 0; j < 3; j++)
 	{
 		const float* uvj = surface.m_uvs + (size_t)surface.m_vertexIds[j] * 2;
@@ -2920,7 +2915,13 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		for (int i = 0; i < 3; i++)
 			normal[i] = faceNormal[i];
 	normalize3(normal);
+}
 
+// The fragment shader from its texel on: the lit colour of the hit and its bytes.
+void shadeHitFinish(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3], TinyRender::Vec2f uv, TGAColor color,
+					const float faceNormal[3], const float viewDir[3], float shadow, const float point[3], unsigned char out[3])
+{
+	TinyRender::Model* model = surface.m_model;
 	const float nDotL = dot3(normal, shading.m_lightDir);
 	float reflection[3];
 	for (int i = 0; i < 3; i++)
@@ -2929,9 +2930,6 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 	const float specular = powInt(reflection[2] > 0.0f ? reflection[2] : 0.0f, (int)model->specular(uv));
 	const float diffuse = nDotL > 0.0f ? nDotL : 0.0f;
 
-	TGAColor color = filtered
-									 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
-									 : model->diffuse(uv);
 	const TinyRender::Vec4f& rgba = model->getColorRGBA();
 	const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
 	float lit[3];
@@ -2978,6 +2976,25 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
+
+void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
+			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
+			  float distance, const float point[3], unsigned char out[3])
+{
+	if (shading.m_daylight)
+	{
+		shadeDaylight(shading, surface, hit, faceNormal, viewDir, shadow, filtered, duvdx, duvdy, distance, out);
+		return;
+	}
+	float normal[3];
+	TinyRender::Vec2f uv;
+	shadeHitFrame(surface, hit.u, hit.v, faceNormal, normal, uv);
+	TGAColor color = filtered
+						 ? surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
+						 : surface.m_model->diffuse(uv);
+	shadeHitFinish(shading, surface, normal, uv, color, faceNormal, viewDir, shadow, point, out);
+}
+
 // A hit's shading normal turned to the camera and its texture coordinates, from its barycentric (u, v): the surface
 // up to its texture read.
 void surfaceFrame(const HitSurface& surface, float u, float v, const float faceNormal[3], float normal[3], TinyRender::Vec2f& uv)
@@ -3312,8 +3329,15 @@ struct ShadeWait
 	float m_dir[3];
 	float m_shadow;
 	float m_distance;
-	// Lit as a glass-backed module rather than as an opaque surface.
-	bool m_module;
+	// Which shading waits: an opaque daylight surface, a glass-backed module in daylight, or the fragment shader.
+	enum Kind
+	{
+		kDaylight,
+		kModule,
+		kFragment
+	} m_kind;
+	// For the fragment shader: the hit point, which the spot light reads.
+	float m_point[3];
 };
 
 struct Sample
@@ -3336,7 +3360,7 @@ struct Sample
 
 // Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
 inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], const float duvdx[2],
-						const float duvdy[2], const float dir[3], float shadow, float distance, bool module)
+						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3])
 {
 	ShadeWait& wait = out.m_shade;
 	wait.m_surface = surface;
@@ -3354,7 +3378,9 @@ inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hi
 	}
 	wait.m_shadow = shadow;
 	wait.m_distance = distance;
-	wait.m_module = module;
+	wait.m_kind = kind;
+	for (int i = 0; i < 3; i++)
+		wait.m_point[i] = point[i];
 	out.m_shadeDeferred = true;
 }
 
@@ -4203,7 +4229,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		{
 			if (deferColour)
 			{
-				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, true);
+				const float point[3] = {hx, hy, hz};
+				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point);
 				return true;
 			}
 			float normal[3], base[3];
@@ -4282,13 +4309,13 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		return true;
 	}
 
-	if (deferColour && shading->m_daylight)
+	const float point[3] = {hx, hy, hz};
+	if (deferColour)
 	{
-		// shadeDaylight's steps are left for the tile, which reads the textures of its samples together.
-		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, false);
+		// The shading is left for the tile, which reads the textures of its samples together.
+		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment, point);
 		return true;
 	}
-	const float point[3] = {hx, hy, hz};
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
 	return true;
 }
@@ -5073,8 +5100,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
 	SurfaceMemo memo;
 	memo.m_valid = false;
-	// Daylight colours wait here and are written together once the tile's samples are in.
-	const bool defer = job.m_shading && job.m_shading->m_daylight && !radiance;
+	// Shading and daylight colours wait here and are done together once the tile's samples are in.
+	const bool defer = job.m_shading && !radiance;
 	DaylightColour waiting[kTileSize * kTileSize];
 	unsigned char* waitingOut[kTileSize * kTileSize];
 	int numWaiting = 0;
@@ -5133,29 +5160,60 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	{
 		// The waiting hits' normals and texture coordinates, their textures read together, then their light, which
 		// joins the colours waiting for the write.
-		TinyRender::Model* models[kTileSize * kTileSize];
+		// Daylight surfaces read up to four texels along a slanted footprint, the fragment shader one; each kind's reads
+		// go together, in the order the samples came.
 		TinyRender::Vec2f uvs[kTileSize * kTileSize], duvdx[kTileSize * kTileSize], duvdy[kTileSize * kTileSize];
-		TGAColor texels[kTileSize * kTileSize];
+		TGAColor texels[kTileSize * kTileSize], kindTexels[kTileSize * kTileSize];
 		float normals[kTileSize * kTileSize][3];
+		int order[kTileSize * kTileSize], numDaylight = 0;
 		for (int i = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
-			models[i] = wait.m_surface.m_model;
-			surfaceFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
-			duvdx[i] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
-			duvdy[i] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
+			if (wait.m_kind == ShadeWait::kFragment)
+				shadeHitFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+			else
+			{
+				surfaceFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+				order[numDaylight++] = i;
+			}
 		}
+		for (int i = 0, fragment = numDaylight; i < numShades; i++)
+			if (shades[i].m_kind == ShadeWait::kFragment)
+				order[fragment++] = i;
+		TinyRender::Model* kindModels[kTileSize * kTileSize];
+		for (int n = 0; n < numShades; n++)
+		{
+			const ShadeWait& wait = shades[order[n]];
+			kindModels[n] = wait.m_surface.m_model;
+			duvdx[n] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
+			duvdy[n] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
+		}
+		TinyRender::Vec2f kindUvs[kTileSize * kTileSize];
+		for (int n = 0; n < numShades; n++)
+			kindUvs[n] = uvs[order[n]];
 		if (job.m_filtered)
-			TinyRender::Model::diffuseFilteredMany(models, uvs, duvdx, duvdy, numShades, 4, texels);
+		{
+			TinyRender::Model::diffuseFilteredMany(kindModels, kindUvs, duvdx, duvdy, numDaylight, 4, kindTexels);
+			TinyRender::Model::diffuseFilteredMany(kindModels + numDaylight, kindUvs + numDaylight, duvdx + numDaylight, duvdy + numDaylight,
+												   numShades - numDaylight, 1, kindTexels + numDaylight);
+		}
 		else
-			for (int i = 0; i < numShades; i++)
-				texels[i] = models[i]->diffuse(uvs[i]);
+			for (int n = 0; n < numShades; n++)
+				kindTexels[n] = kindModels[n]->diffuse(kindUvs[n]);
+		for (int n = 0; n < numShades; n++)
+			texels[order[n]] = kindTexels[n];
 		for (int i = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
+			if (wait.m_kind == ShadeWait::kFragment)
+			{
+				shadeHitFinish(*job.m_shading, wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow,
+							   wait.m_point, shadeOut[i]);
+				continue;
+			}
 			float base[3], lit[3];
 			surfaceTint(wait.m_surface, texels[i], base);
-			if (wait.m_module)
+			if (wait.m_kind == ShadeWait::kModule)
 				moduleLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
 			else
 				daylightLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
