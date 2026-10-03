@@ -13756,6 +13756,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
 	PyModule_AddIntConstant(m, "ER_SWARM_FRAME_REUSE", ER_SWARM_FRAME_REUSE);
 	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
+	PyModule_AddIntConstant(m, "ER_SWARM_RASTER", ER_SWARM_RASTER);
+	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_BEHIND", ER_SWARM_EDGE_BEHIND);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

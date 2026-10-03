@@ -2486,6 +2486,8 @@ void TinyRendererVisualShapeConverter::render(const float viewMat[16], const flo
 		shading.m_edgeAntialias = (m_data->m_flags & ER_EDGE_ANTIALIAS) != 0;
 		shading.m_edgeOutline = (m_data->m_flags & ER_SWARM_EDGE_OUTLINE) != 0;
 		shading.m_creaseFill = (m_data->m_flags & ER_SWARM_CREASE_FILL) != 0;
+		shading.m_raster = (m_data->m_flags & ER_SWARM_RASTER) != 0;
+		shading.m_edgeBehind = (m_data->m_flags & ER_SWARM_EDGE_BEHIND) != 0;
 		shading.m_linearLight = (m_data->m_flags & ER_SWARM_LINEAR_LIGHT) != 0;
 		shading.m_daylight = daylight;
 		shading.m_sky = (daylight && sunSky && sunSky->daylightBuilt()) ? sunSky : 0;

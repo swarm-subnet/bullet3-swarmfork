@@ -2,6 +2,7 @@
 
 #include <embree4/rtcore.h>
 #include <math.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +87,58 @@ inline void normalize3(float v[3])
 	}
 }
 
+// ER_SWARM_RASTER: a run of consecutive triangles of one mesh and their box, in the mesh's own frame, so a frame drops
+// what lies outside its view before projecting a single corner.
+struct RasterChunk
+{
+	float m_lo[3];
+	float m_hi[3];
+	unsigned m_first;
+	unsigned m_count;
+};
+
+const unsigned kRasterChunkTriangles = 64;
+
+// Cuts a mesh into chunks of kRasterChunkTriangles triangles in file order, each with the box of its corners, and
+// writes the box of them all into lo and hi.
+void buildRasterChunks(const std::vector<float>& vertices, const std::vector<unsigned>& indices, std::vector<RasterChunk>& out,
+					   float lo[3], float hi[3])
+{
+	out.clear();
+	for (int i = 0; i < 3; i++)
+	{
+		lo[i] = INFINITY;
+		hi[i] = -INFINITY;
+	}
+	const size_t numTriangles = indices.size() / 3;
+	for (size_t first = 0; first < numTriangles; first += kRasterChunkTriangles)
+	{
+		RasterChunk chunk;
+		chunk.m_first = (unsigned)first;
+		chunk.m_count = (unsigned)(numTriangles - first < kRasterChunkTriangles ? numTriangles - first : kRasterChunkTriangles);
+		for (int i = 0; i < 3; i++)
+		{
+			chunk.m_lo[i] = INFINITY;
+			chunk.m_hi[i] = -INFINITY;
+		}
+		for (size_t k = first * 3; k < (first + chunk.m_count) * 3; k++)
+		{
+			const float* v = &vertices[(size_t)indices[k] * 3];
+			for (int i = 0; i < 3; i++)
+			{
+				chunk.m_lo[i] = v[i] < chunk.m_lo[i] ? v[i] : chunk.m_lo[i];
+				chunk.m_hi[i] = v[i] > chunk.m_hi[i] ? v[i] : chunk.m_hi[i];
+			}
+		}
+		for (int i = 0; i < 3; i++)
+		{
+			lo[i] = chunk.m_lo[i] < lo[i] ? chunk.m_lo[i] : lo[i];
+			hi[i] = chunk.m_hi[i] > hi[i] ? chunk.m_hi[i] : hi[i];
+		}
+		out.push_back(chunk);
+	}
+}
+
 struct Instance;
 struct Batch;
 
@@ -148,6 +201,10 @@ struct StaticMember
 	// The render object's texture revision the shadow maps last saw.
 	unsigned m_textureRevision;
 	int m_segmentation;
+	// ER_SWARM_RASTER: the member's triangles in world-space chunks, cut the first time a frame paints it, and their box.
+	std::vector<RasterChunk> m_chunks;
+	float m_chunksLo[3];
+	float m_chunksHi[3];
 };
 
 struct CachedTree;
@@ -188,6 +245,11 @@ struct MeshTree
 	bool m_refitting;
 	// The body transform a world tree was built for; the body counts as moved once it differs.
 	float m_pose[16];
+	// ER_SWARM_RASTER: the mesh's chunks in its own frame, cut the first time a frame paints it and again after a rewrite,
+	// and their box.
+	std::vector<RasterChunk> m_chunks;
+	float m_chunksLo[3];
+	float m_chunksHi[3];
 };
 
 // A world tree on disk: <SWARM_BVH_CACHE_DIR>/<key>.rtree holds the world-space vertex, index,
@@ -1192,6 +1254,86 @@ struct MoverShade
 // Lenses remembered at once (wide, zoom, thermal), and the smallest frame worth a memory, so the laser keeps none.
 const int kHitMemories = 4;
 const size_t kHintMinPixels = 64 * 64;
+
+// ER_SWARM_RASTER. What a cut-out test needs of a painted body: its texture and mesh as the hit filter reads them, and
+// for a mover the inverse of its transform's 3x3 part, which takes a camera ray into the mesh's frame as Embree does.
+struct RasterSource
+{
+	TinyRender::Model* m_model;
+	const float* m_vertices;
+	const float* m_uvs;
+	const std::vector<unsigned>* m_indices;
+	bool m_objectSpace;
+	float m_inverse[9];
+};
+
+// A painted triangle in fixed point: three edge functions over the frame's samples, already biased by the fill rule so
+// a sample on an edge two triangles share belongs to exactly one, the box of samples it may cover, the solve that gives a
+// camera ray's distance and barycentrics on the world triangle, and the ids a ray hit on it would carry.
+struct RasterTri
+{
+	long long m_edge[3];
+	long long m_stepX[3];
+	long long m_stepY[3];
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_det[3];
+	float m_u[3];
+	float m_v[3];
+	float m_t;
+	unsigned m_inst;
+	unsigned m_geom;
+	unsigned m_prim;
+	unsigned long long m_key;
+	// The body whose cut-outs a covered sample is tested on, or null when every sample is solid.
+	const RasterSource* m_source;
+};
+
+// A world box only a ray can draw, a forest tree or a chunk with more triangles than its screen box has room to paint:
+// the samples it may cover, its least distance from the eye, and the box itself, which a sample's ray must enter nearer
+// than what was painted there for the sample to be searched.
+struct RayRect
+{
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_distance;
+	float m_lo[3];
+	float m_hi[3];
+};
+
+// One render thread's share of a painted frame: its triangles and rects, and per tile the ones that reach it, a rect's
+// index marked by kRectBit.
+struct RasterLane
+{
+	std::vector<RasterTri> m_tris;
+	std::vector<RayRect> m_rects;
+	std::vector<std::vector<unsigned> > m_bins;
+};
+const unsigned kRectBit = 0x80000000u;
+
+// One chunk to paint, of a static member or of a mover's mesh, and the body its cut-outs are tested on.
+struct RasterJob
+{
+	const RasterChunk* m_chunk;
+	const StaticMember* m_member;
+	const Instance* m_instance;
+	const RasterSource* m_source;
+};
+
+// The forest's trees by square cell across the ground, each tree's world box in cell order with the batch it belongs to.
+struct ForestGrid
+{
+	bool m_built;
+	std::vector<float> m_cellBoxes;
+	std::vector<unsigned> m_cellStart;
+	std::vector<float> m_treeBoxes;
+	std::vector<unsigned> m_treeBatch;
+};
+const float kForestCell = 16.0f;
 }  // namespace
 
 struct SwarmRaycast::Data
@@ -1244,6 +1386,11 @@ struct SwarmRaycast::Data
 	unsigned long long m_sceneRevision;
 	std::vector<double> m_moved;
 	unsigned long long m_movedBase;
+	// ER_SWARM_RASTER: per render thread scratch, the frame's chunks and cut-out sources, and the forest's grid.
+	std::vector<RasterLane> m_rasterLanes;
+	std::vector<RasterJob> m_rasterJobs;
+	std::vector<RasterSource> m_rasterSources;
+	ForestGrid m_forestGrid;
 
 	// Notes a mover's old and new boxes for kept frames, dropping boxes all have seen, or the frames if too many wait.
 	void moverMoved(const MeshTree* tree, const float before[16], const float after[16])
@@ -1750,6 +1897,7 @@ struct SwarmRaycast::Data
 			return;
 		copyLocalVertices(model, tree.m_vertices);
 		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs, true);
+		tree.m_chunks.clear();
 		// A medium-quality scene ignores the geometry's refit quality and rebuilds its whole tree on every commit,
 		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
 		if (!tree.m_refitting)
@@ -2047,6 +2195,8 @@ struct SwarmRaycast::Data
 		}
 		if (changed || batch->m_doubleSided != obj->m_doubleSided || batch->m_textureRevision != obj->m_textureRevision)
 			m_shadowMap.m_built = m_shelterMap.m_built = false;
+		if (changed)
+			m_forestGrid.m_built = false;
 		batch->m_doubleSided = obj->m_doubleSided;
 		batch->m_hasAlpha = obj->m_model->hasAlpha();
 		batch->m_glass = obj->m_glass;
@@ -2072,6 +2222,7 @@ struct SwarmRaycast::Data
 		releaseTree(batch->m_tree);
 		m_batches[batch->m_geomId] = 0;
 		m_forestDirty = true;
+		m_forestGrid.m_built = false;
 		m_shadowMap.m_built = m_shelterMap.m_built = false;
 		delete batch;
 	}
@@ -2087,6 +2238,7 @@ struct SwarmRaycast::Data
 				delete m_batches[i];
 			}
 		m_batches.clear();
+		m_forestGrid.m_built = false;
 		if (m_forest)
 		{
 			rtcDetachGeometry(m_top, m_forestId);
@@ -2181,6 +2333,7 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_frameCount = 0;
 	m_data->m_sceneRevision = 0;
 	m_data->m_movedBase = 0;
+	m_data->m_forestGrid.m_built = false;
 	for (int i = 0; i < kHitMemories; i++)
 	{
 		m_data->m_hitMemories[i].m_lastUse = 0;
@@ -2943,6 +3096,8 @@ struct CameraSetup
 	bool m_valid;
 };
 
+struct RasterFrame;
+
 // Everything a thread needs to trace one tile; all of it is read-only during the frame.
 struct TileJob
 {
@@ -2973,6 +3128,9 @@ struct TileJob
 	float* m_hitPoints;
 	// Where the movers can shade, when the movers answer the shadow rays; null otherwise.
 	const MoverShade* m_moverShade;
+	// ER_SWARM_RASTER: the frame's painted triangles and rects, when the camera paints instead of searching; null otherwise.
+	const RasterFrame* m_raster;
+	bool m_alphaCutout;
 };
 
 // The triangle a ray landed on, enough to find its corners again.
@@ -3410,24 +3568,16 @@ inline void reached(RTCIntersectArguments* args, float t)
 		ctx->m_farthest = t;
 }
 
-// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
-// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss.
-bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
-			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
+// A camera's ray through the frame position (ndcX, ndcY): its unit and raw direction, how far along it the near plane
+// lies and how much further the far plane; false when the near and far points coincide.
+bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float rawDir[3], float& tNear, float& length)
 {
-	const Camera& cam = setup.m_cam;
-	const SwarmRaycastShading* shading = job.m_shading;
-	const bool filtered = job.m_filtered;
-	if (landed)
-		landed[0] = landed[1] = landed[2] = NAN;
-
 	float nearPoint[3], farPoint[3];
 	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
 	planePoint(cam.m_far, ndcX, ndcY, farPoint);
-	float dir[3], rawDir[3];
 	for (int i = 0; i < 3; i++)
 		dir[i] = rawDir[i] = farPoint[i] - nearPoint[i];
-	const float length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+	length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
 	if (!(length > 0.0f))
 		return false;
 	const float invLength = 1.0f / length;
@@ -3437,7 +3587,43 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		dir[i] *= invLength;
 		toNear[i] = nearPoint[i] - cam.m_origin[i];
 	}
-	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+	tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+	return true;
+}
+
+// What is already known of a ray's first hit: nothing, so it is searched with an along-ray depth hint; a hit to shade as
+// it stands; or a miss.
+enum FoundKind
+{
+	kFoundSearch,
+	kFoundHit,
+	kFoundMiss
+};
+
+struct FoundHit
+{
+	FoundKind m_kind;
+	float m_reach;
+	float m_t;
+	RTCHit m_hit;
+};
+
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss. `found`, when given,
+// replaces the search for the first hit: shaded as it stands, a miss, or searched with its own along-ray reach.
+bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
+			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0,
+			  const FoundHit* found = 0)
+{
+	const Camera& cam = setup.m_cam;
+	const SwarmRaycastShading* shading = job.m_shading;
+	const bool filtered = job.m_filtered;
+	if (landed)
+		landed[0] = landed[1] = landed[2] = NAN;
+
+	float dir[3], rawDir[3], tNear, length;
+	if (!pixelRay(cam, ndcX, ndcY, dir, rawDir, tNear, length))
+		return false;
 	// The sky along the ray, only for a ray that ends on it: a miss, an unknown body, or what a thermal veil leaves.
 	const bool thermalSky = shading && shading->m_thermal;
 
@@ -3459,7 +3645,13 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
 	const float facing = -dot3(cam.m_viewRow2, dir);
-	firstHit(job.m_top, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
+	if (found && found->m_kind == kFoundHit)
+	{
+		rayhit.ray.tfar = found->m_t;
+		rayhit.hit = found->m_hit;
+	}
+	else if (!found || found->m_kind == kFoundSearch)
+		firstHit(job.m_top, rayhit, found ? found->m_reach : (facing > 0.0f ? reach / facing : INFINITY), args);
 	reached(args, rayhit.ray.tfar);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 	{
@@ -3491,6 +3683,9 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	out.m_hit.m_prim = rayhit.hit.primID;
 	out.m_hit.m_inst1 = rayhit.hit.instID[1];
 	out.m_hit.m_instPrim1 = rayhit.hit.instPrimID[1];
+	// A painted frame mixes painted and searched hits, so outside the forest neither names a second instance level.
+	if (job.m_raster && rayhit.hit.instID[0] != job.m_forestId)
+		out.m_hit.m_inst1 = out.m_hit.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
 	out.m_shaded = shading && known;
 	if (!out.m_shaded)
 	{
@@ -3759,6 +3954,711 @@ inline float inverseEyeDepth(const Camera& cam, float depth)
 	return 1.0f / (-(depth + cam.m_p23) / cam.m_p22);
 }
 
+// ER_SWARM_RASTER. The frame a lone camera paints: its projection in double, the six planes of its view, the eye, the
+// frame size and tile grid, and the static tree's instance id a painted static hit carries.
+struct RasterView
+{
+	double m_viewProj[4][4];
+	double m_planes[6][4];
+	float m_origin[3];
+	int m_width;
+	int m_height;
+	int m_tilesX;
+	unsigned m_staticId;
+};
+
+// What the tiles read of a painted frame: every thread's lane, and the footprint angle the cut-out test reads at.
+struct RasterFrame
+{
+	const std::vector<RasterLane>* m_lanes;
+	int m_tilesX;
+	float m_spread;
+};
+
+// Sub-pixel steps of the fixed-point frame; how many frame half-widths a triangle may reach past the frame before it is
+// clipped; and how many triangles per sample of its screen box make a chunk cheaper to search than to paint.
+const int kSubPixel = 256;
+const double kGuardBand = 16.0;
+const float kDenseTriangles = 4.0f;
+// Sign of Embree's geometric normal against the cross product of a triangle's edges from its first corner.
+const float kEmbreeNormalSign = 1.0f;
+
+// The view's planes from projection times view, each a combination of its rows that is positive inside.
+void setupRasterView(const Camera& cam, int width, int height, unsigned staticId, RasterView& view)
+{
+	memcpy(view.m_viewProj, cam.m_viewProj, sizeof(view.m_viewProj));
+	const double(*m)[4] = cam.m_viewProj;
+	for (int c = 0; c < 4; c++)
+	{
+		view.m_planes[0][c] = m[3][c] + m[0][c];
+		view.m_planes[1][c] = m[3][c] - m[0][c];
+		view.m_planes[2][c] = m[3][c] + m[1][c];
+		view.m_planes[3][c] = m[3][c] - m[1][c];
+		view.m_planes[4][c] = m[3][c] + m[2][c];
+		view.m_planes[5][c] = m[3][c] - m[2][c];
+	}
+	for (int i = 0; i < 3; i++)
+		view.m_origin[i] = cam.m_origin[i];
+	view.m_width = width;
+	view.m_height = height;
+	view.m_tilesX = (width + kTileSize - 1) / kTileSize;
+	view.m_staticId = staticId;
+}
+
+// False only when the box lies wholly outside one plane of the view; a NaN box counts as seen.
+bool boxVisible(const RasterView& view, const float lo[3], const float hi[3])
+{
+	for (int k = 0; k < 6; k++)
+	{
+		const double* p = view.m_planes[k];
+		const double d = p[0] * (p[0] >= 0.0 ? hi[0] : lo[0]) + p[1] * (p[1] >= 0.0 ? hi[1] : lo[1]) + p[2] * (p[2] >= 0.0 ? hi[2] : lo[2]) + p[3];
+		if (d < 0.0)
+			return false;
+	}
+	return true;
+}
+
+// The box around a mesh box carried by a column-major transform, a hair wider for the rounding of its corners.
+void worldBox(const float m[16], const float lo[3], const float hi[3], float outLo[3], float outHi[3])
+{
+	for (int i = 0; i < 3; i++)
+	{
+		outLo[i] = INFINITY;
+		outHi[i] = -INFINITY;
+	}
+	for (int k = 0; k < 8; k++)
+	{
+		const float corner[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+		float world[3];
+		transformPoint(m, corner, world);
+		for (int i = 0; i < 3; i++)
+		{
+			outLo[i] = world[i] < outLo[i] ? world[i] : outLo[i];
+			outHi[i] = world[i] > outHi[i] ? world[i] : outHi[i];
+		}
+	}
+	for (int i = 0; i < 3; i++)
+	{
+		const float margin = 1e-4f + 1e-6f * (fabsf(outLo[i]) + fabsf(outHi[i]));
+		outLo[i] -= margin;
+		outHi[i] += margin;
+	}
+}
+
+// The samples a box may cover, one more each side, or the whole frame when a corner lies at or behind the eye.
+bool boxRect(const RasterView& view, const float lo[3], const float hi[3], RayRect& rect)
+{
+	double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+	bool whole = false;
+	for (int k = 0; k < 8 && !whole; k++)
+	{
+		const double c[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+		double clip[4];
+		for (int r = 0; r < 4; r++)
+			clip[r] = view.m_viewProj[r][0] * c[0] + view.m_viewProj[r][1] * c[1] + view.m_viewProj[r][2] * c[2] + view.m_viewProj[r][3];
+		const double x = (clip[0] / clip[3] + 1.0) * 0.5 * view.m_width;
+		const double y = (1.0 - clip[1] / clip[3]) * 0.5 * view.m_height - 1.0;
+		if (!(clip[3] > 1e-6) || !(x == x) || !(y == y))
+		{
+			whole = true;
+			break;
+		}
+		x0 = x < x0 ? x : x0;
+		x1 = x > x1 ? x : x1;
+		y0 = y < y0 ? y : y0;
+		y1 = y > y1 ? y : y1;
+	}
+	if (whole)
+	{
+		rect.m_col0 = rect.m_row0 = 0;
+		rect.m_col1 = view.m_width - 1;
+		rect.m_row1 = view.m_height - 1;
+		return true;
+	}
+	// Held to the frame before the conversion, so a corner just in front of the eye cannot overflow an int.
+	const double right = view.m_width + 1.0, bottom = view.m_height + 1.0;
+	x0 = x0 < -2.0 ? -2.0 : (x0 > right ? right : x0);
+	x1 = x1 < -2.0 ? -2.0 : (x1 > right ? right : x1);
+	y0 = y0 < -2.0 ? -2.0 : (y0 > bottom ? bottom : y0);
+	y1 = y1 < -2.0 ? -2.0 : (y1 > bottom ? bottom : y1);
+	rect.m_col0 = (int)floor(x0) - 1;
+	rect.m_col1 = (int)ceil(x1) + 1;
+	rect.m_row0 = (int)floor(y0) - 1;
+	rect.m_row1 = (int)ceil(y1) + 1;
+	rect.m_col0 = rect.m_col0 < 0 ? 0 : rect.m_col0;
+	rect.m_row0 = rect.m_row0 < 0 ? 0 : rect.m_row0;
+	rect.m_col1 = rect.m_col1 >= view.m_width ? view.m_width - 1 : rect.m_col1;
+	rect.m_row1 = rect.m_row1 >= view.m_height ? view.m_height - 1 : rect.m_row1;
+	return rect.m_col0 <= rect.m_col1 && rect.m_row0 <= rect.m_row1;
+}
+
+// The least distance from the eye to the box, a hair short, so no ray's rounded distance into the box falls under it.
+float boxDistance(const float origin[3], const float lo[3], const float hi[3])
+{
+	float sum = 0.0f;
+	for (int i = 0; i < 3; i++)
+	{
+		const float below = lo[i] - origin[i], above = origin[i] - hi[i];
+		const float gap = below > above ? below : above;
+		sum += gap > 0.0f ? gap * gap : 0.0f;
+	}
+	return sqrtf(sum) * (1.0f - 1e-5f) - 1e-4f;
+}
+
+// Files an item under every tile its samples reach.
+void binInto(RasterLane& lane, const RasterView& view, int col0, int col1, int row0, int row1, unsigned index)
+{
+	for (int ty = row0 / kTileSize; ty <= row1 / kTileSize; ty++)
+		for (int tx = col0 / kTileSize; tx <= col1 / kTileSize; tx++)
+			lane.m_bins[(size_t)ty * view.m_tilesX + tx].push_back(index);
+}
+
+// Keeps a ray rect in the lane and files it under its tiles.
+void addRayRect(RasterLane& lane, const RasterView& view, const RayRect& rect)
+{
+	binInto(lane, view, rect.m_col0, rect.m_col1, rect.m_row0, rect.m_row1, (unsigned)lane.m_rects.size() | kRectBit);
+	lane.m_rects.push_back(rect);
+}
+
+struct ClipVertex
+{
+	double m_p[4];
+};
+
+// How far inside a plane a clip-space point lies: the near plane, then the four sides of the guard band.
+inline double guardDistance(const ClipVertex& v, int plane)
+{
+	switch (plane)
+	{
+		case 0:
+			return v.m_p[2] + v.m_p[3];
+		case 1:
+			return kGuardBand * v.m_p[3] - v.m_p[0];
+		case 2:
+			return kGuardBand * v.m_p[3] + v.m_p[0];
+		case 3:
+			return kGuardBand * v.m_p[3] - v.m_p[1];
+		default:
+			return kGuardBand * v.m_p[3] + v.m_p[1];
+	}
+}
+
+inline bool clipBefore(const ClipVertex& a, const ClipVertex& b)
+{
+	for (int k = 0; k < 4; k++)
+		if (a.m_p[k] != b.m_p[k])
+			return a.m_p[k] < b.m_p[k];
+	return false;
+}
+
+// Keeps the part of a polygon inside one plane. A cut edge is interpolated from its lesser end, so an edge two triangles
+// share is cut at the same point by both and the painted surface keeps no crack along it.
+int clipPolygon(const ClipVertex* in, int n, int plane, ClipVertex* out)
+{
+	int kept = 0;
+	for (int i = 0; i < n; i++)
+	{
+		const ClipVertex& p = in[i];
+		const ClipVertex& q = in[(i + 1) % n];
+		const double dp = guardDistance(p, plane), dq = guardDistance(q, plane);
+		if (dp >= 0.0)
+			out[kept++] = p;
+		if ((dp >= 0.0) != (dq >= 0.0))
+		{
+			const bool flip = clipBefore(q, p);
+			const ClipVertex& a = flip ? q : p;
+			const ClipVertex& b = flip ? p : q;
+			const double da = flip ? dq : dp, db = flip ? dp : dq;
+			const double t = da / (da - db);
+			for (int k = 0; k < 4; k++)
+				out[kept].m_p[k] = a.m_p[k] + (b.m_p[k] - a.m_p[k]) * t;
+			kept++;
+		}
+	}
+	return kept;
+}
+
+inline long long floorDiv(long long a, long long b)
+{
+	return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+// Puts one clipped piece of a triangle on the frame in fixed point; a piece with no area or no sample adds nothing.
+void addScreenTriangle(RasterLane& lane, const RasterView& view, const ClipVertex* const corners[3], const RasterTri& world)
+{
+	long long x[3], y[3];
+	for (int j = 0; j < 3; j++)
+	{
+		const double* p = corners[j]->m_p;
+		x[j] = (long long)floor((p[0] / p[3] + 1.0) * 0.5 * view.m_width * kSubPixel + 0.5);
+		y[j] = (long long)floor(((1.0 - p[1] / p[3]) * 0.5 * view.m_height - 1.0) * kSubPixel + 0.5);
+	}
+	const long long area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+	if (area == 0)
+		return;
+	if (area < 0)
+	{
+		std::swap(x[1], x[2]);
+		std::swap(y[1], y[2]);
+	}
+	const long long minX = std::min(x[0], std::min(x[1], x[2])), maxX = std::max(x[0], std::max(x[1], x[2]));
+	const long long minY = std::min(y[0], std::min(y[1], y[2])), maxY = std::max(y[0], std::max(y[1], y[2]));
+	const int col0 = (int)std::max(-floorDiv(-minX, kSubPixel), 0LL);
+	const int col1 = (int)std::min(floorDiv(maxX, kSubPixel), (long long)view.m_width - 1);
+	const int row0 = (int)std::max(-floorDiv(-minY, kSubPixel), 0LL);
+	const int row1 = (int)std::min(floorDiv(maxY, kSubPixel), (long long)view.m_height - 1);
+	if (col0 > col1 || row0 > row1)
+		return;
+	RasterTri tri = world;
+	for (int i = 0; i < 3; i++)
+	{
+		const int k = (i + 1) % 3;
+		const long long dx = x[k] - x[i], dy = y[k] - y[i];
+		// A sample exactly on an edge belongs to the one triangle of the two sharing it that owns the edge.
+		const bool owns = dy > 0 || (dy == 0 && dx < 0);
+		tri.m_edge[i] = dy * x[i] - dx * y[i] - (owns ? 0 : 1);
+		tri.m_stepX[i] = -dy * kSubPixel;
+		tri.m_stepY[i] = dx * kSubPixel;
+	}
+	tri.m_col0 = col0;
+	tri.m_col1 = col1;
+	tri.m_row0 = row0;
+	tri.m_row1 = row1;
+	binInto(lane, view, col0, col1, row0, row1, (unsigned)lane.m_tris.size());
+	lane.m_tris.push_back(tri);
+}
+
+// Puts one world triangle on the frame: dropped when single-sided and turned away from the eye, as the camera ray's
+// filter drops it, or when wholly outside one side of the view; clipped to the near plane and the guard band otherwise.
+void paintTriangle(RasterLane& lane, const RasterView& view, const float c[3][3], bool doubleSided, unsigned inst, unsigned geom,
+				   unsigned prim, const RasterSource* source)
+{
+	float e1[3], e2[3], toEye[3], normal[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = c[1][i] - c[0][i];
+		e2[i] = c[2][i] - c[0][i];
+		toEye[i] = view.m_origin[i] - c[0][i];
+	}
+	cross3(e1, e2, normal);
+	// Every camera ray onto the plane meets the normal at the sign it has against the first corner seen from the eye.
+	if (!doubleSided && -kEmbreeNormalSign * dot3(normal, toEye) >= 0.0f)
+		return;
+	ClipVertex v[3];
+	for (int j = 0; j < 3; j++)
+		for (int r = 0; r < 4; r++)
+			v[j].m_p[r] = view.m_viewProj[r][0] * c[j][0] + view.m_viewProj[r][1] * c[j][1] + view.m_viewProj[r][2] * c[j][2] + view.m_viewProj[r][3];
+	for (int axis = 0; axis < 3; axis++)
+		for (int side = -1; side <= 1; side += 2)
+		{
+			bool out = true;
+			for (int j = 0; j < 3 && out; j++)
+				out = !(v[j].m_p[3] + side * v[j].m_p[axis] >= 0.0);
+			if (out)
+				return;
+		}
+	// The Moller-Trumbore solve with the eye as every ray's origin: its determinant and the barycentric and distance
+	// numerators are each a constant vector dotted with the ray's direction.
+	RasterTri world;
+	cross3(e2, e1, world.m_det);
+	cross3(e2, toEye, world.m_u);
+	cross3(toEye, e1, world.m_v);
+	world.m_t = dot3(e2, world.m_v);
+	world.m_inst = inst;
+	world.m_geom = geom;
+	world.m_prim = prim;
+	world.m_key = ((unsigned long long)inst << 48) ^ ((unsigned long long)geom << 32) ^ prim;
+	world.m_source = source;
+	bool inside = true;
+	for (int plane = 0; plane < 5 && inside; plane++)
+		for (int j = 0; j < 3 && inside; j++)
+			inside = guardDistance(v[j], plane) >= 0.0;
+	if (inside)
+	{
+		const ClipVertex* const corners[3] = {&v[0], &v[1], &v[2]};
+		addScreenTriangle(lane, view, corners, world);
+		return;
+	}
+	ClipVertex polygon[2][10];
+	int n = 3;
+	for (int j = 0; j < 3; j++)
+		polygon[0][j] = v[j];
+	int current = 0;
+	for (int plane = 0; plane < 5 && n >= 3; plane++)
+	{
+		n = clipPolygon(polygon[current], n, plane, polygon[1 - current]);
+		current = 1 - current;
+	}
+	for (int j = 1; j + 1 < n; j++)
+	{
+		const ClipVertex* const corners[3] = {&polygon[current][0], &polygon[current][j], &polygon[current][j + 1]};
+		addScreenTriangle(lane, view, corners, world);
+	}
+}
+
+// Paints one chunk; one with more triangles than its screen box has samples to spare leaves its box to rays instead.
+void paintJob(RasterLane& lane, const RasterView& view, const RasterJob& job)
+{
+	const RasterChunk& chunk = *job.m_chunk;
+	const Instance* inst = job.m_instance;
+	float lo[3], hi[3];
+	if (inst)
+		worldBox(inst->m_transform, chunk.m_lo, chunk.m_hi, lo, hi);
+	else
+		for (int i = 0; i < 3; i++)
+		{
+			lo[i] = chunk.m_lo[i];
+			hi[i] = chunk.m_hi[i];
+		}
+	RayRect rect;
+	if (!boxVisible(view, lo, hi) || !boxRect(view, lo, hi, rect))
+		return;
+	const float samples = (float)(rect.m_col1 - rect.m_col0 + 1) * (float)(rect.m_row1 - rect.m_row0 + 1);
+	if ((float)chunk.m_count > kDenseTriangles * samples)
+	{
+		rect.m_distance = boxDistance(view.m_origin, lo, hi);
+		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
+		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		addRayRect(lane, view, rect);
+		return;
+	}
+	const float* vertices = inst ? &inst->m_tree->m_vertices[0] : &job.m_member->m_vertices[0];
+	const unsigned* indices = inst ? &inst->m_tree->m_indices[0] : &job.m_member->m_indices[0];
+	const bool doubleSided = inst ? inst->m_doubleSided : job.m_member->m_doubleSided;
+	const unsigned instId = inst ? inst->m_geomId : view.m_staticId;
+	const unsigned geomId = inst ? 0u : job.m_member->m_geomId;
+	for (unsigned t = chunk.m_first; t < chunk.m_first + chunk.m_count; t++)
+	{
+		// Corners land on the floats resolveHit gives the same triangle, so painting and shading agree on where it is.
+		float c[3][3];
+		for (int j = 0; j < 3; j++)
+		{
+			const float* p = vertices + (size_t)indices[(size_t)t * 3 + j] * 3;
+			if (inst)
+				transformPoint(inst->m_transform, p, c[j]);
+			else
+				for (int i = 0; i < 3; i++)
+					c[j][i] = p[i];
+		}
+		paintTriangle(lane, view, c, doubleSided, instId, geomId, t, job.m_source);
+	}
+}
+
+// Leaves a ray rect for every enabled tree of a cell in view.
+void paintForestCell(RasterLane& lane, const RasterView& view, const ForestGrid& grid, size_t cell, const std::vector<Batch*>& batches)
+{
+	if (!boxVisible(view, &grid.m_cellBoxes[cell * 6], &grid.m_cellBoxes[cell * 6 + 3]))
+		return;
+	for (unsigned k = grid.m_cellStart[cell]; k < grid.m_cellStart[cell + 1]; k++)
+	{
+		const Batch* batch = batches[grid.m_treeBatch[k]];
+		if (!batch || !batch->m_enabled)
+			continue;
+		const float* lo = &grid.m_treeBoxes[(size_t)k * 6];
+		const float* hi = lo + 3;
+		RayRect rect;
+		if (!boxVisible(view, lo, hi) || !boxRect(view, lo, hi, rect))
+			continue;
+		rect.m_distance = boxDistance(view.m_origin, lo, hi);
+		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
+		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		addRayRect(lane, view, rect);
+	}
+}
+
+// Files every tree of every batch under the square cell its box's centre falls in, with its world box a hair wider
+// than its mesh, and gives every cell the box around its trees.
+void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
+{
+	struct Tree
+	{
+		long long m_x;
+		long long m_y;
+		unsigned m_batch;
+		float m_box[6];
+		bool operator<(const Tree& other) const { return m_x != other.m_x ? m_x < other.m_x : m_y < other.m_y; }
+	};
+	std::vector<Tree> trees;
+	for (size_t b = 0; b < batches.size(); b++)
+	{
+		const Batch* batch = batches[b];
+		if (!batch)
+			continue;
+		const std::vector<float>& vertices = batch->m_tree->m_vertices;
+		float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+		for (size_t i = 0; i + kVertexPadding < vertices.size(); i += 3)
+			for (int k = 0; k < 3; k++)
+			{
+				lo[k] = vertices[i + k] < lo[k] ? vertices[i + k] : lo[k];
+				hi[k] = vertices[i + k] > hi[k] ? vertices[i + k] : hi[k];
+			}
+		if (!(lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]))
+			continue;
+		for (size_t p = 0; (p + 1) * 12 <= batch->m_transforms.size(); p++)
+		{
+			const float* t = &batch->m_transforms[p * 12];
+			Tree tree;
+			tree.m_batch = (unsigned)b;
+			for (int r = 0; r < 3; r++)
+			{
+				tree.m_box[r] = INFINITY;
+				tree.m_box[3 + r] = -INFINITY;
+			}
+			for (int k = 0; k < 8; k++)
+			{
+				const double c[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+				for (int r = 0; r < 3; r++)
+				{
+					const float w = (float)((double)t[9 + r] + (double)t[r] * c[0] + (double)t[3 + r] * c[1] + (double)t[6 + r] * c[2]);
+					tree.m_box[r] = w < tree.m_box[r] ? w : tree.m_box[r];
+					tree.m_box[3 + r] = w > tree.m_box[3 + r] ? w : tree.m_box[3 + r];
+				}
+			}
+			for (int r = 0; r < 3; r++)
+			{
+				const float margin = 1e-3f + 1e-5f * (fabsf(tree.m_box[r]) + fabsf(tree.m_box[3 + r]));
+				tree.m_box[r] -= margin;
+				tree.m_box[3 + r] += margin;
+			}
+			const double midX = 0.5 * ((double)tree.m_box[0] + tree.m_box[3]), midY = 0.5 * ((double)tree.m_box[1] + tree.m_box[4]);
+			tree.m_x = fabs(midX) < 1e12 ? (long long)floor(midX / kForestCell) : 0;
+			tree.m_y = fabs(midY) < 1e12 ? (long long)floor(midY / kForestCell) : 0;
+			trees.push_back(tree);
+		}
+	}
+	std::stable_sort(trees.begin(), trees.end());
+	grid.m_cellBoxes.clear();
+	grid.m_cellStart.clear();
+	grid.m_treeBoxes.resize(trees.size() * 6);
+	grid.m_treeBatch.resize(trees.size());
+	for (size_t i = 0; i < trees.size(); i++)
+	{
+		if (i == 0 || trees[i].m_x != trees[i - 1].m_x || trees[i].m_y != trees[i - 1].m_y)
+		{
+			grid.m_cellStart.push_back((unsigned)i);
+			for (int r = 0; r < 3; r++)
+				grid.m_cellBoxes.push_back(INFINITY);
+			for (int r = 0; r < 3; r++)
+				grid.m_cellBoxes.push_back(-INFINITY);
+		}
+		float* cell = &grid.m_cellBoxes[grid.m_cellBoxes.size() - 6];
+		for (int r = 0; r < 3; r++)
+		{
+			cell[r] = trees[i].m_box[r] < cell[r] ? trees[i].m_box[r] : cell[r];
+			cell[3 + r] = trees[i].m_box[3 + r] > cell[3 + r] ? trees[i].m_box[3 + r] : cell[3 + r];
+		}
+		memcpy(&grid.m_treeBoxes[i * 6], trees[i].m_box, sizeof(trees[i].m_box));
+		grid.m_treeBatch[i] = trees[i].m_batch;
+	}
+	grid.m_cellStart.push_back((unsigned)trees.size());
+	grid.m_built = true;
+}
+
+// A tile's painted result per sample: the nearest painted hit, where on its triangle, and the least distance at which a
+// ray rect asks for a search.
+struct TilePaint
+{
+	float m_t[kTileSize * kTileSize];
+	float m_u[kTileSize * kTileSize];
+	float m_v[kTileSize * kTileSize];
+	const RasterTri* m_tri[kTileSize * kTileSize];
+	float m_rayNear[kTileSize * kTileSize];
+};
+
+// Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
+// the box or enters it only past limit. A zero direction component keeps its slab only when the origin lies inside it.
+inline float rayEnters(const float origin[3], const float dir[3], const float lo[3], const float hi[3], float limit)
+{
+	float enter = 0.0f, leave = limit + limit * 1e-5f + 1e-4f;
+	for (int i = 0; i < 3; i++)
+	{
+		if (dir[i] == 0.0f)
+		{
+			if (!(origin[i] >= lo[i] && origin[i] <= hi[i]))
+				return INFINITY;
+			continue;
+		}
+		const float inv = 1.0f / dir[i];
+		float near = (lo[i] - origin[i]) * inv, far = (hi[i] - origin[i]) * inv;
+		if (near > far)
+			std::swap(near, far);
+		enter = near > enter ? near : enter;
+		leave = far < leave ? far : leave;
+	}
+	if (!(enter <= leave))
+		return INFINITY;
+	return enter * (1.0f - 1e-5f) - 1e-4f;
+}
+
+// True when a covered sample lands on a texel the hit filter would call see-through: the same test on the same mesh,
+// with the camera ray carried into the mesh's frame for a mover as Embree carries it.
+bool paintedCutOut(const RasterFrame& frame, const RasterTri& tri, const float dir[3], float t, float u, float v)
+{
+	const RasterSource& source = *tri.m_source;
+	const unsigned* ids = &(*source.m_indices)[(size_t)tri.m_prim * 3];
+	const float* p0 = source.m_vertices + (size_t)ids[0] * 3;
+	const float* p1 = source.m_vertices + (size_t)ids[1] * 3;
+	const float* p2 = source.m_vertices + (size_t)ids[2] * 3;
+	float e1[3], e2[3], normal[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = p1[i] - p0[i];
+		e2[i] = p2[i] - p0[i];
+	}
+	cross3(e1, e2, normal);
+	RTCHit hit;
+	hit.primID = tri.m_prim;
+	hit.u = u;
+	hit.v = v;
+	hit.Ng_x = normal[0];
+	hit.Ng_y = normal[1];
+	hit.Ng_z = normal[2];
+	float local[3] = {dir[0], dir[1], dir[2]};
+	if (source.m_objectSpace)
+		for (int r = 0; r < 3; r++)
+			local[r] = dot3(source.m_inverse + r * 3, dir);
+	RTCRay ray;
+	ray.dir_x = local[0];
+	ray.dir_y = local[1];
+	ray.dir_z = local[2];
+	ray.tfar = t;
+	return cutOutAt(source.m_model, source.m_vertices, source.m_uvs, *source.m_indices, &hit, &ray, frame.m_spread);
+}
+
+// Paints one tile: every lane's triangles reaching it keep, per sample, the nearest hit between the clip planes whose
+// texel is solid, nearer ties going to the lesser key, so the order the triangles come in never changes the result.
+void paintTile(const RasterFrame& frame, const Camera& cam, int width, int height, int row0, int row1, int col0, int col1, TilePaint& paint)
+{
+	const int tile = (row0 / kTileSize) * frame.m_tilesX + col0 / kTileSize;
+	float dir[kTileSize * kTileSize][3], tNear[kTileSize * kTileSize], tFar[kTileSize * kTileSize];
+	for (int row = row0; row < row1; row++)
+	{
+		const double ndcY = pixelNdcY(row, height);
+		for (int col = col0; col < col1; col++)
+		{
+			const int k = (row - row0) * kTileSize + (col - col0);
+			paint.m_t[k] = INFINITY;
+			paint.m_tri[k] = 0;
+			paint.m_rayNear[k] = INFINITY;
+			float rawDir[3], length;
+			if (pixelRay(cam, pixelNdcX(col, width), ndcY, dir[k], rawDir, tNear[k], length))
+				tFar[k] = tNear[k] + length;
+			else
+			{
+				dir[k][0] = dir[k][1] = dir[k][2] = 0.0f;
+				tNear[k] = INFINITY;
+				tFar[k] = -INFINITY;
+			}
+		}
+	}
+	const std::vector<RasterLane>& lanes = *frame.m_lanes;
+	for (size_t l = 0; l < lanes.size(); l++)
+	{
+		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
+		for (size_t b = 0; b < bin.size(); b++)
+		{
+			if (bin[b] & kRectBit)
+				continue;
+			const RasterTri& tri = lanes[l].m_tris[bin[b]];
+			const int r0 = std::max(tri.m_row0, row0), r1 = std::min(tri.m_row1, row1 - 1);
+			const int c0 = std::max(tri.m_col0, col0), c1 = std::min(tri.m_col1, col1 - 1);
+			for (int row = r0; row <= r1; row++)
+			{
+				long long e0 = tri.m_edge[0] + tri.m_stepX[0] * c0 + tri.m_stepY[0] * row;
+				long long e1 = tri.m_edge[1] + tri.m_stepX[1] * c0 + tri.m_stepY[1] * row;
+				long long e2 = tri.m_edge[2] + tri.m_stepX[2] * c0 + tri.m_stepY[2] * row;
+				for (int col = c0; col <= c1; col++, e0 += tri.m_stepX[0], e1 += tri.m_stepX[1], e2 += tri.m_stepX[2])
+				{
+					if ((e0 | e1 | e2) < 0)
+						continue;
+					const int k = (row - row0) * kTileSize + (col - col0);
+					const float* d = dir[k];
+					const float det = dot3(d, tri.m_det);
+					if (det == 0.0f)
+						continue;
+					const float inv = 1.0f / det;
+					const float t = tri.m_t * inv;
+					if (!(t >= tNear[k] && t <= tFar[k]))
+						continue;
+					if (t > paint.m_t[k] || (t == paint.m_t[k] && tri.m_key >= paint.m_tri[k]->m_key))
+						continue;
+					float u = dot3(d, tri.m_u) * inv, v = dot3(d, tri.m_v) * inv;
+					u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+					v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+					if (u + v > 1.0f)
+					{
+						const float scale = 1.0f / (u + v);
+						u *= scale;
+						v *= scale;
+					}
+					if (tri.m_source && paintedCutOut(frame, tri, d, t, u, v))
+						continue;
+					paint.m_t[k] = t;
+					paint.m_u[k] = u;
+					paint.m_v[k] = v;
+					paint.m_tri[k] = &tri;
+				}
+			}
+		}
+	}
+	// Once every triangle is in, a sample is searched only where its own ray enters a rect's box before the painted hit.
+	for (size_t l = 0; l < lanes.size(); l++)
+	{
+		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
+		for (size_t b = 0; b < bin.size(); b++)
+		{
+			if (!(bin[b] & kRectBit))
+				continue;
+			const RayRect& rect = lanes[l].m_rects[bin[b] & ~kRectBit];
+			const int r0 = std::max(rect.m_row0, row0), r1 = std::min(rect.m_row1, row1 - 1);
+			const int c0 = std::max(rect.m_col0, col0), c1 = std::min(rect.m_col1, col1 - 1);
+			for (int row = r0; row <= r1; row++)
+				for (int col = c0; col <= c1; col++)
+				{
+					const int k = (row - row0) * kTileSize + (col - col0);
+					const float limit = paint.m_t[k] < tFar[k] ? paint.m_t[k] : tFar[k];
+					if (paint.m_rayNear[k] <= limit || !(rect.m_distance <= limit))
+						continue;
+					const float enter = rayEnters(cam.m_origin, dir[k], rect.m_lo, rect.m_hi, limit);
+					paint.m_rayNear[k] = enter < paint.m_rayNear[k] ? enter : paint.m_rayNear[k];
+				}
+		}
+	}
+}
+
+// What the painting says of one sample: shade the painted hit, search where a rect may hold something nearer (no
+// further than just past the painted hit), or a miss.
+void paintedFound(const TilePaint& paint, int k, FoundHit& found)
+{
+	const RasterTri* tri = paint.m_tri[k];
+	if (paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k])
+	{
+		found.m_kind = kFoundSearch;
+		found.m_reach = tri ? paint.m_t[k] + paint.m_t[k] * (1.0f / 1024.0f) + 0.01f : INFINITY;
+		return;
+	}
+	if (!tri)
+	{
+		found.m_kind = kFoundMiss;
+		return;
+	}
+	found.m_kind = kFoundHit;
+	found.m_t = paint.m_t[k];
+	RTCHit& hit = found.m_hit;
+	hit.Ng_x = hit.Ng_y = hit.Ng_z = 0.0f;
+	hit.u = paint.m_u[k];
+	hit.v = paint.m_v[k];
+	hit.primID = tri->m_prim;
+	hit.geomID = tri->m_geom;
+	for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+	{
+		hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+		hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+	}
+	hit.instID[0] = tri->m_inst;
+	hit.instPrimID[0] = 0;
+}
+
 // Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
 // written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
 // `scratch`, when given, records the id and triangle of every hit for the edge pass. `radiance`, under ER_SWARM_THERMAL,
@@ -3768,6 +4668,9 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
 {
 	const int width = job.m_width;
+	TilePaint paint;
+	if (job.m_raster)
+		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, job.m_height);
@@ -3777,8 +4680,11 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			sample.m_radiance = 0.0f;
 			const size_t offset = (size_t)row * width + col;
 			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+			FoundHit found;
+			if (job.m_raster)
+				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
 			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0);
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0);
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
@@ -3889,6 +4795,59 @@ bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam
 		cache.m_ok[slot] = projectTriangle(job, cam, hit, cache.m_x[slot], cache.m_y[slot]);
 	}
 	return cache.m_ok[slot];
+}
+
+// ER_SWARM_EDGE_BEHIND: where a ray from the eye along dir lands on one known triangle, when it lands inside it between
+// the clip planes; false for a triangle the scene no longer knows, or one with cut-outs only a search can test.
+bool triangleHit(const TileJob& job, const float origin[3], const float dir[3], float tNear, float tFar, const HitId& id, RTCHit& hit, float& t)
+{
+	for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+	{
+		hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+		hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+	}
+	hit.instID[0] = id.m_inst;
+	hit.instPrimID[0] = 0;
+	hit.instID[1] = id.m_inst1;
+	hit.instPrimID[1] = id.m_instPrim1;
+	hit.geomID = id.m_geom;
+	hit.primID = id.m_prim;
+	int segmentation;
+	HitSurface surface;
+	if (!resolveHit(hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface, true))
+		return false;
+	if (surface.m_hasAlpha && job.m_alphaCutout)
+		return false;
+	float e1[3], e2[3], toEye[3], pvec[3], qvec[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+		e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+		toEye[i] = origin[i] - surface.m_corners[0][i];
+	}
+	cross3(dir, e2, pvec);
+	const float det = dot3(e1, pvec);
+	if (det == 0.0f)
+		return false;
+	const float inv = 1.0f / det;
+	const float u = dot3(toEye, pvec) * inv;
+	if (!(u >= 0.0f && u <= 1.0f))
+		return false;
+	cross3(toEye, e1, qvec);
+	const float v = dot3(dir, qvec) * inv;
+	if (!(v >= 0.0f && u + v <= 1.0f))
+		return false;
+	t = dot3(e2, qvec) * inv;
+	if (!(t >= tNear && t <= tFar))
+		return false;
+	hit.u = u;
+	hit.v = v;
+	float normal[3];
+	cross3(e1, e2, normal);
+	hit.Ng_x = normal[0];
+	hit.Ng_y = normal[1];
+	hit.Ng_z = normal[2];
+	return true;
 }
 
 // Keeps the part of `poly` on the inner side of the directed line a -> b, where inside is the side
@@ -4179,8 +5138,36 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
+					// ER_SWARM_EDGE_BEHIND: the nearest of the pixel's and its neighbours' triangles under the probe
+					// point is shaded where the probe would land on it, and the search runs only where none lies there.
+					FoundHit behind;
+					behind.m_kind = kFoundHit;
+					behind.m_t = INFINITY;
+					float probeDir[3], rawDir[3], probeNear, probeLength;
+					if (job.m_shading->m_edgeBehind && pixelRay(cam, px, py, probeDir, rawDir, probeNear, probeLength))
+					{
+						const size_t cells[5] = {offset, neighbours[0], neighbours[1], neighbours[2], neighbours[3]};
+						for (int n = 0; n < 5; n++)
+						{
+							if ((n > 0 && cells[n] == offset) || hits[cells[n]].m_prim == RTC_INVALID_GEOMETRY_ID)
+								continue;
+							bool seen = false;
+							for (int m = 0; m < n && !seen; m++)
+								seen = hits[cells[m]].m_prim != RTC_INVALID_GEOMETRY_ID && sameTriangle(hits[cells[m]], hits[cells[n]]);
+							RTCHit hit;
+							float t;
+							if (!seen && triangleHit(job, cam.m_origin, probeDir, probeNear, probeNear + probeLength, hits[cells[n]], hit, t) &&
+								t < behind.m_t)
+							{
+								behind.m_t = t;
+								behind.m_hit = hit;
+							}
+						}
+					}
 					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
-					if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
+					if (behind.m_t < INFINITY && traceRay(job, setup, px, py, args, shadowArgs, probe, INFINITY, 0, &behind) && probe.m_shaded)
+						restColour = probe.m_rgb;
+					else if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
 						restColour = probe.m_rgb;
 					else if (target.m_background)
 					{
@@ -4376,7 +5363,114 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		}
 	}
 
+	// ER_SWARM_RASTER: a camera that remembers its lens paints its frame. Here the chunks in view are listed, cut the first
+	// time they are painted; in the parallel region every thread paints its share before the first tile is traced.
+	const bool raster = memory != 0 && shading && shading->m_raster;
+	RasterView rasterView;
+	RasterFrame rasterFrame;
+	long long forestCells = 0;
+	job.m_raster = 0;
+	job.m_alphaCutout = alphaCutout;
+	if (raster)
+	{
+		setupRasterView(setups[0].m_cam, width, height, m_data->m_staticInstanceId, rasterView);
+		const size_t frameTiles = (size_t)rasterView.m_tilesX * (size_t)((height + kTileSize - 1) / kTileSize);
+		m_data->m_rasterLanes.resize((size_t)threads);
+		for (size_t i = 0; i < m_data->m_rasterLanes.size(); i++)
+		{
+			RasterLane& lane = m_data->m_rasterLanes[i];
+			lane.m_tris.clear();
+			lane.m_rects.clear();
+			lane.m_bins.resize(frameTiles);
+			for (size_t t = 0; t < frameTiles; t++)
+				lane.m_bins[t].clear();
+		}
+		std::vector<RasterJob>& jobs = m_data->m_rasterJobs;
+		std::vector<RasterSource>& sources = m_data->m_rasterSources;
+		jobs.clear();
+		sources.clear();
+		// Reserved whole, so the sources the jobs point at never move.
+		sources.reserve(m_data->m_members.size() + m_data->m_byGeomId.size());
+		for (size_t i = 0; i < m_data->m_members.size(); i++)
+		{
+			StaticMember* member = m_data->m_members[i];
+			if (member->m_retired || !member->m_visible)
+				continue;
+			if (member->m_chunks.empty())
+				buildRasterChunks(member->m_vertices, member->m_indices, member->m_chunks, member->m_chunksLo, member->m_chunksHi);
+			if (!boxVisible(rasterView, member->m_chunksLo, member->m_chunksHi))
+				continue;
+			const RasterSource* source = 0;
+			if (alphaCutout && member->m_hasAlpha)
+			{
+				RasterSource s;
+				s.m_model = member->m_obj->m_model;
+				s.m_vertices = &member->m_vertices[0];
+				s.m_uvs = member->m_uvs;
+				s.m_indices = &member->m_indices;
+				s.m_objectSpace = false;
+				sources.push_back(s);
+				source = &sources.back();
+			}
+			for (size_t c = 0; c < member->m_chunks.size(); c++)
+			{
+				const RasterJob unit = {&member->m_chunks[c], member, 0, source};
+				jobs.push_back(unit);
+			}
+		}
+		for (size_t i = 0; i < m_data->m_byGeomId.size(); i++)
+		{
+			const Instance* inst = m_data->m_byGeomId[i];
+			if (!inst || !inst->m_enabled || !inst->m_tree)
+				continue;
+			const float* m = inst->m_transform;
+			const double a[3][3] = {{m[0], m[4], m[8]}, {m[1], m[5], m[9]}, {m[2], m[6], m[10]}};
+			const double cof[3][3] = {{a[1][1] * a[2][2] - a[1][2] * a[2][1], a[0][2] * a[2][1] - a[0][1] * a[2][2], a[0][1] * a[1][2] - a[0][2] * a[1][1]},
+									  {a[1][2] * a[2][0] - a[1][0] * a[2][2], a[0][0] * a[2][2] - a[0][2] * a[2][0], a[0][2] * a[1][0] - a[0][0] * a[1][2]},
+									  {a[1][0] * a[2][1] - a[1][1] * a[2][0], a[0][1] * a[2][0] - a[0][0] * a[2][1], a[0][0] * a[1][1] - a[0][1] * a[1][0]}};
+			const double det = a[0][0] * cof[0][0] + a[0][1] * cof[1][0] + a[0][2] * cof[2][0];
+			// A flattened placement is disabled in the tree, so nothing of it is drawn.
+			if (!(det != 0.0))
+				continue;
+			MeshTree* tree = inst->m_tree;
+			if (tree->m_chunks.empty())
+				buildRasterChunks(tree->m_vertices, tree->m_indices, tree->m_chunks, tree->m_chunksLo, tree->m_chunksHi);
+			float lo[3], hi[3];
+			worldBox(m, tree->m_chunksLo, tree->m_chunksHi, lo, hi);
+			if (!boxVisible(rasterView, lo, hi))
+				continue;
+			const RasterSource* source = 0;
+			if (alphaCutout && inst->m_hasAlpha)
+			{
+				RasterSource s;
+				s.m_model = inst->m_obj->m_model;
+				s.m_vertices = &tree->m_vertices[0];
+				s.m_uvs = tree->m_uvs.data();
+				s.m_indices = &tree->m_indices;
+				s.m_objectSpace = true;
+				for (int r = 0; r < 3; r++)
+					for (int c = 0; c < 3; c++)
+						s.m_inverse[r * 3 + c] = (float)(cof[r][c] / det);
+				sources.push_back(s);
+				source = &sources.back();
+			}
+			for (size_t c = 0; c < tree->m_chunks.size(); c++)
+			{
+				const RasterJob unit = {&tree->m_chunks[c], 0, inst, source};
+				jobs.push_back(unit);
+			}
+		}
+		if (!m_data->m_forestGrid.m_built)
+			buildForestGrid(m_data->m_forestGrid, m_data->m_batches);
+		forestCells = (long long)m_data->m_forestGrid.m_cellStart.size() - 1;
+		rasterFrame.m_lanes = &m_data->m_rasterLanes;
+		rasterFrame.m_tilesX = rasterView.m_tilesX;
+		rasterFrame.m_spread = job.m_pixelSpread;
+		job.m_raster = &rasterFrame;
+	}
+
 	// The depth hint: the same lens's last hits, put onto this frame's pixels, tell each ray about how far to search.
+	// A painted frame needs none: the painting bounds every ray it still casts.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
 	float viewProj[4][4];
@@ -4385,7 +5479,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	if (memory)
 	{
 		const Camera& cam = setups[0].m_cam;
-		if (memory->m_points.size() == numPixels * 3)
+		if (memory->m_points.size() == numPixels * 3 && !raster)
 		{
 			for (int r = 0; r < 4; r++)
 				for (int c = 0; c < 4; c++)
@@ -4477,6 +5571,24 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
 				hintFrames[0][i] = far;
 			}
+		}
+
+		// Every thread paints its share of the chunks and trees into its own lane; the loops' barriers then hand all the
+		// lanes to whichever thread traces a tile.
+		if (job.m_raster)
+		{
+#ifdef _OPENMP
+			RasterLane& lane = m_data->m_rasterLanes[(size_t)omp_get_thread_num()];
+#else
+			RasterLane& lane = m_data->m_rasterLanes[0];
+#endif
+			const long long numJobs = (long long)m_data->m_rasterJobs.size();
+#pragma omp for schedule(static)
+			for (long long i = 0; i < numJobs; i++)
+				paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
+#pragma omp for schedule(static)
+			for (long long i = 0; i < forestCells; i++)
+				paintForestCell(lane, rasterView, m_data->m_forestGrid, (size_t)i, m_data->m_batches);
 		}
 
 		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
