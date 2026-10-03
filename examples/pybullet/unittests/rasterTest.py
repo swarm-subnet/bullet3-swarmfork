@@ -1,6 +1,6 @@
 """ER_SWARM_RASTER: a painted frame shows what the searched frame shows, dot for dot but for samples on a seam two bodies
 share, through clipping, back faces, movers, cut-outs and forest trees, searched tree by tree or whole, with the same
-bytes at any thread count; and ER_SWARM_EDGE_BEHIND changes the colour of edge dots only."""
+bytes at any thread count."""
 import hashlib
 import os
 import subprocess
@@ -17,9 +17,8 @@ from forestBatchTest import forest_world, ground, write_forest, write_meshes
 
 SIZE = 96
 RASTER = getattr(p, "ER_SWARM_RASTER", 0)
-BEHIND = getattr(p, "ER_SWARM_EDGE_BEHIND", 0)
 INSTANCED = getattr(p, "VISUAL_SHAPE_RENDER_INSTANCED", 0)
-NEEDS_FLAG = unittest.skipUnless(RASTER and BEHIND, "wheel built without the painted frame")
+NEEDS_FLAG = unittest.skipUnless(RASTER, "wheel built without the painted frame")
 PICTURE = (getattr(p, "ER_SWARM_RAYCAST", 0) | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER_SWARM_MOVER_SHADOW", 0) |
            getattr(p, "ER_EDGE_ANTIALIAS", 0) | getattr(p, "ER_ALPHA_CUTOUT", 0) | getattr(p, "ER_TEXTURE_FILTER", 0) |
            p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX)
@@ -111,13 +110,6 @@ class TestRaster(unittest.TestCase):
     for a, b in zip(render(PICTURE, size=32), render(PICTURE | RASTER, size=32)):
       self.assertTrue(np.array_equal(a, b))
 
-  def test_edge_behind_changes_edge_colour_only(self):
-    """With the edge shortcut, depth and object map are untouched and only a few edge dots change colour."""
-    plain, behind = render(PICTURE | RASTER), render(PICTURE | RASTER | BEHIND)
-    self.assertTrue(np.array_equal(plain[1], behind[1]))
-    self.assertTrue(np.array_equal(plain[2], behind[2]))
-    self.assertLessEqual((np.abs(plain[0].astype(int) - behind[0].astype(int)).max(axis=2) > 0).mean(), 0.05)
-
 
 @NEEDS_FLAG
 class TestRasterScenes(unittest.TestCase):
@@ -180,9 +172,8 @@ def run_hash():
   digest = hashlib.sha256()
   for position in ([9.5, -9.0, 0.3], IN_VIEW):
     p.resetBasePositionAndOrientation(blue, position, [0, 0, 0, 1])
-    for frame in (render(PICTURE | RASTER), render(PICTURE | RASTER | BEHIND)):
-      for part in frame:
-        digest.update(part.tobytes())
+    for part in render(PICTURE | RASTER):
+      digest.update(part.tobytes())
   folder = tempfile.mkdtemp()
   forest_world(folder)
   for part in render(PICTURE | RASTER, eye=(0.0, -6.0, 6.0), target=(0.0, 0.0, 0.0)):

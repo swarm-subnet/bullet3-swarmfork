@@ -4945,59 +4945,6 @@ bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam
 	return cache.m_ok[slot];
 }
 
-// ER_SWARM_EDGE_BEHIND: where a ray from the eye along dir lands on one known triangle, when it lands inside it between
-// the clip planes; false for a triangle the scene no longer knows, or one with cut-outs only a search can test.
-bool triangleHit(const TileJob& job, const float origin[3], const float dir[3], float tNear, float tFar, const HitId& id, RTCHit& hit, float& t)
-{
-	for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
-	{
-		hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
-		hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
-	}
-	hit.instID[0] = id.m_inst;
-	hit.instPrimID[0] = 0;
-	hit.instID[1] = id.m_inst1;
-	hit.instPrimID[1] = id.m_instPrim1;
-	hit.geomID = id.m_geom;
-	hit.primID = id.m_prim;
-	int segmentation;
-	HitSurface surface;
-	if (!resolveHit(hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface, true))
-		return false;
-	if (surface.m_hasAlpha && job.m_alphaCutout)
-		return false;
-	float e1[3], e2[3], toEye[3], pvec[3], qvec[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
-		e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
-		toEye[i] = origin[i] - surface.m_corners[0][i];
-	}
-	cross3(dir, e2, pvec);
-	const float det = dot3(e1, pvec);
-	if (det == 0.0f)
-		return false;
-	const float inv = 1.0f / det;
-	const float u = dot3(toEye, pvec) * inv;
-	if (!(u >= 0.0f && u <= 1.0f))
-		return false;
-	cross3(toEye, e1, qvec);
-	const float v = dot3(dir, qvec) * inv;
-	if (!(v >= 0.0f && u + v <= 1.0f))
-		return false;
-	t = dot3(e2, qvec) * inv;
-	if (!(t >= tNear && t <= tFar))
-		return false;
-	hit.u = u;
-	hit.v = v;
-	float normal[3];
-	cross3(e1, e2, normal);
-	hit.Ng_x = normal[0];
-	hit.Ng_y = normal[1];
-	hit.Ng_z = normal[2];
-	return true;
-}
-
 // Keeps the part of `poly` on the inner side of the directed line a -> b, where inside is the side
 // `sign` says the triangle's third corner lies on.
 void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
@@ -5286,36 +5233,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					double px = (ndcX - coveredCx) / rest, py = (ndcY - coveredCy) / rest;
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
-					// ER_SWARM_EDGE_BEHIND: the nearest of the pixel's and its neighbours' triangles under the probe
-					// point is shaded where the probe would land on it, and the search runs only where none lies there.
-					FoundHit behind;
-					behind.m_kind = kFoundHit;
-					behind.m_t = INFINITY;
-					float probeDir[3], rawDir[3], probeNear, probeLength;
-					if (job.m_shading->m_edgeBehind && pixelRay(cam, px, py, probeDir, rawDir, probeNear, probeLength))
-					{
-						const size_t cells[5] = {offset, neighbours[0], neighbours[1], neighbours[2], neighbours[3]};
-						for (int n = 0; n < 5; n++)
-						{
-							if ((n > 0 && cells[n] == offset) || hits[cells[n]].m_prim == RTC_INVALID_GEOMETRY_ID)
-								continue;
-							bool seen = false;
-							for (int m = 0; m < n && !seen; m++)
-								seen = hits[cells[m]].m_prim != RTC_INVALID_GEOMETRY_ID && sameTriangle(hits[cells[m]], hits[cells[n]]);
-							RTCHit hit;
-							float t;
-							if (!seen && triangleHit(job, cam.m_origin, probeDir, probeNear, probeNear + probeLength, hits[cells[n]], hit, t) &&
-								t < behind.m_t)
-							{
-								behind.m_t = t;
-								behind.m_hit = hit;
-							}
-						}
-					}
 					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
-					if (behind.m_t < INFINITY && traceRay(job, setup, px, py, args, shadowArgs, probe, INFINITY, 0, &behind) && probe.m_shaded)
-						restColour = probe.m_rgb;
-					else if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
+					if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
 						restColour = probe.m_rgb;
 					else if (target.m_background)
 					{
