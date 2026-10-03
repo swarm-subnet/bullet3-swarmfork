@@ -3099,6 +3099,28 @@ float paneLight(const SwarmRaycastShading& shading, const float normal[3], const
 	return 1.0f - reflect;
 }
 
+// A glass-backed module seen in daylight, in linear light: the sky its pane mirrors, and through the pane its backsheet
+// in the pane's colour, lit and shadowed as the pane, standing in for a ray behind it.
+void moduleLight(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3], const float base[3],
+				 const float viewDir[3], float shadow, float lit[3])
+{
+	float sky[3], skyLight[3];
+	const float through = paneLight(shading, normal, viewDir, sky);
+	if (shading.m_sky)
+		shading.m_sky->irradiance(normal, skyLight);
+	else
+		for (int i = 0; i < 3; i++)
+			skyLight[i] = shading.m_ambientColor[i];
+	const float nDotL = dot3(normal, shading.m_lightDir);
+	const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+	const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
+	for (int i = 0; i < 3; i++)
+	{
+		const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+		lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading.m_ambientCoeff * skyLight[i] + shadow * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
+	}
+}
+
 // A daylight colour on its way to the byte: its linear light, the horizon colour its haze blends towards and its distance.
 struct DaylightColour
 {
@@ -3290,6 +3312,8 @@ struct ShadeWait
 	float m_dir[3];
 	float m_shadow;
 	float m_distance;
+	// Lit as a glass-backed module rather than as an opaque surface.
+	bool m_module;
 };
 
 struct Sample
@@ -3309,6 +3333,30 @@ struct Sample
 	bool m_shadeDeferred;
 	ShadeWait m_shade;
 };
+
+// Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
+inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], const float duvdx[2],
+						const float duvdy[2], const float dir[3], float shadow, float distance, bool module)
+{
+	ShadeWait& wait = out.m_shade;
+	wait.m_surface = surface;
+	wait.m_u = hit.u;
+	wait.m_v = hit.v;
+	for (int i = 0; i < 3; i++)
+	{
+		wait.m_faceNormal[i] = faceNormal[i];
+		wait.m_dir[i] = dir[i];
+	}
+	for (int i = 0; i < 2; i++)
+	{
+		wait.m_duvdx[i] = duvdx[i];
+		wait.m_duvdy[i] = duvdy[i];
+	}
+	wait.m_shadow = shadow;
+	wait.m_distance = distance;
+	wait.m_module = module;
+	out.m_shadeDeferred = true;
+}
 
 // A lit daylight colour's byte now, or the colour kept in the sample for its tile's batched write.
 inline void daylightOut(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, Sample& out, bool defer)
@@ -4153,24 +4201,15 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
 		if (surface.m_glassBacked)
 		{
-			// A module: its backsheet in the pane's colour, lit and shadowed as the pane, stands in for a ray behind it.
-			float normal[3], base[3], sky[3], skyLight[3];
-			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
-			const float through = paneLight(*shading, normal, dir, sky);
-			if (shading->m_sky)
-				shading->m_sky->irradiance(normal, skyLight);
-			else
-				for (int i = 0; i < 3; i++)
-					skyLight[i] = shading->m_ambientColor[i];
-			const float nDotL = dot3(normal, shading->m_lightDir);
-			const float direct = nDotL > 0.0f ? nDotL : 0.0f;
-			const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
-			for (int i = 0; i < 3; i++)
+			if (deferColour)
 			{
-				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
-				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
+				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, true);
+				return true;
 			}
-			daylightOut(*shading, lit, dir, t, out, deferColour);
+			float normal[3], base[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			moduleLight(*shading, surface, normal, base, dir, shadow, lit);
+			daylightOut(*shading, lit, dir, t, out, false);
 			return true;
 		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
@@ -4246,23 +4285,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	if (deferColour && shading->m_daylight)
 	{
 		// shadeDaylight's steps are left for the tile, which reads the textures of its samples together.
-		ShadeWait& wait = out.m_shade;
-		wait.m_surface = surface;
-		wait.m_u = rayhit.hit.u;
-		wait.m_v = rayhit.hit.v;
-		for (int i = 0; i < 3; i++)
-		{
-			wait.m_faceNormal[i] = faceNormal[i];
-			wait.m_dir[i] = dir[i];
-		}
-		for (int i = 0; i < 2; i++)
-		{
-			wait.m_duvdx[i] = duvdx[i];
-			wait.m_duvdy[i] = duvdy[i];
-		}
-		wait.m_shadow = shadow;
-		wait.m_distance = t;
-		out.m_shadeDeferred = true;
+		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, false);
 		return true;
 	}
 	const float point[3] = {hx, hy, hz};
@@ -5132,7 +5155,10 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			const ShadeWait& wait = shades[i];
 			float base[3], lit[3];
 			surfaceTint(wait.m_surface, texels[i], base);
-			daylightLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
+			if (wait.m_module)
+				moduleLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
+			else
+				daylightLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
 			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting]);
 			waitingOut[numWaiting++] = shadeOut[i];
 		}
