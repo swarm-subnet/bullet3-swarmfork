@@ -336,6 +336,9 @@ struct QueryContext
 	float m_pixelSpread;
 	// How far along its ray any camera ray of this thread got this frame, for the region a kept frame depends on.
 	float m_farthest;
+	// ER_SWARM_RASTER: the forest tree a ray cast straight into its mesh is in, since such a hit names no instance.
+	const Batch* m_directBatch;
+	unsigned m_directPlacement;
 };
 
 // Casts the shadow-map cells [col0, col1) x [row0, row1) along -light; each ray depends only on the map and the tree.
@@ -351,6 +354,8 @@ void castShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row
 	ctx.m_alphaCutout = map.m_alphaCutout;
 	ctx.m_leafNoShadow = map.m_leafNoShadow;
 	ctx.m_pixelSpread = 0.0f;
+	ctx.m_directBatch = 0;
+	ctx.m_directPlacement = 0;
 	RTCIntersectArguments args;
 	rtcInitIntersectArguments(&args);
 	args.context = &ctx.m_context;
@@ -493,6 +498,11 @@ const Instance* hitInstance(const QueryContext* ctx, const RTCHit* hit)
 // The batch a hit inside the forest belongs to and the placement it landed on; null for any other hit.
 const Batch* hitBatch(const QueryContext* ctx, const RTCHit* hit, unsigned& placement)
 {
+	if (ctx->m_directBatch)
+	{
+		placement = ctx->m_directPlacement;
+		return ctx->m_directBatch;
+	}
 	if (!ctx->m_batches || ctx->m_forestId == RTC_INVALID_GEOMETRY_ID || hit->instID[0] != ctx->m_forestId)
 		return 0;
 	if (hit->instID[1] >= ctx->m_batches->size())
@@ -1303,7 +1313,21 @@ struct RayRect
 	float m_distance;
 	float m_lo[3];
 	float m_hi[3];
+	// The forest tree the box holds, its batch and placement; kNoTree for a dense chunk, which only a full search draws.
+	unsigned m_batch;
+	unsigned m_placement;
 };
+const unsigned kNoTree = ~0u;
+
+// A forest tree a sample's ray enters before the painted hit, and where it enters the tree's box.
+struct TreeCandidate
+{
+	float m_enter;
+	unsigned m_batch;
+	unsigned m_placement;
+};
+// Trees a sample keeps before it falls back to the full search.
+const int kTreeCandidates = 32;
 
 // One render thread's share of a painted frame: its triangles and rects, and per tile the ones that reach it, a rect's
 // index marked by kRectBit.
@@ -1324,7 +1348,7 @@ struct RasterJob
 	const RasterSource* m_source;
 };
 
-// The forest's trees by square cell across the ground, each tree's world box in cell order with the batch it belongs to.
+// The forest's trees by square cell across the ground, each tree's world box in cell order with its batch and placement.
 struct ForestGrid
 {
 	bool m_built;
@@ -1332,6 +1356,7 @@ struct ForestGrid
 	std::vector<unsigned> m_cellStart;
 	std::vector<float> m_treeBoxes;
 	std::vector<unsigned> m_treeBatch;
+	std::vector<unsigned> m_treePlacement;
 };
 const float kForestCell = 16.0f;
 }  // namespace
@@ -3592,21 +3617,113 @@ bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float r
 }
 
 // What is already known of a ray's first hit: nothing, so it is searched with an along-ray depth hint; a hit to shade as
-// it stands; or a miss.
+// it stands; a miss; or the few forest trees a nearer hit can only be in.
 enum FoundKind
 {
 	kFoundSearch,
 	kFoundHit,
-	kFoundMiss
+	kFoundMiss,
+	kFoundTrees
 };
 
+// For kFoundTrees: the painted hit, when there is one, and the forest trees the ray enters before it, which are the
+// only places a nearer hit can be.
 struct FoundHit
 {
 	FoundKind m_kind;
 	float m_reach;
+	bool m_painted;
 	float m_t;
 	RTCHit m_hit;
+	const TreeCandidate* m_trees;
+	int m_numTrees;
 };
+
+// Nearer entry first, then the lesser batch and placement, so the order never depends on the order the trees were filed.
+inline bool enteredBefore(const TreeCandidate& a, const TreeCandidate& b)
+{
+	if (a.m_enter != b.m_enter)
+		return a.m_enter < b.m_enter;
+	return a.m_batch != b.m_batch ? a.m_batch < b.m_batch : a.m_placement < b.m_placement;
+}
+
+// The first hit of a ray that can only meet something nearer than its painted hit inside a few forest trees: each
+// tree's mesh is searched in the tree's own frame, nearest box first, until the next box starts past the nearest hit.
+// The hit then names the forest, the batch and the placement, as a hit found through the forest's instances does.
+void treesHit(const TileJob& job, RTCRayHit& rayhit, const FoundHit& found, RTCIntersectArguments* args)
+{
+	TreeCandidate order[kTreeCandidates];
+	for (int i = 0; i < found.m_numTrees; i++)
+	{
+		int j = i;
+		while (j > 0 && enteredBefore(found.m_trees[i], order[j - 1]))
+		{
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = found.m_trees[i];
+	}
+	QueryContext* ctx = (QueryContext*)args->context;
+	float nearest = found.m_painted ? found.m_t : rayhit.ray.tfar;
+	bool inTree = false;
+	for (int i = 0; i < found.m_numTrees && order[i].m_enter <= nearest; i++)
+	{
+		const Batch* batch = order[i].m_batch < job.m_batches->size() ? (*job.m_batches)[order[i].m_batch] : 0;
+		if (!batch)
+			continue;
+		// The inverse of the placement's 3x3 part is the transpose of the inverse transpose the batch keeps for normals.
+		const float* inverse = &batch->m_normalRotations[(size_t)order[i].m_placement * 9];
+		const float* placement = &batch->m_transforms[(size_t)order[i].m_placement * 12];
+		const float org[3] = {rayhit.ray.org_x - placement[9], rayhit.ray.org_y - placement[10], rayhit.ray.org_z - placement[11]};
+		const float dir[3] = {rayhit.ray.dir_x, rayhit.ray.dir_y, rayhit.ray.dir_z};
+		float localOrg[3], localDir[3];
+		for (int r = 0; r < 3; r++)
+		{
+			localOrg[r] = (inverse[r] * org[0] + inverse[3 + r] * org[1]) + inverse[6 + r] * org[2];
+			localDir[r] = (inverse[r] * dir[0] + inverse[3 + r] * dir[1]) + inverse[6 + r] * dir[2];
+		}
+		RTCRayHit local;
+		local.ray.org_x = localOrg[0];
+		local.ray.org_y = localOrg[1];
+		local.ray.org_z = localOrg[2];
+		local.ray.dir_x = localDir[0];
+		local.ray.dir_y = localDir[1];
+		local.ray.dir_z = localDir[2];
+		local.ray.tnear = rayhit.ray.tnear;
+		local.ray.tfar = nearest;
+		local.ray.time = 0.0f;
+		local.ray.mask = (unsigned)-1;
+		local.ray.id = 0;
+		local.ray.flags = 0;
+		local.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+		local.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+		ctx->m_directBatch = batch;
+		ctx->m_directPlacement = order[i].m_placement;
+		rtcIntersect1(batch->m_tree->m_scene, &local, args);
+		ctx->m_directBatch = 0;
+		if (local.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+			continue;
+		nearest = local.ray.tfar;
+		inTree = true;
+		rayhit.hit = local.hit;
+		for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+		{
+			rayhit.hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+			rayhit.hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+		}
+		rayhit.hit.instID[0] = job.m_forestId;
+		rayhit.hit.instPrimID[0] = 0;
+		rayhit.hit.instID[1] = order[i].m_batch;
+		rayhit.hit.instPrimID[1] = order[i].m_placement;
+	}
+	if (inTree)
+		rayhit.ray.tfar = nearest;
+	else if (found.m_painted)
+	{
+		rayhit.ray.tfar = found.m_t;
+		rayhit.hit = found.m_hit;
+	}
+}
 
 // One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
 // `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss. `found`, when given,
@@ -3650,6 +3767,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		rayhit.ray.tfar = found->m_t;
 		rayhit.hit = found->m_hit;
 	}
+	else if (found && found->m_kind == kFoundTrees)
+		treesHit(job, rayhit, *found, args);
 	else if (!found || found->m_kind == kFoundSearch)
 		firstHit(job.m_top, rayhit, found ? found->m_reach : (facing > 0.0f ? reach / facing : INFINITY), args);
 	reached(args, rayhit.ray.tfar);
@@ -4319,6 +4438,8 @@ void paintJob(RasterLane& lane, const RasterView& view, const RasterJob& job)
 		rect.m_distance = boxDistance(view.m_origin, lo, hi);
 		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
 		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		rect.m_batch = kNoTree;
+		rect.m_placement = 0;
 		addRayRect(lane, view, rect);
 		return;
 	}
@@ -4362,6 +4483,8 @@ void paintForestCell(RasterLane& lane, const RasterView& view, const ForestGrid&
 		rect.m_distance = boxDistance(view.m_origin, lo, hi);
 		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
 		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		rect.m_batch = grid.m_treeBatch[k];
+		rect.m_placement = grid.m_treePlacement[k];
 		addRayRect(lane, view, rect);
 	}
 }
@@ -4375,6 +4498,7 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 		long long m_x;
 		long long m_y;
 		unsigned m_batch;
+		unsigned m_placement;
 		float m_box[6];
 		bool operator<(const Tree& other) const { return m_x != other.m_x ? m_x < other.m_x : m_y < other.m_y; }
 	};
@@ -4399,6 +4523,7 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 			const float* t = &batch->m_transforms[p * 12];
 			Tree tree;
 			tree.m_batch = (unsigned)b;
+			tree.m_placement = (unsigned)p;
 			for (int r = 0; r < 3; r++)
 			{
 				tree.m_box[r] = INFINITY;
@@ -4431,6 +4556,7 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 	grid.m_cellStart.clear();
 	grid.m_treeBoxes.resize(trees.size() * 6);
 	grid.m_treeBatch.resize(trees.size());
+	grid.m_treePlacement.resize(trees.size());
 	for (size_t i = 0; i < trees.size(); i++)
 	{
 		if (i == 0 || trees[i].m_x != trees[i - 1].m_x || trees[i].m_y != trees[i - 1].m_y)
@@ -4449,6 +4575,7 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 		}
 		memcpy(&grid.m_treeBoxes[i * 6], trees[i].m_box, sizeof(trees[i].m_box));
 		grid.m_treeBatch[i] = trees[i].m_batch;
+		grid.m_treePlacement[i] = trees[i].m_placement;
 	}
 	grid.m_cellStart.push_back((unsigned)trees.size());
 	grid.m_built = true;
@@ -4463,6 +4590,11 @@ struct TilePaint
 	float m_v[kTileSize * kTileSize];
 	const RasterTri* m_tri[kTileSize * kTileSize];
 	float m_rayNear[kTileSize * kTileSize];
+	// The forest trees each sample's ray enters before the painted hit, and whether only the full search will do: a
+	// dense chunk lies on the way, or more trees than kTreeCandidates.
+	TreeCandidate m_trees[kTileSize * kTileSize][kTreeCandidates];
+	int m_numTrees[kTileSize * kTileSize];
+	bool m_wide[kTileSize * kTileSize];
 };
 
 // Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
@@ -4540,6 +4672,8 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 			paint.m_t[k] = INFINITY;
 			paint.m_tri[k] = 0;
 			paint.m_rayNear[k] = INFINITY;
+			paint.m_numTrees[k] = 0;
+			paint.m_wide[k] = false;
 			float rawDir[3], length;
 			if (pixelRay(cam, pixelNdcX(col, width), ndcY, dir[k], rawDir, tNear[k], length))
 				tFar[k] = tNear[k] + length;
@@ -4601,7 +4735,8 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 			}
 		}
 	}
-	// Once every triangle is in, a sample is searched only where its own ray enters a rect's box before the painted hit.
+	// Once every triangle is in, a sample is searched only where its own ray enters a rect's box before the painted hit,
+	// and only in the trees it enters while no dense chunk lies on its way and the trees fit the sample's list.
 	for (size_t l = 0; l < lanes.size(); l++)
 	{
 		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
@@ -4617,32 +4752,45 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 				{
 					const int k = (row - row0) * kTileSize + (col - col0);
 					const float limit = paint.m_t[k] < tFar[k] ? paint.m_t[k] : tFar[k];
-					if (paint.m_rayNear[k] <= limit || !(rect.m_distance <= limit))
+					if (paint.m_wide[k] || !(rect.m_distance <= limit))
 						continue;
 					const float enter = rayEnters(cam.m_origin, dir[k], rect.m_lo, rect.m_hi, limit);
+					if (!(enter < INFINITY))
+						continue;
 					paint.m_rayNear[k] = enter < paint.m_rayNear[k] ? enter : paint.m_rayNear[k];
+					if (rect.m_batch == kNoTree || paint.m_numTrees[k] == kTreeCandidates)
+					{
+						paint.m_wide[k] = true;
+						continue;
+					}
+					TreeCandidate& tree = paint.m_trees[k][paint.m_numTrees[k]++];
+					tree.m_enter = enter;
+					tree.m_batch = rect.m_batch;
+					tree.m_placement = rect.m_placement;
 				}
 		}
 	}
 }
 
-// What the painting says of one sample: shade the painted hit, search where a rect may hold something nearer (no
-// further than just past the painted hit), or a miss.
+// What the painting says of one sample: shade the painted hit; search only the forest trees the ray enters before it;
+// search everything, no further than just past the painted hit, where a dense chunk or too many trees lie on the way;
+// or a miss.
 void paintedFound(const TilePaint& paint, int k, FoundHit& found)
 {
 	const RasterTri* tri = paint.m_tri[k];
-	if (paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k])
+	const bool search = paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k];
+	found.m_painted = tri != 0;
+	if (search && paint.m_wide[k])
 	{
 		found.m_kind = kFoundSearch;
 		found.m_reach = tri ? paint.m_t[k] + paint.m_t[k] * (1.0f / 1024.0f) + 0.01f : INFINITY;
 		return;
 	}
+	found.m_kind = search ? kFoundTrees : (tri ? kFoundHit : kFoundMiss);
+	found.m_trees = paint.m_trees[k];
+	found.m_numTrees = paint.m_numTrees[k];
 	if (!tri)
-	{
-		found.m_kind = kFoundMiss;
 		return;
-	}
-	found.m_kind = kFoundHit;
 	found.m_t = paint.m_t[k];
 	RTCHit& hit = found.m_hit;
 	hit.Ng_x = hit.Ng_y = hit.Ng_z = 0.0f;
@@ -5542,6 +5690,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
 		ctx.m_pixelSpread = job.m_pixelSpread;
 		ctx.m_farthest = 0.0f;
+		ctx.m_directBatch = 0;
+		ctx.m_directPlacement = 0;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;

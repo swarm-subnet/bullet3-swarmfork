@@ -1,6 +1,6 @@
 """ER_SWARM_RASTER: a painted frame shows what the searched frame shows, dot for dot but for samples on a seam two bodies
-share, through clipping, back faces, movers, cut-outs and forest trees, with the same bytes at any thread count; and
-ER_SWARM_EDGE_BEHIND changes the colour of edge dots only."""
+share, through clipping, back faces, movers, cut-outs and forest trees, searched tree by tree or whole, with the same
+bytes at any thread count; and ER_SWARM_EDGE_BEHIND changes the colour of edge dots only."""
 import hashlib
 import os
 import subprocess
@@ -13,11 +13,12 @@ import pybullet as p
 
 from alphaCutoutTest import build_world as cutout_world
 from alphaCutoutTest import write_leaf_tga
-from forestBatchTest import forest_world
+from forestBatchTest import forest_world, ground, write_forest, write_meshes
 
 SIZE = 96
 RASTER = getattr(p, "ER_SWARM_RASTER", 0)
 BEHIND = getattr(p, "ER_SWARM_EDGE_BEHIND", 0)
+INSTANCED = getattr(p, "VISUAL_SHAPE_RENDER_INSTANCED", 0)
 NEEDS_FLAG = unittest.skipUnless(RASTER and BEHIND, "wheel built without the painted frame")
 PICTURE = (getattr(p, "ER_SWARM_RAYCAST", 0) | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER_SWARM_MOVER_SHADOW", 0) |
            getattr(p, "ER_EDGE_ANTIALIAS", 0) | getattr(p, "ER_ALPHA_CUTOUT", 0) | getattr(p, "ER_TEXTURE_FILTER", 0) |
@@ -150,6 +151,18 @@ class TestRasterScenes(unittest.TestCase):
     forest_world(self.folder)
     for eye, target in (((0.0, -6.0, 6.0), (0.0, 0.0, 0.0)), ((0.0, -7.0, 0.6), (0.0, 0.0, 1.0))):
       assert_same_frame(self, render(PICTURE, eye=eye, target=target), render(PICTURE | RASTER, eye=eye, target=target))
+
+  def test_a_row_of_trees_deeper_than_the_list_is_searched_whole(self):
+    """Looking down a row of forty trees, rays enter more boxes than a sample keeps, and the full search draws them."""
+    p.resetSimulation()
+    ground()
+    row = [(k % 2, (0.0, -4.0 + 0.25 * k, 0.4), 0.3 * k, (1.0, 1.0, 1.0)) for k in range(40)]
+    path = write_forest(self.folder, write_meshes(self.folder), row)
+    shape = p.createVisualShape(p.GEOM_MESH, fileName=path, flags=INSTANCED | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY,
+                                specularColor=[0, 0, 0])
+    p.createMultiBody(0, -1, shape)
+    eye, target = (0.0, -9.0, 0.7), (0.0, 0.0, 0.5)
+    assert_same_frame(self, render(PICTURE, eye=eye, target=target), render(PICTURE | RASTER, eye=eye, target=target))
 
   def test_same_bytes_for_one_two_and_four_threads(self):
     """Every painted frame of the scripted run hashes the same at every thread count."""
