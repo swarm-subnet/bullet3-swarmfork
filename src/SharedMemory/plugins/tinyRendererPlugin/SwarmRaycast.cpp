@@ -30,6 +30,7 @@
 #include "SwarmLowLight.h"
 #include "SwarmSky.h"
 #include "SwarmThermal.h"
+#include "Bullet3Common/b3DiskCache.h"
 #include "Bullet3Common/b3Logging.h"
 #include "LinearMath/btTransform.h"
 
@@ -880,7 +881,23 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
 	rtcCommitGeometry(tree->m_geometry);
 	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
+	// A tree another process of this machine built over the same arrays is loaded instead of built; the load checks the
+	// image against the geometry and builds when they differ.
+	std::string diskPath;
+	std::vector<char> image;
+	unsigned long long diskKey = b3DiskCacheHash("SWCTREE1", 8);
+	diskKey = b3DiskCacheHash(&vertices[0], numVertices * 3 * sizeof(float), diskKey);
+	diskKey = b3DiskCacheHash(&indices[0], indices.size() * sizeof(unsigned), diskKey);
+	const bool onDisk = b3DiskCachePath(diskKey, "ctree", diskPath);
+	if (onDisk && b3DiskCacheRead(diskPath, image) && !image.empty())
+		rtcSwarmLoadTree(tree->m_scene, &image[0], image.size());
 	joinCommit(tree->m_scene);
+	if (onDisk && image.empty())
+	{
+		image.resize(rtcSwarmSaveTree(tree->m_scene, 0, 0));
+		if (!image.empty() && rtcSwarmSaveTree(tree->m_scene, &image[0], image.size()) == image.size())
+			b3DiskCacheWrite(diskPath, &image[0], image.size());
+	}
 	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
 	return tree;
 }
