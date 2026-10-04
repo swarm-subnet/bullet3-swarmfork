@@ -3267,6 +3267,54 @@ void moduleLight(const SwarmRaycastShading& shading, const HitSurface& surface, 
 	}
 }
 
+// moduleLight for count modules at once: each module's steps as moduleLight takes them, the sky each pane mirrors and
+// the sky light on each normal looked up together, eight at a time, as daylightLightMany looks up its own.
+void moduleLightMany(const SwarmRaycastShading& shading, const HitSurface* const* surfaces, const float (*normals)[3], const float (*bases)[3],
+					 const float (*viewDirs)[3], const float* shadows, int count, float (*lit)[3])
+{
+	if (!shading.m_sky)
+	{
+		for (int k = 0; k < count; k++)
+			moduleLight(shading, *surfaces[k], normals[k], bases[k], viewDirs[k], shadows[k], lit[k]);
+		return;
+	}
+	float mirrorX[kTileSize * kTileSize], mirrorY[kTileSize * kTileSize], mirrorZ[kTileSize * kTileSize], through[kTileSize * kTileSize];
+	float normalX[kTileSize * kTileSize], normalY[kTileSize * kTileSize], normalZ[kTileSize * kTileSize];
+	float sky[kTileSize * kTileSize][3], skyLight[kTileSize * kTileSize][3];
+	for (int k = 0; k < count; k++)
+	{
+		const float* normal = normals[k];
+		const float toCamera[3] = {-viewDirs[k][0], -viewDirs[k][1], -viewDirs[k][2]};
+		float nDotV = dot3(normal, toCamera);
+		nDotV = nDotV < 0.0f ? 0.0f : (nDotV > 1.0f ? 1.0f : nDotV);
+		const float away = 1.0f - nDotV;
+		const float away2 = away * away;
+		const float face = kPaneF0 + (1.0f - kPaneF0) * away2 * away2 * away;
+		const float reflect = (2.0f * face) / (1.0f + face);
+		mirrorX[k] = normal[0] * (2.0f * nDotV) - toCamera[0];
+		mirrorY[k] = normal[1] * (2.0f * nDotV) - toCamera[1];
+		mirrorZ[k] = normal[2] * (2.0f * nDotV) - toCamera[2];
+		through[k] = 1.0f - reflect;
+		normalX[k] = normal[0];
+		normalY[k] = normal[1];
+		normalZ[k] = normal[2];
+	}
+	shading.m_sky->radianceMany(mirrorX, mirrorY, mirrorZ, count, sky);
+	shading.m_sky->irradianceMany(normalX, normalY, normalZ, count, skyLight);
+	for (int k = 0; k < count; k++)
+	{
+		const float nDotL = dot3(normals[k], shading.m_lightDir);
+		const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+		const TinyRender::Vec4f& rgba = surfaces[k]->m_model->getColorRGBA();
+		for (int i = 0; i < 3; i++)
+		{
+			const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+			lit[k][i] = (1.0f - through[k]) * sky[k][i] +
+						through[k] * bases[k][i] * backing * (shading.m_ambientCoeff * skyLight[k][i] + shadows[k] * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
+		}
+	}
+}
+
 // A daylight colour on its way to the byte: its linear light, the horizon colour its haze blends towards and its distance.
 struct DaylightColour
 {
@@ -5905,14 +5953,29 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 				kindTexels[n] = kindModels[n]->diffuse(kindUvs[n]);
 		for (int n = 0; n < numShades; n++)
 			texels[order[n]] = kindTexels[n];
-		// The daylight surfaces' light, worked out together.
+		// The daylight surfaces' light, and the modules' light, each worked out together.
 		const HitSurface* daySurfaces[kTileSize * kTileSize];
 		float dayNormals[kTileSize * kTileSize][3], dayBases[kTileSize * kTileSize][3], dayDirs[kTileSize * kTileSize][3];
 		float dayShadows[kTileSize * kTileSize], dayLit[kTileSize * kTileSize][3];
-		int numDay = 0;
+		const HitSurface* moduleSurfaces[kTileSize * kTileSize];
+		float moduleNormals[kTileSize * kTileSize][3], moduleBases[kTileSize * kTileSize][3], moduleDirs[kTileSize * kTileSize][3];
+		float moduleShadows[kTileSize * kTileSize], moduleLit[kTileSize * kTileSize][3];
+		int numDay = 0, numModule = 0;
 		for (int i = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
+			if (wait.m_kind == ShadeWait::kModule)
+			{
+				moduleSurfaces[numModule] = wait.m_surface;
+				surfaceTint(*wait.m_surface, texels[i], moduleBases[numModule]);
+				for (int c = 0; c < 3; c++)
+				{
+					moduleNormals[numModule][c] = normals[i][c];
+					moduleDirs[numModule][c] = wait.m_dir[c];
+				}
+				moduleShadows[numModule++] = wait.m_shadow;
+				continue;
+			}
 			if (wait.m_kind != ShadeWait::kDaylight)
 				continue;
 			daySurfaces[numDay] = wait.m_surface;
@@ -5925,9 +5988,10 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			dayShadows[numDay++] = wait.m_shadow;
 		}
 		daylightLightMany(*job.m_shading, daySurfaces, dayNormals, dayBases, dayDirs, dayShadows, numDay, dayLit);
+		moduleLightMany(*job.m_shading, moduleSurfaces, moduleNormals, moduleBases, moduleDirs, moduleShadows, numModule, moduleLit);
 		int skyFor[kTileSize * kTileSize], numSky = 0, fragments[kTileSize * kTileSize], numFragments = 0;
 		const int firstSky = numWaiting;
-		for (int i = 0, day = 0; i < numShades; i++)
+		for (int i = 0, day = 0, module = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
 			if (wait.m_kind == ShadeWait::kFragment)
@@ -5935,15 +5999,7 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 				fragments[numFragments++] = i;
 				continue;
 			}
-			float base[3], moduleLit[3];
-			const float* lit = moduleLit;
-			if (wait.m_kind == ShadeWait::kModule)
-			{
-				surfaceTint(*wait.m_surface, texels[i], base);
-				moduleLight(*job.m_shading, *wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, moduleLit);
-			}
-			else
-				lit = dayLit[day++];
+			const float* lit = wait.m_kind == ShadeWait::kModule ? moduleLit[module++] : dayLit[day++];
 			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting], true);
 			skyFor[numSky++] = i;
 			waitingOut[numWaiting++] = shadeOut[i];
