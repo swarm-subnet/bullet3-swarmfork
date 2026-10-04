@@ -5331,74 +5331,11 @@ void paintedFound(const TilePaint& paint, int k, FoundHit& found)
 	hit.instPrimID[0] = 0;
 }
 
-// Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
-// written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
-// `scratch`, when given, records the id and triangle of every hit for the edge pass. `radiance`, under ER_SWARM_THERMAL,
-// takes every pixel's in-band radiance, hit or miss, in place of a colour.
-void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, EdgeScratch* scratch, float* radiance,
-				int row0, int row1, int col0, int col1,
-				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
+// The tile's waiting hits shaded together: their footprints, shadows, normals and textures, then their light, which joins
+// the colours waiting in `waiting`; then every waiting colour is finished and written.
+void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccludedArguments* shadowArgs, ShadeWait* shades,
+					   unsigned char* const* shadeOut, int numShades, DaylightColour* waiting, unsigned char** waitingOut, int numWaiting)
 {
-	const int width = job.m_width;
-	TilePaint paint;
-	if (job.m_raster)
-		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
-	SurfaceMemo memo;
-	memo.m_valid = false;
-	// Shading and daylight colours wait here and are done together once the tile's samples are in.
-	const bool defer = job.m_shading && !radiance;
-	DaylightColour waiting[kTileSize * kTileSize];
-	unsigned char* waitingOut[kTileSize * kTileSize];
-	int numWaiting = 0;
-	ShadeWait shades[kTileSize * kTileSize];
-	unsigned char* shadeOut[kTileSize * kTileSize];
-	int numShades = 0;
-	for (int row = row0; row < row1; row++)
-	{
-		const double ndcY = pixelNdcY(row, job.m_height);
-		for (int col = col0; col < col1; col++)
-		{
-			Sample sample;
-			sample.m_radiance = 0.0f;
-			sample.m_shade = &shades[numShades];
-			const size_t offset = (size_t)row * width + col;
-			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
-			FoundHit found;
-			if (job.m_raster)
-				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
-			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo, defer);
-			if (radiance)
-				radiance[offset] = sample.m_radiance;
-			if (target.m_background && !(hit && sample.m_shaded))
-				target.m_background->pixel(row, col, &target.m_rgb[offset * 3]);
-			if (!hit)
-			{
-				if (scratch)
-					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
-				continue;
-			}
-			target.m_depth[offset] = sample.m_depth;
-			if (target.m_seg)
-				target.m_seg[offset] = sample.m_segmentation;
-			if (scratch)
-			{
-				scratch->m_ids[offset] = sample.m_segmentation;
-				scratch->m_hits[offset] = sample.m_hit;
-				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
-			}
-			if (sample.m_shaded && !radiance && sample.m_shadeDeferred)
-				shadeOut[numShades++] = &target.m_rgb[offset * 3];
-			else if (sample.m_shaded && !radiance && sample.m_deferred)
-			{
-				waiting[numWaiting] = sample.m_colour;
-				waitingOut[numWaiting++] = &target.m_rgb[offset * 3];
-			}
-			else if (sample.m_shaded && !radiance)
-				for (int i = 0; i < 3; i++)
-					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
-		}
-	}
 	if (numShades)
 	{
 		// The waiting hits' normals and texture coordinates, their textures read together, then their light, which
@@ -5556,6 +5493,77 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	}
 	if (numWaiting)
 		daylightFinishAll(*job.m_shading, waiting, numWaiting, waitingOut);
+}
+
+// Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
+// written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
+// `scratch`, when given, records the id and triangle of every hit for the edge pass. `radiance`, under ER_SWARM_THERMAL,
+// takes every pixel's in-band radiance, hit or miss, in place of a colour.
+void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast::Target& target, EdgeScratch* scratch, float* radiance,
+				int row0, int row1, int col0, int col1,
+				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
+{
+	const int width = job.m_width;
+	TilePaint paint;
+	if (job.m_raster)
+		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
+	SurfaceMemo memo;
+	memo.m_valid = false;
+	// Shading and daylight colours wait here and are done together once the tile's samples are in.
+	const bool defer = job.m_shading && !radiance;
+	DaylightColour waiting[kTileSize * kTileSize];
+	unsigned char* waitingOut[kTileSize * kTileSize];
+	int numWaiting = 0;
+	ShadeWait shades[kTileSize * kTileSize];
+	unsigned char* shadeOut[kTileSize * kTileSize];
+	int numShades = 0;
+	for (int row = row0; row < row1; row++)
+	{
+		const double ndcY = pixelNdcY(row, job.m_height);
+		for (int col = col0; col < col1; col++)
+		{
+			Sample sample;
+			sample.m_radiance = 0.0f;
+			sample.m_shade = &shades[numShades];
+			const size_t offset = (size_t)row * width + col;
+			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+			FoundHit found;
+			if (job.m_raster)
+				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
+			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
+									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo, defer);
+			if (radiance)
+				radiance[offset] = sample.m_radiance;
+			if (target.m_background && !(hit && sample.m_shaded))
+				target.m_background->pixel(row, col, &target.m_rgb[offset * 3]);
+			if (!hit)
+			{
+				if (scratch)
+					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
+				continue;
+			}
+			target.m_depth[offset] = sample.m_depth;
+			if (target.m_seg)
+				target.m_seg[offset] = sample.m_segmentation;
+			if (scratch)
+			{
+				scratch->m_ids[offset] = sample.m_segmentation;
+				scratch->m_hits[offset] = sample.m_hit;
+				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
+			}
+			if (sample.m_shaded && !radiance && sample.m_shadeDeferred)
+				shadeOut[numShades++] = &target.m_rgb[offset * 3];
+			else if (sample.m_shaded && !radiance && sample.m_deferred)
+			{
+				waiting[numWaiting] = sample.m_colour;
+				waitingOut[numWaiting++] = &target.m_rgb[offset * 3];
+			}
+			else if (sample.m_shaded && !radiance)
+				for (int i = 0; i < 3; i++)
+					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
+		}
+	}
+	finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
@@ -5848,6 +5856,30 @@ void moverRects(const std::vector<Instance*>& instances, const Camera& cam, int 
 	}
 }
 
+// An edge pixel's blend written to the frame: encoded once from linear light, or rounded from byte values.
+inline void writeBlend(unsigned char* pixel, const double colour[3], bool linear)
+{
+	for (int i = 0; i < 3; i++)
+	{
+		if (linear)
+		{
+			pixel[i] = swarmLinearToSrgb((float)colour[i]);
+			continue;
+		}
+		const int value = (int)(colour[i] + 0.5);
+		pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
+	}
+}
+
+// An edge pixel whose probe hit waits for the tile's batched shading: its blend so far and the share the probe fills.
+struct ProbeWait
+{
+	size_t m_offset;
+	double m_colour[3];
+	double m_rest;
+	unsigned char m_rgb[3];
+};
+
 // Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
 // the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
 // the pixel square is clipped against each, front to back, so each surface gets exactly the share of
@@ -5871,6 +5903,14 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
 	const float tolerance = job.m_shading->m_edgeOutline ? kOutlineTolerance : kEdgeTolerance;
+	// The probes' shading waits for the tile, as the first pass's does, and their pixels are blended once it is done.
+	const bool defer = !job.m_shading->m_thermal;
+	ShadeWait shades[kTileSize * kTileSize];
+	unsigned char* shadeOut[kTileSize * kTileSize];
+	DaylightColour waiting[kTileSize * kTileSize];
+	unsigned char* waitingOut[kTileSize * kTileSize];
+	ProbeWait probes[kTileSize * kTileSize];
+	int numShades = 0, numWaiting = 0, numProbes = 0;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
@@ -5967,6 +6007,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
 				Sample probe;
+				probe.m_shade = &shades[numShades];
 				unsigned char background[3];
 				if (hasOwn)
 				{
@@ -5977,7 +6018,24 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
 					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
-					if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
+					const bool hit = traceRay(job, setup, px, py, args, shadowArgs, probe, reach, 0, 0, 0, defer) && probe.m_shaded;
+					if (hit && (probe.m_shadeDeferred || probe.m_deferred))
+					{
+						ProbeWait& wait = probes[numProbes++];
+						wait.m_offset = offset;
+						for (int i = 0; i < 3; i++)
+							wait.m_colour[i] = colour[i];
+						wait.m_rest = rest;
+						if (probe.m_shadeDeferred)
+							shadeOut[numShades++] = wait.m_rgb;
+						else
+						{
+							waiting[numWaiting] = probe.m_colour;
+							waitingOut[numWaiting++] = wait.m_rgb;
+						}
+						continue;
+					}
+					if (hit)
 						restColour = probe.m_rgb;
 					else if (target.m_background)
 					{
@@ -5995,18 +6053,18 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				for (int i = 0; i < 3; i++)
 					colour[i] /= covered;
 
-			unsigned char* pixel = target.m_rgb + offset * 3;
-			for (int i = 0; i < 3; i++)
-			{
-				if (linear)
-				{
-					pixel[i] = swarmLinearToSrgb((float)colour[i]);
-					continue;
-				}
-				const int value = (int)(colour[i] + 0.5);
-				pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
-			}
+			writeBlend(target.m_rgb + offset * 3, colour, linear);
 		}
+	}
+	if (!numProbes)
+		return;
+	finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
+	for (int n = 0; n < numProbes; n++)
+	{
+		ProbeWait& wait = probes[n];
+		for (int i = 0; i < 3; i++)
+			wait.m_colour[i] += wait.m_rest * (linear ? kSwarmSrgbToLinear[wait.m_rgb[i]] : (double)wait.m_rgb[i]);
+		writeBlend(target.m_rgb + wait.m_offset * 3, wait.m_colour, linear);
 	}
 }
 
