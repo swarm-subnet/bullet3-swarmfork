@@ -6887,8 +6887,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			}
 		}
 
-		// Every thread paints its share of the chunks and trees into its own lane; the loops' barriers then hand all the
-		// lanes to whichever thread traces a tile.
+		// Every thread paints the chunks and trees it takes into its own lane; the loops' barriers then hand all the lanes
+		// to whichever thread traces a tile. Chunks cost very different amounts, so threads take them a few at a time as
+		// they finish; which lane holds what never changes a tile, since painting keeps the nearest hit and the lesser key.
 		if (job.m_raster)
 		{
 #ifdef _OPENMP
@@ -6897,10 +6898,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			RasterLane& lane = m_data->m_rasterLanes[0];
 #endif
 			const long long numJobs = (long long)m_data->m_rasterJobs.size();
-#pragma omp for schedule(static)
+#pragma omp for schedule(dynamic, 4)
 			for (long long i = 0; i < numJobs; i++)
 				paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
-#pragma omp for schedule(static)
+#pragma omp for schedule(dynamic, 16)
 			for (long long i = 0; i < forestCells; i++)
 				paintForestCell(lane, rasterView, m_data->m_forestGrid, (size_t)i, m_data->m_batches);
 		}
