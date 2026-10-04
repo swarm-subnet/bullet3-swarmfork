@@ -5492,6 +5492,93 @@ void paintedFound(const TilePaint& paint, int k, FoundHit& found)
 	hit.instPrimID[0] = 0;
 }
 
+// The first pass for a sample painting landed on a known triangle whose shading waits for the tile, the common case,
+// without traceRay's general route: the same steps traceRay takes for that sample, in the same order, so every value is
+// the one it writes. False, before anything but the memo is touched, when the sample needs anything else: no painted
+// hit, a search, an unknown body, a veil or a see-through pane, or a shadow ray with no map; traceRay then takes it.
+bool paintedHit(const TileJob& job, const CameraSetup& setup, const TilePaint& paint, int k, RTCIntersectArguments* args, Sample& out,
+				float* landed, SurfaceMemo& memo)
+{
+	const RasterTri* tri = paint.m_tri[k];
+	if (!paint.m_ray[k] || !tri || (paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k]))
+		return false;
+	const SwarmRaycastShading& shading = *job.m_shading;
+	if (shading.m_shadow && !job.m_shadowMap)
+		return false;
+	const unsigned key[5] = {tri->m_inst, tri->m_geom, tri->m_prim, RTC_INVALID_GEOMETRY_ID, RTC_INVALID_GEOMETRY_ID};
+	bool resolve = false;
+	SurfaceMemo::Entry& entry = memo.find(key, resolve);
+	HitSurface& surface = entry.m_surface;
+	if (resolve)
+	{
+		RTCHit hit;
+		hit.Ng_x = hit.Ng_y = hit.Ng_z = 0.0f;
+		hit.u = paint.m_u[k];
+		hit.v = paint.m_v[k];
+		hit.primID = tri->m_prim;
+		hit.geomID = tri->m_geom;
+		for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+		{
+			hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+			hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+		}
+		hit.instID[0] = tri->m_inst;
+		hit.instPrimID[0] = 0;
+		int segmentation = -1;
+		entry.m_known = resolveHit(hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface);
+		if (entry.m_known)
+		{
+			float e1[3], e2[3];
+			for (int i = 0; i < 3; i++)
+			{
+				e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+				e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+			}
+			cross3(e1, e2, entry.m_woundNormal);
+		}
+		entry.m_segmentation = segmentation;
+	}
+	if (!entry.m_known)
+		return false;
+	ShadeWait::Kind kind = ShadeWait::kFragment;
+	if (shading.m_daylight)
+	{
+		if ((job.m_filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) || (surface.m_glass && !surface.m_glassBacked))
+			return false;
+		kind = surface.m_glass ? ShadeWait::kModule : ShadeWait::kDaylight;
+	}
+
+	const Camera& cam = setup.m_cam;
+	const float* dir = paint.m_dir[k];
+	const float t = paint.m_t[k];
+	out.m_deferred = false;
+	reached(args, t);
+	const float point[3] = {cam.m_origin[0] + dir[0] * t, cam.m_origin[1] + dir[1] * t, cam.m_origin[2] + dir[2] * t};
+	if (landed)
+		for (int i = 0; i < 3; i++)
+			landed[i] = point[i];
+	const float zEye = ((cam.m_viewRow2[0] * point[0] + cam.m_viewRow2[1] * point[1]) + cam.m_viewRow2[2] * point[2]) + cam.m_viewRow2[3];
+	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
+	out.m_inverseEyeDepth = 1.0f / zEye;
+	out.m_segmentation = entry.m_segmentation;
+	out.m_hit.m_inst = tri->m_inst;
+	out.m_hit.m_geom = tri->m_geom;
+	out.m_hit.m_prim = tri->m_prim;
+	out.m_hit.m_inst1 = out.m_hit.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
+	out.m_shaded = true;
+	const float* wound = entry.m_woundNormal;
+	float faceNormal[3];
+	const bool awayFromCamera = dot3(wound, dir) > 0.0f;
+	for (int i = 0; i < 3; i++)
+		faceNormal[i] = awayFromCamera ? -wound[i] : wound[i];
+	RTCHit hit;
+	hit.u = paint.m_u[k];
+	hit.v = paint.m_v[k];
+	const float zero[2] = {0.0f, 0.0f};
+	waitForTile(out, surface, hit, faceNormal, zero, zero, dir, 1.0f, t, kind, point, job.m_filtered, paint.m_rawDir[k], wound, shading.m_shadow);
+	return true;
+}
+
 // The tile's waiting hits shaded together: their footprints, shadows, normals and textures, then their light, which joins
 // the colours waiting in `waiting`; then every waiting colour is finished and written.
 void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccludedArguments* shadowArgs, ShadeWait* shades,
@@ -5695,6 +5782,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	memo.clear();
 	// Shading and daylight colours wait here and are done together once the tile's samples are in.
 	const bool defer = job.m_shading && !radiance;
+	// A painted sample on a known triangle takes the short route; any other goes through traceRay.
+	const bool fast = job.m_raster && defer && !job.m_shading->m_thermal;
 	DaylightColour waiting[kTileSize * kTileSize];
 	unsigned char* waitingOut[kTileSize * kTileSize];
 	int numWaiting = 0;
@@ -5710,12 +5799,18 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			sample.m_radiance = 0.0f;
 			sample.m_shade = &shades[numShades];
 			const size_t offset = (size_t)row * width + col;
-			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
-			FoundHit found;
-			if (job.m_raster)
-				paintedFound(paint, (row - row0) * kTileSize + (col - col0), found);
-			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0, job.m_raster ? &found : 0, &memo, defer);
+			const int k = (row - row0) * kTileSize + (col - col0);
+			float* landed = job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0;
+			bool hit = fast && paintedHit(job, setup, paint, k, args, sample, landed, memo);
+			if (!hit)
+			{
+				const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+				FoundHit found;
+				if (job.m_raster)
+					paintedFound(paint, k, found);
+				hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach, landed, job.m_raster ? &found : 0,
+							   &memo, defer);
+			}
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
