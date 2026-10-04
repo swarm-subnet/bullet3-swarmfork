@@ -890,15 +890,23 @@ static inline FilterLanes wrapUnit8(FilterLanes value)
 }
 
 // sampleBilinear on each lane, from the level of its own texture each lane names. A texel's bytes come from one
-// four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it.
+// four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it; a
+// one-texel three-byte image is read from a copy with a spare byte in front, which gives the same bytes.
 static inline void bilinear8(SharedTexture* const tex[8], FilterInts level, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4])
 {
 	FilterLongs baseLo, baseHi;
 	FilterInts w, h;
+	unsigned char lone[8][4];
 	for (int l = 0; l < 8; l++)
 	{
 		TGAImage& img = level[l] == 0 ? tex[l]->img_ : *tex[l]->mips_[level[l] - 1];
-		const long long base = (long long)(size_t)img.buffer();
+		long long base = (long long)(size_t)img.buffer();
+		if (bpp[l] == 3 && img.get_width() * img.get_height() == 1)
+		{
+			lone[l][0] = 0;
+			memcpy(&lone[l][1], img.buffer(), 3);
+			base = (long long)(size_t)&lone[l][1];
+		}
 		if (l < 4)
 			baseLo[l] = base;
 		else
