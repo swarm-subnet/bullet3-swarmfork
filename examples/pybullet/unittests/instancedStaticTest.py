@@ -2,7 +2,6 @@
 import hashlib
 import json
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -85,7 +84,9 @@ def memory_case(instanced, copies, triangles, scales=1):
     for i in range(copies):
       p.createMultiBody(0, -1, shapes[i % scales], basePosition=[(i % 20) * 2, (i // 20) * 2, 0])
     frame(flags=RAY, shadow=0, eye=(20, 10, 50), target=(20, 10, 0), size=256)
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    # The process's own high-water mark: ru_maxrss also carries the parent's RSS from the spawn.
+    with open("/proc/self/status") as status:
+      peak = next(int(line.split()[1]) for line in status if line.startswith("VmHWM:")) * 1024
   p.disconnect()
   return peak
 
