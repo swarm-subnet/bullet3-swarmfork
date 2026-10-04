@@ -785,12 +785,16 @@ void copyAttributes(TinyRender::Model* model, const std::vector<unsigned>& indic
 	normals.assign(hasNormals ? (size_t)numVerts * 3 : 0, 0.0f);
 	if (!gatherUvs && !hasNormals)
 		return;
-	for (size_t f = 0; f * 3 + 2 < indices.size(); f++)
-		for (int j = 0; j < 3; j++)
+	// A vertex keeps what its last corner gives it, so the corners are walked from the last and each vertex is worked
+	// out at its first meeting only.
+	std::vector<unsigned char> done((size_t)numVerts, 0);
+	for (size_t f = indices.size() / 3; f-- > 0;)
+		for (int j = 2; j >= 0; j--)
 		{
 			const unsigned v = indices[f * 3 + j];
-			if (v >= (unsigned)numVerts)
+			if (v >= (unsigned)numVerts || done[v])
 				continue;
+			done[v] = 1;
 			if (gatherUvs)
 			{
 				const TinyRender::Vec2f uv = model->uv((int)f, j);
@@ -5209,7 +5213,31 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 			trees.push_back(tree);
 		}
 	}
-	std::stable_sort(trees.begin(), trees.end());
+	// Cell order, trees of one cell in their filing order: a counting sort over the cells the trees span, which gives what
+	// a stable sort gives, or that sort itself when the span is too wide to count.
+	long long loX = 0, hiX = -1, loY = 0, hiY = -1;
+	for (size_t i = 0; i < trees.size(); i++)
+	{
+		loX = i == 0 || trees[i].m_x < loX ? trees[i].m_x : loX;
+		hiX = i == 0 || trees[i].m_x > hiX ? trees[i].m_x : hiX;
+		loY = i == 0 || trees[i].m_y < loY ? trees[i].m_y : loY;
+		hiY = i == 0 || trees[i].m_y > hiY ? trees[i].m_y : hiY;
+	}
+	const long long spanX = hiX - loX + 1, spanY = hiY - loY + 1;
+	if (!trees.empty() && spanX > 0 && spanY > 0 && spanX <= 4096 && spanY <= 4096 && spanX * spanY <= 4 * (long long)trees.size() + 65536)
+	{
+		std::vector<unsigned> start((size_t)(spanX * spanY) + 1, 0);
+		for (size_t i = 0; i < trees.size(); i++)
+			start[(size_t)((trees[i].m_x - loX) * spanY + (trees[i].m_y - loY)) + 1]++;
+		for (size_t c = 1; c < start.size(); c++)
+			start[c] += start[c - 1];
+		std::vector<Tree> sorted(trees.size());
+		for (size_t i = 0; i < trees.size(); i++)
+			sorted[start[(size_t)((trees[i].m_x - loX) * spanY + (trees[i].m_y - loY))]++] = trees[i];
+		trees.swap(sorted);
+	}
+	else
+		std::stable_sort(trees.begin(), trees.end());
 	grid.m_cellBoxes.clear();
 	grid.m_cellStart.clear();
 	grid.m_treeBoxes.resize(trees.size() * 6);

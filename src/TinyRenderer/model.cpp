@@ -697,6 +697,33 @@ static void buildMips(SharedTexture& tex)
 		{
 			const int y0 = 2 * y;
 			const int y1 = (y0 + 1 < sh) ? y0 + 1 : y0;
+			// A row wider than one always has both source columns: the same sums, with the texel width fixed and no edge test.
+			if (sw > 1 && (bpp == 3 || bpp == 4))
+			{
+				const unsigned char* top = s + (size_t)y0 * sw * bpp;
+				const unsigned char* bottom = s + (size_t)y1 * sw * bpp;
+				unsigned char* o = d + (size_t)y * dw * bpp;
+				if (bpp == 3)
+					for (int x = 0; x < dw; x++)
+					{
+						const unsigned char* a = top + 6 * x;
+						const unsigned char* b = bottom + 6 * x;
+						o[3 * x] = (unsigned char)((a[0] + a[3] + b[0] + b[3] + 2) >> 2);
+						o[3 * x + 1] = (unsigned char)((a[1] + a[4] + b[1] + b[4] + 2) >> 2);
+						o[3 * x + 2] = (unsigned char)((a[2] + a[5] + b[2] + b[5] + 2) >> 2);
+					}
+				else
+					for (int x = 0; x < dw; x++)
+					{
+						const unsigned char* a = top + 8 * x;
+						const unsigned char* b = bottom + 8 * x;
+						o[4 * x] = (unsigned char)((a[0] + a[4] + b[0] + b[4] + 2) >> 2);
+						o[4 * x + 1] = (unsigned char)((a[1] + a[5] + b[1] + b[5] + 2) >> 2);
+						o[4 * x + 2] = (unsigned char)((a[2] + a[6] + b[2] + b[6] + 2) >> 2);
+						o[4 * x + 3] = (unsigned char)((a[3] + a[7] + b[3] + b[7] + 2) >> 2);
+					}
+				continue;
+			}
 			for (int x = 0; x < dw; x++)
 			{
 				const int x0 = 2 * x;
