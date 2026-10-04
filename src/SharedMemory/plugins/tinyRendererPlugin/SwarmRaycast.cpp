@@ -14,6 +14,9 @@
 #include <thread>
 #include <vector>
 #include <xmmintrin.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -3341,7 +3344,9 @@ struct ShadeWait
 	// For the fragment shader: the hit point, which the spot light reads.
 	float m_point[3];
 	// The footprint is worked out with the tile's others when m_footprintLater; the camera ray and wound normal it needs.
+	// The shadow likewise when m_shadowLater, from the hit point and face normal.
 	bool m_footprintLater;
+	bool m_shadowLater;
 	float m_rawDir[3];
 	float m_wound[3];
 };
@@ -3367,7 +3372,7 @@ struct Sample
 // Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
 inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], const float duvdx[2],
 						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3],
-						bool footprintLater, const float rawDir[3], const float wound[3])
+						bool footprintLater, const float rawDir[3], const float wound[3], bool shadowLater)
 {
 	ShadeWait& wait = out.m_shade;
 	wait.m_surface = surface;
@@ -3387,6 +3392,7 @@ inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hi
 	wait.m_distance = distance;
 	wait.m_kind = kind;
 	wait.m_footprintLater = footprintLater;
+	wait.m_shadowLater = shadowLater;
 	for (int i = 0; i < 3; i++)
 	{
 		wait.m_point[i] = point[i];
@@ -3514,24 +3520,29 @@ bool castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
 // A leaf card with leaf shadows off asks from its sunward side, since its back-light is not its own shadow.
-float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
+// The normal a shadow is looked up with: the face normal made unit, turned to the light for a leaf card when leaf
+// shadows are off, so the light through it is not cancelled by the map's rule that a face turned from the sun is dark.
+inline void shadowNormal(const SwarmRaycastShading* shading, const float faceNormal[3], bool leaf, float unitNormal[3])
 {
-	const SwarmRaycastShading* shading = job.m_shading;
-	float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+	for (int i = 0; i < 3; i++)
+		unitNormal[i] = faceNormal[i];
 	normalize3(unitNormal);
 	if (leaf && shading->m_leafNoShadow && dot3(unitNormal, shading->m_lightDir) < 0.0f)
 		for (int i = 0; i < 3; i++)
 			unitNormal[i] = -unitNormal[i];
-	float litShare = 1.0f;
-	bool blocked = false;
-	if (job.m_shadowMap && shading->m_daylight)
-	{
-		const ShadowMap* map = (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
-		litShare = shadowMapLit(*map, point, unitNormal);
-		blocked = litShare <= 0.0f;
-	}
-	else
-		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+}
+
+// The map a daylight point is looked up in: the fine core grid where it covers the point, else the main map.
+inline const ShadowMap* shadowMapFor(const TileJob& job, const float point[3])
+{
+	return (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
+}
+
+// The light a point keeps once the map has answered: a shadow ray into the movers or the whole scene where the map did
+// not already block it, then the shadow coefficient.
+float shadowFinish(const TileJob& job, const float point[3], const float unitNormal[3], float litShare, bool blocked, RTCOccludedArguments* shadowArgs)
+{
+	const SwarmRaycastShading* shading = job.m_shading;
 	const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
 	const float origin[3] = {point[0] + unitNormal[0] * kShadowBias, point[1] + unitNormal[1] * kShadowBias, point[2] + unitNormal[2] * kShadowBias};
 	bool reachable = true;
@@ -3561,6 +3572,101 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	if (shading->m_daylight)
 		return blocked ? shading->m_shadowLightCoeff : shading->m_shadowLightCoeff + (1.0f - shading->m_shadowLightCoeff) * litShare;
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
+}
+
+float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
+{
+	const SwarmRaycastShading* shading = job.m_shading;
+	float unitNormal[3];
+	shadowNormal(shading, faceNormal, leaf, unitNormal);
+	float litShare = 1.0f;
+	bool blocked = false;
+	if (job.m_shadowMap && shading->m_daylight)
+	{
+		litShare = shadowMapLit(*shadowMapFor(job, point), point, unitNormal);
+		blocked = litShare <= 0.0f;
+	}
+	else
+		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+	return shadowFinish(job, point, unitNormal, litShare, blocked, shadowArgs);
+}
+
+// shadowMapLit for count points at once, each with its own map and unit normal: eight at a time in vector lanes where
+// the build has AVX2 and all eight read the inside of one map, each lane shadowMapLit's steps and its nine cells added
+// in the same order; any other group point by point.
+void shadowLitMany(const ShadowMap* const* maps, const float (*points)[3], const float (*normals)[3], int count, float* lit)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.0f, half = zero + 0.5f;
+	for (; k + 8 <= count; k += 8)
+	{
+		const ShadowMap& map = *maps[k];
+		bool same = map.m_built;
+		for (int l = 1; l < 8 && same; l++)
+			same = maps[k + l] == &map;
+		if (!same)
+		{
+			for (int l = 0; l < 8; l++)
+				lit[k + l] = shadowMapLit(*maps[k + l], points[k + l], normals[k + l]);
+			continue;
+		}
+		Lanes p[3], n[3];
+		for (int l = 0; l < 8; l++)
+			for (int i = 0; i < 3; i++)
+			{
+				p[i][l] = points[k + l][i];
+				n[i][l] = normals[k + l][i];
+			}
+		const Lanes facing = (n[0] * map.m_lightDir[0] + n[1] * map.m_lightDir[1]) + n[2] * map.m_lightDir[2];
+		Lanes rel[3];
+		for (int i = 0; i < 3; i++)
+			rel[i] = (p[i] + n[i] * map.m_cell) - map.m_origin[i];
+		const Lanes u = ((rel[0] * map.m_axisU[0] + rel[1] * map.m_axisU[1]) + rel[2] * map.m_axisU[2]) / map.m_cell;
+		const Lanes v = ((rel[0] * map.m_axisV[0] + rel[1] * map.m_axisV[1]) + rel[2] * map.m_axisV[2]) / map.m_cell;
+		const Ints outside = ~(u >= zero) | ~(v >= zero) | (u >= (float)map.m_cols) | (v >= (float)map.m_rows);
+		const Lanes depth = -((rel[0] * map.m_lightDir[0] + rel[1] * map.m_lightDir[1]) + rel[2] * map.m_lightDir[2]) - map.m_cell;
+		const Lanes su = u - 1.0f, sv = v - 1.0f;
+		const Lanes flU = (Lanes)_mm256_round_ps((__m256)su, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+		const Lanes flV = (Lanes)_mm256_round_ps((__m256)sv, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+		const Ints iu = __builtin_convertvector(flU, Ints), iv = __builtin_convertvector(flV, Ints);
+		const Lanes fu = su - __builtin_convertvector(iu, Lanes), fv = sv - __builtin_convertvector(iv, Lanes);
+		const Ints dark = ~(facing > zero);
+		// Lanes the vector path reads: facing the light, on the map, and with all nine cells inside it.
+		const Ints read = ~dark & ~outside & (iu >= 0) & (iv >= 0) & (iu + 2 < map.m_cols) & (iv + 2 < map.m_rows);
+		// A lane on the map but too near its border for the inside path makes the whole group go point by point.
+		bool border = false;
+		for (int l = 0; l < 8; l++)
+			border |= !dark[l] && !outside[l] && !read[l];
+		if (border)
+		{
+			for (int l = 0; l < 8; l++)
+				lit[k + l] = shadowMapLit(map, points[k + l], normals[k + l]);
+			continue;
+		}
+		for (int l = 0; l < 8; l++)
+			if (read[l])
+				ensureShadowCells(map, iu[l], iu[l] + 2, iv[l], iv[l] + 2);
+		const Lanes weightU[3] = {half * (one - fu), half, half * fu};
+		const Lanes weightV[3] = {half * (one - fv), half, half * fv};
+		const Ints first = (read & (iv * map.m_cols + iu));
+		Lanes sum = zero;
+		for (int dv = 0; dv < 3; dv++)
+			for (int du = 0; du < 3; du++)
+			{
+				const Ints at = read & (first + dv * map.m_cols + du);
+				const Lanes cell = (Lanes)_mm256_i32gather_ps(map.m_depth.get(), (__m256i)at, 4);
+				sum += ~(depth > cell) & read ? weightV[dv] * weightU[du] : zero;
+			}
+		const Lanes result = dark ? zero : (outside ? one : sum);
+		for (int l = 0; l < 8; l++)
+			lit[k + l] = result[l];
+	}
+#endif
+	for (; k < count; k++)
+		lit[k] = shadowMapLit(*maps[k], points[k], normals[k]);
 }
 
 // A hit's texture footprint from the right and upper neighbours' rays on its plane; woundNormal keeps the weights' sign.
@@ -4181,8 +4287,13 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	for (int i = 0; i < 3; i++)
 		faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
 
+	// A daylight hit whose shading waits for its tile leaves its shadow-map lookup to the tile's batch too, unless a step
+	// before the wait reads the shadow: a cut-out that may be a veil, or a pane the ray passes through.
+	const bool waitable = deferColour && !shading->m_thermal && !(shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
+						  !(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
+	const bool shadowLater = waitable && shading->m_shadow && shading->m_daylight && job.m_shadowMap;
 	float shadow = 1.0f;
-	if (shading->m_shadow && !shading->m_thermal)
+	if (shading->m_shadow && !shading->m_thermal && !shadowLater)
 	{
 		const float point[3] = {hx, hy, hz};
 		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
@@ -4190,9 +4301,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 
 	// A hit whose shading waits for its tile leaves its footprint to be worked out with the tile's others, unless a step
 	// before the wait reads it: a thermal frame, a cut-out that may be a veil, or a pane the ray passes through.
-	const bool footprintLater = deferColour && filtered && !shading->m_thermal &&
-								!(shading->m_daylight && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
-								!(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
+	const bool footprintLater = waitable && filtered;
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
 	if (filtered && !footprintLater)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
@@ -4323,7 +4432,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			{
 				const float point[3] = {hx, hy, hz};
 				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point, footprintLater, rawDir,
-							woundNormal);
+							woundNormal, shadowLater);
 				return true;
 			}
 			float normal[3], base[3];
@@ -4407,7 +4516,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	{
 		// The shading is left for the tile, which reads the textures of its samples together.
 		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment,
-					point, footprintLater, rawDir, woundNormal);
+					point, footprintLater, rawDir, woundNormal, shadowLater);
 		return true;
 	}
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
@@ -5298,6 +5407,26 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					shades[late[n]].m_duvdx[c] = lateX[n][c];
 					shades[late[n]].m_duvdy[c] = lateY[n][c];
 				}
+			// The shadows left for the tile: the maps' lit shares together, then each point's remaining shadow ray.
+			const ShadowMap* maps[kTileSize * kTileSize];
+			float points[kTileSize * kTileSize][3], normals[kTileSize * kTileSize][3], lit[kTileSize * kTileSize];
+			numLate = 0;
+			for (int i = 0; i < numShades; i++)
+			{
+				const ShadeWait& wait = shades[i];
+				if (!wait.m_shadowLater)
+					continue;
+				const int n = numLate++;
+				late[n] = i;
+				shadowNormal(job.m_shading, wait.m_faceNormal, leafCard(wait.m_surface.m_doubleSided, wait.m_surface.m_hasAlpha), normals[n]);
+				for (int c = 0; c < 3; c++)
+					points[n][c] = wait.m_point[c];
+				maps[n] = shadowMapFor(job, points[n]);
+			}
+			if (numLate)
+				shadowLitMany(maps, points, normals, numLate, lit);
+			for (int n = 0; n < numLate; n++)
+				shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], lit[n], lit[n] <= 0.0f, shadowArgs);
 		}
 		for (int i = 0; i < numShades; i++)
 		{
