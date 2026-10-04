@@ -5296,11 +5296,25 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 			const RasterTri& tri = lanes[l].m_tris[bin[b]];
 			const int r0 = std::max(tri.m_row0, row0), r1 = std::min(tri.m_row1, row1 - 1);
 			const int c0 = std::max(tri.m_col0, col0), c1 = std::min(tri.m_col1, col1 - 1);
+			// An edge function is linear over the rectangle, so its largest value there is at a corner, and along a row at
+			// one end: where an edge is negative even there, no sample is covered and the rectangle or row is skipped.
+			long long rowGain[3];
+			bool empty = false;
+			for (int i = 0; i < 3; i++)
+			{
+				rowGain[i] = std::max(0LL, tri.m_stepX[i] * (c1 - c0));
+				const long long best = tri.m_edge[i] + tri.m_stepX[i] * c0 + rowGain[i] + std::max(tri.m_stepY[i] * r0, tri.m_stepY[i] * r1);
+				empty = empty || best < 0;
+			}
+			if (empty)
+				continue;
 			for (int row = r0; row <= r1; row++)
 			{
 				long long e0 = tri.m_edge[0] + tri.m_stepX[0] * c0 + tri.m_stepY[0] * row;
 				long long e1 = tri.m_edge[1] + tri.m_stepX[1] * c0 + tri.m_stepY[1] * row;
 				long long e2 = tri.m_edge[2] + tri.m_stepX[2] * c0 + tri.m_stepY[2] * row;
+				if (e0 + rowGain[0] < 0 || e1 + rowGain[1] < 0 || e2 + rowGain[2] < 0)
+					continue;
 				for (int col = c0; col <= c1; col++, e0 += tri.m_stepX[0], e1 += tri.m_stepX[1], e2 += tri.m_stepX[2])
 				{
 					if ((e0 | e1 | e2) < 0)
