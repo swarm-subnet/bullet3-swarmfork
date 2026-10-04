@@ -97,6 +97,21 @@ void greyRow(const float* __restrict c0, const float* __restrict c1, const float
 	}
 }
 
+// A row's linear colour from its luminance and its two colour rows above and below, faded by `keep` and times the gain.
+void colourRow(const float* __restrict luminance, const float* __restrict bTop, const float* __restrict bBottom, const float* __restrict rTop,
+			   const float* __restrict rBottom, const float* __restrict keep, float ay, float gain, int width, float* __restrict outR,
+			   float* __restrict outG, float* __restrict outB)
+{
+	for (int col = 0; col < width; col++)
+	{
+		const float b = (bTop[col] + (bBottom[col] - bTop[col]) * ay) * keep[col];
+		const float r = (rTop[col] + (rBottom[col] - rTop[col]) * ay) * keep[col];
+		outR[col] = (luminance[col] + 1.5748f * r) * gain;
+		outG[col] = (luminance[col] - 0.1873f * b - 0.4681f * r) * gain;
+		outB[col] = (luminance[col] + 1.8556f * b) * gain;
+	}
+}
+
 // The low-light chain with grain, in three passes over the frame, so the render threads meet only twice in between.
 // Each pass computes every value from the passes before it with the same steps in the same order, so the bytes are
 // the same at any thread count and whichever thread takes a row.
@@ -342,17 +357,8 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 			ySmooth[col] = ySmooth[col] + (y[start + col] - ySmooth[col]) * detail[start + col];
 		const float* luminance = ySmooth;
 		if (colour)
-			for (int col = 0; col < width; col++)
-			{
-				const size_t i = start + col;
-				const float bTop = cbWide[(size_t)y0 * width + col], bBottom = cbWide[(size_t)y1 * width + col];
-				const float rTop = crWide[(size_t)y0 * width + col], rBottom = crWide[(size_t)y1 * width + col];
-				const float b = (bTop + (bBottom - bTop) * ay) * keep[i];
-				const float r = (rTop + (rBottom - rTop) * ay) * keep[i];
-				outR[col] = (luminance[col] + 1.5748f * r) * gain;
-				outG[col] = (luminance[col] - 0.1873f * b - 0.4681f * r) * gain;
-				outB[col] = (luminance[col] + 1.8556f * b) * gain;
-			}
+			colourRow(luminance, cbWide + (size_t)y0 * width, cbWide + (size_t)y1 * width, crWide + (size_t)y0 * width,
+					  crWide + (size_t)y1 * width, keep + start, ay, gain, width, outR, outG, outB);
 		else
 			for (int col = 0; col < width; col++)
 				outR[col] = outG[col] = outB[col] = luminance[col] * gain;

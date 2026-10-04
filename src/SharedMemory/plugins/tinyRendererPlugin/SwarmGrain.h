@@ -140,6 +140,29 @@ inline void blurColumn(const float* rows, float* acc, int width, int height, int
 {
 	int x = 0;
 #if defined(__GNUC__)
+	// Each tap's row, edge row repeated, found once for the whole output row rather than once per eight pixels.
+	const int kMaxRadius = 64;
+	if (radius <= kMaxRadius)
+	{
+		const float* tapRows[2 * kMaxRadius + 1];
+		for (int k = -radius; k <= radius; k++)
+		{
+			int sy = y + k;
+			sy = sy < 0 ? 0 : (sy >= height ? height - 1 : sy);
+			tapRows[k + radius] = rows + (size_t)sy * width;
+		}
+		for (; x + 8 <= width; x += 8)
+		{
+			SwarmLanes8 sum = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+			for (int k = -radius; k <= radius; k++)
+			{
+				SwarmLanes8 v;
+				memcpy(&v, tapRows[k + radius] + x, sizeof(v));
+				sum += tap[k] * v;
+			}
+			memcpy(acc + x, &sum, sizeof(sum));
+		}
+	}
 	for (; x + 8 <= width; x += 8)
 	{
 		SwarmLanes8 sum = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
