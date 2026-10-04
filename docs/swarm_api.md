@@ -160,7 +160,7 @@ Related behaviours without a flag:
 
 | Variable | Default | Read by | What it does |
 |---|---|---|---|
-| `SWARM_RENDER_THREADS` | 2 | `b3GetSwarmRenderThreads` in `TinyRenderer.cpp`, once per process | OpenMP threads for the depth face loop and the ray-cast tiles, clamped to 1..16. The bytes do not depend on it: the rasteriser's depth loop writes each pixel once and the ray caster traces fixed tiles, each whole on one thread |
+| `SWARM_RENDER_THREADS` | 2 | `b3GetSwarmRenderThreads` in `TinyRenderer.cpp`, once per process | OpenMP threads for the depth face loop, the ray-cast tiles and `swarmStreamLook`'s bands, clamped to 1..16. The bytes do not depend on it: the rasteriser's depth loop writes each pixel once, the ray caster traces fixed tiles and the video look draws fixed 16-row bands, each whole on one thread |
 | `SWARM_BVH_CACHE_DIR` | unset | the server (`.bvh`), the model and texture loaders (`.objc`, `.texc`) and the ray caster (`.rtree`, `.ctree`) | Folder for the disk caches; unset means no file is read or written whatever the flags say. Without any flag, a parsed `.obj` with its `.mtl`, a decoded texture and a shared mesh's ray-cast tree are kept under a key hashed from their source bytes, written through a temporary file and a rename, and read back by later processes; a short or damaged file is ignored and rebuilt. Solar park, a fresh process: world build 9.9 s to 5.4 s, about 630 MB of files |
 | `SWARM_SHARE_MESH` | on | `model.cpp` | `0` gives every render object private copies of its mesh and texture (the behaviour before [#8](https://github.com/swarm-subnet/bullet3-swarmfork/pull/8)); on, identical data is shared with reference counts and copy on write, warehouse RSS 658 MB to 228 MB, images identical |
 
@@ -204,7 +204,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `edgeAntialiasTest.py` | `ER_EDGE_ANTIALIAS`, depth and mask unchanged; `ER_SWARM_EDGE_OUTLINE`: nothing without edge anti-aliasing, each pixel the first ray or the full blend, silhouettes blended, creases inside one body left, a depth jump inside one body blended; `ER_SWARM_CREASE_FILL`: nothing without edge anti-aliasing, depth, mask, silhouettes and border pixels as the full blend, creases among leaves filled; thread counts |
 | `alphaCutoutTest.py` | `ER_ALPHA_CUTOUT` in colour, depth, shadow ray and shadow map |
 | `glintTest.py` | `ER_SPECULAR_GLINT`, `specularColor` reaching the renderer |
-| `instancedStaticTest.py` | `VISUAL_SHAPE_RENDER_INSTANCED`: identical single-body buffers, shadow maps and rays, leaf cut-outs, glass, movement and removal, scale sharing, isolated peak RSS and thread identity |
+| `instancedStaticTest.py` | `VISUAL_SHAPE_RENDER_INSTANCED`: identical single-body buffers, shadow maps and rays, leaf cut-outs, glass, movement and removal, scale sharing, each child process's own peak RSS and thread identity |
 | `forestBatchTest.py` | `.fst` forest files: the same colour and depth as separate instanced bodies on the ray-cast, shadow map, daylight and raster paths, binary rows drawing the text rows' bytes, body pose, mask id, movers, the flag required, thread counts |
 | `renderTreeCacheTest.py` | `VISUAL_SHAPE_RENDER_TREE_CACHE` |
 | `skySunTest.py` | `ER_SWARM_SKY_SUN`, `skyCloudSeed`, both paths paint the same sky |
@@ -218,7 +218,7 @@ cd examples/pybullet/unittests && SWARM_RENDER_THREADS=2 python -m unittest -v <
 | `thermalTest.py` | `ER_SWARM_THERMAL`: R = G = B from 0 to 255, the range following each frame, hotter brighter, ground under a roof warmer at night, glass darker under the night sky, a heat map and its removal, `nan` making a shape passive again, sun and shade by day, depth and mask equal to the colour frame's, colour frames untouched by every thermal setting, no effect on the rasteriser, the seed, and 1, 2 and 4 threads each in its own process |
 | `rasterTest.py` | `ER_SWARM_RASTER`: the painted frame showing what the search shows, back faces hidden, a moved body painted where it stands, a small frame searched, the same cut-out holes, forest trees found, a row of trees deeper than the list searched whole, thread counts |
 | `diskCacheTest.py` | `SWARM_BVH_CACHE_DIR` model, texture and mesh-tree files: the same bytes with no folder, a cold folder, a warm one and broken files |
-| `streamLookTest.py` | `swarmStreamLook`: a fixed frame's bytes pinned, bad frames and qualities refused |
+| `streamLookTest.py` | `swarmStreamLook`: a fixed frame's bytes pinned, the same bytes at 1, 2 and 4 threads each in its own process for it and for small frames at other qualities, bad frames and qualities refused |
 | `frameReuseTest.py` | `ER_SWARM_FRAME_REUSE`: a still camera's frame handed back with the bytes it is drawn with, a mover out of sight and shade changing nothing, a mover coming into view or throwing its shadow in from out of view, a new colour, a moved camera, a mover met only by a left-column edge probe and one stepping out through the frame's side, new grain at night and in thermal, the frame really handed back, and 1, 2 and 4 threads each in its own process |
 
 The cross-repository proof that existing families are untouched is the swarm repository's `validator/scripts/verify_render_identity.py`, run on the wheel before and after a change, and its `validator/tests/test_render_backend.py` and `validator/tests/test_sky_sun.py`, which pin ray-cast and sun-sky frames to committed hashes.
@@ -239,7 +239,7 @@ The rest of PyBullet is upstream and documented in the PyBullet Quickstart Guide
 | `rayTest`, `rayTestBatch` | altitude ray, clearance checks, spawn validation | none |
 | `applyExternalForce`, `resetBasePositionAndOrientation` | rotor thrust, wind, moving actors | none |
 
-One call is the fork's own: `swarmStreamLook(frame, out, quality)` writes into `out` a float32 colour frame (height x width x 3, both multiples of 16, values 0 to 1) as a live video stream delivers it, colour at half resolution and 8 x 8 blocks quantised on the JPEG quality scale, in whole-number arithmetic, byte for byte what the Swarm Sentinel family's numpy version gives: 5.9 ms to 2.3 ms a 640 x 480 frame.
+One call is the fork's own: `swarmStreamLook(frame, out, quality)` writes into `out` a float32 colour frame (height x width x 3, both multiples of 16, values 0 to 1) as a live video stream delivers it, colour at half resolution and 8 x 8 blocks quantised on the JPEG quality scale, in whole-number arithmetic, byte for byte what the Swarm Sentinel family's numpy version gives: 5.9 ms to 2.3 ms a 640 x 480 frame. The render threads take 16-row bands, each band's whole look on one thread, since no step crosses a 16-row boundary: 2.2 / 1.1 / 0.6 ms at 1 / 2 / 4 threads (`streamLookTest.py` holds 1, 2 and 4 threads to the same bytes).
 
 ## 9. Adding a switch
 
