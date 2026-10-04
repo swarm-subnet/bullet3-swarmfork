@@ -4144,11 +4144,32 @@ inline void reached(RTCIntersectArguments* args, float t)
 
 // A camera's ray through the frame position (ndcX, ndcY): its unit and raw direction, how far along it the near plane
 // lies and how much further the far plane; false when the near and far points coincide.
-bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float rawDir[3], float& tNear, float& length)
+// A column's share of its rays' near and far plane points, basis[0] + basis[1] ndcX, the sum planePoint starts with.
+struct ColumnRay
+{
+	double m_near[3];
+	double m_far[3];
+};
+
+inline void columnRay(const Camera& cam, double ndcX, ColumnRay& out)
+{
+	for (int i = 0; i < 3; i++)
+	{
+		out.m_near[i] = cam.m_near[0][i] + cam.m_near[1][i] * ndcX;
+		out.m_far[i] = cam.m_far[0][i] + cam.m_far[1][i] * ndcX;
+	}
+}
+
+// pixelRay from a column's share: planePoint adds left to right, so finishing its sum here gives the same points.
+inline bool pixelRayInColumn(const Camera& cam, const ColumnRay& column, double ndcY, float dir[3], float rawDir[3], float& tNear,
+							 float& length)
 {
 	float nearPoint[3], farPoint[3];
-	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
-	planePoint(cam.m_far, ndcX, ndcY, farPoint);
+	for (int i = 0; i < 3; i++)
+	{
+		nearPoint[i] = (float)(column.m_near[i] + cam.m_near[2][i] * ndcY);
+		farPoint[i] = (float)(column.m_far[i] + cam.m_far[2][i] * ndcY);
+	}
 	for (int i = 0; i < 3; i++)
 		dir[i] = rawDir[i] = farPoint[i] - nearPoint[i];
 	length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
@@ -4163,6 +4184,13 @@ bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float r
 	}
 	tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
 	return true;
+}
+
+bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float rawDir[3], float& tNear, float& length)
+{
+	ColumnRay column;
+	columnRay(cam, ndcX, column);
+	return pixelRayInColumn(cam, column, ndcY, dir, rawDir, tNear, length);
 }
 
 // What is already known of a ray's first hit: nothing, so it is searched with an along-ray depth hint; a hit to shade as
@@ -5357,6 +5385,9 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 	float(*dir)[3] = paint.m_dir;
 	float* tNear = paint.m_tNear;
 	float tFar[kTileSize * kTileSize];
+	ColumnRay columns[kTileSize];
+	for (int col = col0; col < col1; col++)
+		columnRay(cam, pixelNdcX(col, width), columns[col - col0]);
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
@@ -5368,7 +5399,7 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 			paint.m_rayNear[k] = INFINITY;
 			paint.m_numTrees[k] = 0;
 			paint.m_wide[k] = false;
-			paint.m_ray[k] = pixelRay(cam, pixelNdcX(col, width), ndcY, dir[k], paint.m_rawDir[k], tNear[k], paint.m_length[k]);
+			paint.m_ray[k] = pixelRayInColumn(cam, columns[col - col0], ndcY, dir[k], paint.m_rawDir[k], tNear[k], paint.m_length[k]);
 			if (paint.m_ray[k])
 				tFar[k] = tNear[k] + paint.m_length[k];
 			else
