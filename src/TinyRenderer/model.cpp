@@ -982,11 +982,14 @@ static inline void bilinear8(const FilterLevel8& images, FilterLanes u, FilterLa
 		const FilterInts bytes = (FilterInts)_mm256_set_m128i(b, a);
 		texel[q] = filterSelect(early, (FilterInts)((FilterUints)bytes >> 8), bytes);
 	}
-	const FilterInts w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy), w01 = (256 - wx) * wy, w11 = wx * wy;
+	// The four-weight sum, as two blends along x and one along y: t00 (256 - wx) + t10 wx is 256 t00 + (t10 - t00) wx in
+	// whole numbers, and so for the rows, so every sum is the same integer with fewer products.
 	for (int c = 0; c < 4; c++)
 	{
 		const int s = 8 * c;
-		out[c] = (((texel[0] >> s) & 255) * w00 + ((texel[1] >> s) & 255) * w10 + ((texel[2] >> s) & 255) * w01 + ((texel[3] >> s) & 255) * w11 + 32768) >> 16;
+		const FilterInts t00 = (texel[0] >> s) & 255, t10 = (texel[1] >> s) & 255, t01 = (texel[2] >> s) & 255, t11 = (texel[3] >> s) & 255;
+		const FilterInts top = (t00 << 8) + (t10 - t00) * wx, bottom = (t01 << 8) + (t11 - t01) * wx;
+		out[c] = ((top << 8) + (bottom - top) * wy + 32768) >> 16;
 	}
 }
 
@@ -1055,7 +1058,8 @@ static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f
 		{
 			bilinear8(coarse, uk, vk, bpp, b);
 			for (int c = 0; c < 4; c++)
-				a[c] = filterSelect(weight != 0, (a[c] * (256 - weight) + b[c] * weight + 128) >> 8, a[c]);
+				// a (256 - w) + b w as 256 a + (b - a) w, the same integer; at w = 0 it is a itself.
+				a[c] = ((a[c] << 8) + (b[c] - a[c]) * weight + 128) >> 8;
 		}
 		const FilterInts active = (zero + k) < taps;
 		for (int c = 0; c < 4; c++)
