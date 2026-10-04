@@ -6137,17 +6137,26 @@ bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam
 }
 
 // Keeps the part of `poly` on the inner side of the directed line a -> b, where inside is the side
-// `sign` says the triangle's third corner lies on.
-void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
+// `sign` says the triangle's third corner lies on. Each corner's side is worked out once; true, with `out` untouched,
+// when every corner is inside, since the clip would then hand back `poly` itself.
+bool clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
 {
-	out.m_n = 0;
 	const double ex = bx - ax, ey = by - ay;
+	double side[8];
+	int inside = 0;
 	for (int i = 0; i < poly.m_n; i++)
+	{
+		side[i] = (ex * (poly.m_y[i] - ay) - ey * (poly.m_x[i] - ax)) * sign;
+		inside += side[i] >= 0.0;
+	}
+	if (inside == poly.m_n)
+		return true;
+	out.m_n = 0;
+	for (int i = 0; i < poly.m_n && inside; i++)
 	{
 		const int k = i + 1 < poly.m_n ? i + 1 : 0;
 		const double px = poly.m_x[i], py = poly.m_y[i], qx = poly.m_x[k], qy = poly.m_y[k];
-		const double dp = (ex * (py - ay) - ey * (px - ax)) * sign;
-		const double dq = (ex * (qy - ay) - ey * (qx - ax)) * sign;
+		const double dp = side[i], dq = side[k];
 		if (dp >= 0.0)
 		{
 			out.m_x[out.m_n] = px;
@@ -6162,6 +6171,7 @@ void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by,
 			out.m_n++;
 		}
 	}
+	return false;
 }
 
 // Area of the polygon and its centroid; a polygon too thin to have an area reports zero and its first corner.
@@ -6187,15 +6197,48 @@ double polygonArea(const Polygon& poly, double& cx, double& cy)
 	return fabs(twice) * 0.5;
 }
 
-// Share of the pixel square that the triangle covers, and the centroid of that part.
-double coverage(const Polygon& square, double squareArea, const double x[3], const double y[3], double& cx, double& cy)
+// The pixel square's own area and centroid, worked out the first time a triangle covers the whole square.
+struct SquarePart
+{
+	bool m_known;
+	double m_part;
+	double m_cx;
+	double m_cy;
+};
+
+// Share of the pixel square that the triangle covers, and the centroid of that part. A clip that keeps every corner
+// hands its polygon on as it is, an empty one ends the clipping, and a square no edge cuts takes the square's own area
+// from `whole`, all as the three full clips would give it.
+double coverage(const Polygon& square, double squareArea, const double x[3], const double y[3], double& cx, double& cy, SquarePart& whole)
 {
 	const double sign = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]) >= 0.0 ? 1.0 : -1.0;
-	Polygon a, b, c;
-	clipByEdge(square, x[0], y[0], x[1], y[1], sign, a);
-	clipByEdge(a, x[1], y[1], x[2], y[2], sign, b);
-	clipByEdge(b, x[2], y[2], x[0], y[0], sign, c);
-	const double part = polygonArea(c, cx, cy);
+	Polygon clipped[3];
+	const Polygon* poly = &square;
+	const double edges[3][4] = {{x[0], y[0], x[1], y[1]}, {x[1], y[1], x[2], y[2]}, {x[2], y[2], x[0], y[0]}};
+	for (int e = 0; e < 3; e++)
+	{
+		if (!clipByEdge(*poly, edges[e][0], edges[e][1], edges[e][2], edges[e][3], sign, clipped[e]))
+			poly = &clipped[e];
+		if (!poly->m_n)
+		{
+			cx = cy = 0.0;
+			return 0.0;
+		}
+	}
+	double part;
+	if (poly == &square)
+	{
+		if (!whole.m_known)
+		{
+			whole.m_part = polygonArea(square, whole.m_cx, whole.m_cy);
+			whole.m_known = true;
+		}
+		part = whole.m_part;
+		cx = whole.m_cx;
+		cy = whole.m_cy;
+	}
+	else
+		part = polygonArea(*poly, cx, cy);
 	const double share = part / squareArea;
 	return share > 1.0 ? 1.0 : share;
 }
@@ -6373,6 +6416,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			square.m_x[1] = ndcX + halfX; square.m_y[1] = ndcY - halfY;
 			square.m_x[2] = ndcX + halfX; square.m_y[2] = ndcY + halfY;
 			square.m_x[3] = ndcX - halfX; square.m_y[3] = ndcY + halfY;
+			SquarePart whole;
+			whole.m_known = false;
 
 			// Candidates, each triangle once: bodies in front of this pixel's hit from the four neighbours,
 			// then the pixel's own triangle, then the neighbours on the same body (a crease or a facet).
@@ -6425,7 +6470,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				double cx, cy;
 				if (!projectCached(cache, job, cam, candidates[c].m_hit, x, y))
 					continue;
-				double share = coverage(square, squareArea, x, y, cx, cy);
+				double share = coverage(square, squareArea, x, y, cx, cy, whole);
 				if (share > 1.0 - covered)
 					share = 1.0 - covered;
 				if (share <= 0.0)
