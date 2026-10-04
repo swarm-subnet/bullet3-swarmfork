@@ -43,6 +43,9 @@ public:
 
 	// Linear radiance along a world direction, blended from the four nearest texels.
 	void radiance(float x, float y, float z, float out[3]) const;
+	// radiance for count directions given as separate x, y and z arrays: the values radiance gives each, eight at a time
+	// in vector lanes where the build has AVX2.
+	void radianceMany(const float* x, const float* y, const float* z, int count, float (*out)[3]) const;
 
 	// Light a surface facing the unit normal receives from the whole sky; a uniform sky of radiance L gives L.
 	void irradiance(const float normal[3], float out[3]) const;

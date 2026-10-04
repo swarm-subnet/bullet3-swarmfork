@@ -3146,13 +3146,15 @@ struct DaylightColour
 	float m_distance;
 };
 
-// Everything the byte of a lit colour needs from the scene: the horizon colour is only looked up under haze.
-void daylightPrepare(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, DaylightColour& colour)
+// Everything the byte of a lit colour needs from the scene: the horizon colour is only looked up under haze. With
+// skyLater, a sky's horizon colour is left for the caller to look up with others.
+void daylightPrepare(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, DaylightColour& colour,
+					 bool skyLater = false)
 {
 	for (int i = 0; i < 3; i++)
 		colour.m_lit[i] = lit[i];
 	colour.m_distance = distance;
-	if (!(shading.m_hazeDistance > 0.0f))
+	if (!(shading.m_hazeDistance > 0.0f) || (skyLater && shading.m_sky))
 		return;
 	if (shading.m_sky)
 	{
@@ -5202,6 +5204,8 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				kindTexels[n] = kindModels[n]->diffuse(kindUvs[n]);
 		for (int n = 0; n < numShades; n++)
 			texels[order[n]] = kindTexels[n];
+		int skyFor[kTileSize * kTileSize], numSky = 0;
+		const int firstSky = numWaiting;
 		for (int i = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
@@ -5217,8 +5221,28 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				moduleLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
 			else
 				daylightLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, lit);
-			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting]);
+			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting], true);
+			skyFor[numSky++] = i;
 			waitingOut[numWaiting++] = shadeOut[i];
+		}
+		// Their horizon colours under haze, looked up together: the sky's colour just above the horizon each way.
+		const SwarmRaycastShading& shading = *job.m_shading;
+		if (shading.m_hazeDistance > 0.0f && shading.m_sky && numSky)
+		{
+			float x[kTileSize * kTileSize], y[kTileSize * kTileSize], z[kTileSize * kTileSize];
+			float horizon[kTileSize * kTileSize][3];
+			for (int n = 0; n < numSky; n++)
+			{
+				float level[3] = {shades[skyFor[n]].m_dir[0], shades[skyFor[n]].m_dir[1], shades[skyFor[n]].m_dir[2]};
+				level[shading.m_glint.m_upAxis] = 0.02f;
+				x[n] = level[0];
+				y[n] = level[1];
+				z[n] = level[2];
+			}
+			shading.m_sky->radianceMany(x, y, z, numSky, horizon);
+			for (int n = 0; n < numSky; n++)
+				for (int c = 0; c < 3; c++)
+					waiting[firstSky + n].m_horizon[c] = horizon[n][c];
 		}
 	}
 	if (numWaiting)

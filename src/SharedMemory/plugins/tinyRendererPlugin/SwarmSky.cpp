@@ -5,6 +5,9 @@
 
 #include "SwarmDaylight.h"
 #include "../../../TinyRenderer/SwarmGamma.h"
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace
 {
@@ -673,6 +676,60 @@ void SwarmSky::radiance(float x, float y, float z, float out[3]) const
 		const float b = p01[k] + (p11[k] - p01[k]) * cs.m_wi;
 		out[k] = a + (b - a) * cs.m_wj;
 	}
+}
+
+void SwarmSky::radianceMany(const float* x, const float* y, const float* z, int count, float (*out)[3]) const
+{
+	int k = 0;
+#if defined(__AVX2__)
+	if (m_daylightBuilt)
+	{
+		typedef float Lanes __attribute__((vector_size(32)));
+		typedef int Ints __attribute__((vector_size(32)));
+		const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.f, last = zero + (float)(kDayFace - 1);
+		const Ints izero = {0, 0, 0, 0, 0, 0, 0, 0};
+		for (; k + 8 <= count; k += 8)
+		{
+			// cubeSample on each lane: the same face choice, the same scale and the same clamps.
+			Lanes vx, vy, vz;
+			memcpy(&vx, x + k, sizeof(vx));
+			memcpy(&vy, y + k, sizeof(vy));
+			memcpy(&vz, z + k, sizeof(vz));
+			const Lanes ax = vx < zero ? -vx : vx, ay = vy < zero ? -vy : vy, az = vz < zero ? -vz : vz;
+			const Ints onX = (ax >= ay) & (ax >= az);
+			const Ints onY = ~onX & (ay >= az);
+			const Ints face = onX ? (vx < zero ? izero + 1 : izero) : (onY ? (vy < zero ? izero + 3 : izero + 2) : (vz < zero ? izero + 5 : izero + 4));
+			const Lanes m = onX ? ax : (onY ? ay : az);
+			const Lanes s = onX ? vy : vx;
+			const Lanes t = (onX | onY) ? vz : vy;
+			const Lanes inv = one / m;
+			Lanes fi = (s * inv + 1.f) * (0.5f * kDayFace) - 0.5f;
+			Lanes fj = (t * inv + 1.f) * (0.5f * kDayFace) - 0.5f;
+			fi = m > zero ? fi : zero;
+			fj = m > zero ? fj : zero;
+			fi = fi < zero ? zero : (fi > last ? last : fi);
+			fj = fj < zero ? zero : (fj > last ? last : fj);
+			const Ints i0 = __builtin_convertvector(fi, Ints), j0 = __builtin_convertvector(fj, Ints);
+			const Ints i1 = i0 + 1 < kDayFace ? i0 + 1 : i0, j1 = j0 + 1 < kDayFace ? j0 + 1 : j0;
+			const Lanes wi = fi - __builtin_convertvector(i0, Lanes), wj = fj - __builtin_convertvector(j0, Lanes);
+			const Ints row0 = (face * kDayFace + j0) * kDayFace, row1 = (face * kDayFace + j1) * kDayFace;
+			const Ints at00 = (row0 + i0) * 3, at10 = (row0 + i1) * 3, at01 = (row1 + i0) * 3, at11 = (row1 + i1) * 3;
+			for (int c = 0; c < 3; c++)
+			{
+				const float* base = &m_radiance[c];
+				const Lanes p00 = (Lanes)_mm256_i32gather_ps(base, (__m256i)at00, 4), p10 = (Lanes)_mm256_i32gather_ps(base, (__m256i)at10, 4);
+				const Lanes p01 = (Lanes)_mm256_i32gather_ps(base, (__m256i)at01, 4), p11 = (Lanes)_mm256_i32gather_ps(base, (__m256i)at11, 4);
+				const Lanes a = p00 + (p10 - p00) * wi;
+				const Lanes b = p01 + (p11 - p01) * wi;
+				const Lanes v = a + (b - a) * wj;
+				for (int l = 0; l < 8; l++)
+					out[k + l][c] = v[l];
+			}
+		}
+	}
+#endif
+	for (; k < count; k++)
+		radiance(x[k], y[k], z[k], out[k]);
 }
 
 void SwarmSky::irradiance(const float normal[3], float out[3]) const
