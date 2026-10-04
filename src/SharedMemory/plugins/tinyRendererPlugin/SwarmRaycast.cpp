@@ -4239,12 +4239,15 @@ struct SurfaceMemo
 	short m_slot[kSlots];
 	int m_count;
 	int m_last;
+	// The painted triangle m_last was found for, when the last finding came from paintedHit; null otherwise.
+	const void* m_lastTri;
 
 	// Empty, for a new tile.
 	void clear()
 	{
 		m_count = 0;
 		m_last = 0;
+		m_lastTri = 0;
 		memset(m_slot, 0, sizeof(m_slot));
 	}
 
@@ -4252,6 +4255,7 @@ struct SurfaceMemo
 	Entry& find(const unsigned key[5], bool& added)
 	{
 		added = false;
+		m_lastTri = 0;
 		if (m_count && memcmp(m_entries[m_last].m_key, key, sizeof(m_entries[0].m_key)) == 0)
 			return m_entries[m_last];
 		const unsigned mix = (key[0] * 0x9E3779B1u) ^ (key[1] * 0x85EBCA77u) ^ (key[2] * 0xC2B2AE3Du) ^ (key[3] * 0x27D4EB2Fu) ^ (key[4] * 0x165667B1u);
@@ -5564,9 +5568,16 @@ bool paintedHit(const TileJob& job, const CameraSetup& setup, const TilePaint& p
 	const SwarmRaycastShading& shading = *job.m_shading;
 	if (shading.m_shadow && !job.m_shadowMap)
 		return false;
-	const unsigned key[5] = {tri->m_inst, tri->m_geom, tri->m_prim, RTC_INVALID_GEOMETRY_ID, RTC_INVALID_GEOMETRY_ID};
+	// The sample before on the same painted triangle found its entry last, so the key and the lookup are skipped.
 	bool resolve = false;
-	SurfaceMemo::Entry& entry = memo.find(key, resolve);
+	SurfaceMemo::Entry* found = &memo.m_entries[memo.m_last];
+	if (tri != memo.m_lastTri)
+	{
+		const unsigned key[5] = {tri->m_inst, tri->m_geom, tri->m_prim, RTC_INVALID_GEOMETRY_ID, RTC_INVALID_GEOMETRY_ID};
+		found = &memo.find(key, resolve);
+		memo.m_lastTri = tri;
+	}
+	SurfaceMemo::Entry& entry = *found;
 	HitSurface& surface = entry.m_surface;
 	if (resolve)
 	{
