@@ -10685,15 +10685,24 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				npy_intp dep_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				npy_intp seg_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				int depthOnly = (flags >= 0) && ((flags & ER_DEPTH_ONLY) != 0);
+				int noDepth = !depthOnly && (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0);
 
 				pyResultList = PyTuple_New(5);
 
 				PyTuple_SetItem(pyResultList, 0, PyInt_FromLong(imageData.m_pixelWidth));
 				PyTuple_SetItem(pyResultList, 1, PyInt_FromLong(imageData.m_pixelHeight));
 
-				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
-				memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
-					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				if (noDepth)
+				{
+					Py_INCREF(Py_None);
+					pyDep = Py_None;
+				}
+				else
+				{
+					pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
+					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				}
 
 				if (depthOnly)
 				{
@@ -10738,9 +10747,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				int bytesPerPixel = 4;  // Red, Green, Blue, and Alpha each 8 bit values
 				int num =
 					bytesPerPixel * imageData.m_pixelWidth * imageData.m_pixelHeight;
+				const int noDepth = (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0) && ((flags & ER_DEPTH_ONLY) == 0);
 				pylistRGB = PyTuple_New(num);
-				pylistDep =
-					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
+				pylistDep = noDepth ? 0 : PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				pylistSeg =
 					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				for (i = 0; i < imageData.m_pixelWidth; i++)
@@ -10749,6 +10758,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 					{
 						// TODO(hellojas): validate depth values make sense
 						int depIndex = i + j * imageData.m_pixelWidth;
+						if (pylistDep)
 						{
 							item = PyFloat_FromDouble(imageData.m_depthValues[depIndex]);
 							PyTuple_SetItem(pylistDep, depIndex, item);
@@ -10771,6 +10781,11 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 			}
 
 			PyTuple_SetItem(pyResultList, 2, pylistRGB);
+			if (!pylistDep)
+			{
+				Py_INCREF(Py_None);
+				pylistDep = Py_None;
+			}
 			PyTuple_SetItem(pyResultList, 3, pylistDep);
 			PyTuple_SetItem(pyResultList, 4, pylistSeg);
 			return pyResultList;
@@ -13972,6 +13987,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_FRAME_REUSE", ER_SWARM_FRAME_REUSE);
 	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
 	PyModule_AddIntConstant(m, "ER_SWARM_RASTER", ER_SWARM_RASTER);
+	PyModule_AddIntConstant(m, "ER_SWARM_NO_DEPTH", ER_SWARM_NO_DEPTH);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

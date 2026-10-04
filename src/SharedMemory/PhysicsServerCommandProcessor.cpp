@@ -4579,6 +4579,10 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 				{
 					segmentationMaskBuffer = 0;
 				}
+				if ((flags & ER_SWARM_NO_DEPTH) != 0 && !compactDepthStream)
+				{
+					depthBuffer = 0;
+				}
 
 				int camRelativeStart = (numBatchCameras > 1 && camPixels > 0) ? (startPixelIndex % camPixels) : startPixelIndex;
 				if (numBatchCameras > 1 && camPixels > 0)

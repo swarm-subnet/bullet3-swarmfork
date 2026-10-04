@@ -556,16 +556,24 @@ bool PhysicsDirect::processCamera(const struct SharedMemoryCommand& orgCommand)
 
 			int numPixels = serverCmd.m_sendPixelDataArguments.m_imageWidth * serverCmd.m_sendPixelDataArguments.m_imageHeight;
 
-			m_data->m_cachedCameraPixelsRGBA.reserve(numPixels * numBytesPerPixel);
-			m_data->m_cachedCameraDepthBuffer.resize(numTotalPixels);
-			m_data->m_cachedSegmentationMask.resize(numTotalPixels);
-			m_data->m_cachedCameraPixelsRGBA.resize(numTotalPixels * numBytesPerPixel);
-
 			int reqFlags = (command.m_updateFlags & REQUEST_PIXEL_ARGS_HAS_FLAGS) ? command.m_requestPixelDataArguments.m_flags : 0;
 			bool depthOnly = (reqFlags & ER_DEPTH_ONLY) != 0;
 			bool noSeg = (reqFlags & ER_NO_SEGMENTATION_MASK) != 0;
 			// Must mirror the server's compact depth-only stream layout.
 			bool compactDepthStream = depthOnly && ((command.m_updateFlags & ER_BULLET_HARDWARE_OPENGL) == 0);
+			bool noDepth = (reqFlags & ER_SWARM_NO_DEPTH) != 0 && !compactDepthStream;
+
+			// A buffer this request's chunks write in full is resized without filling it first; the others fill as before.
+			m_data->m_cachedCameraPixelsRGBA.reserve(numPixels * numBytesPerPixel);
+			m_data->m_cachedCameraDepthBuffer.resizeNoInitialize(numTotalPixels);
+			if (!noSeg && !compactDepthStream)
+				m_data->m_cachedSegmentationMask.resizeNoInitialize(numTotalPixels);
+			else
+				m_data->m_cachedSegmentationMask.resize(numTotalPixels);
+			if (!depthOnly)
+				m_data->m_cachedCameraPixelsRGBA.resizeNoInitialize(numTotalPixels * numBytesPerPixel);
+			else
+				m_data->m_cachedCameraPixelsRGBA.resize(numTotalPixels * numBytesPerPixel);
 			int numCopied = serverCmd.m_sendPixelDataArguments.m_numPixelsCopied;
 			int startPixel = serverCmd.m_sendPixelDataArguments.m_startingPixelIndex;
 
@@ -579,7 +587,8 @@ bool PhysicsDirect::processCamera(const struct SharedMemoryCommand& orgCommand)
 
 			if (numCopied > 0)
 			{
-				memcpy(&m_data->m_cachedCameraDepthBuffer[startPixel], depthBuffer, numCopied * sizeof(float));
+				if (!noDepth)
+					memcpy(&m_data->m_cachedCameraDepthBuffer[startPixel], depthBuffer, numCopied * sizeof(float));
 				if (!noSeg && !compactDepthStream)
 				{
 					memcpy(&m_data->m_cachedSegmentationMask[startPixel], segmentationMaskBuffer, numCopied * sizeof(int));
