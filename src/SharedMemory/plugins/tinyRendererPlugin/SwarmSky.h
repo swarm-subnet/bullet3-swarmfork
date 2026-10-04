@@ -49,6 +49,9 @@ public:
 
 	// Light a surface facing the unit normal receives from the whole sky; a uniform sky of radiance L gives L.
 	void irradiance(const float normal[3], float out[3]) const;
+	// irradiance for count unit normals given as separate x, y and z arrays: the values irradiance gives each, eight at a
+	// time in vector lanes where the compiler has them.
+	void irradianceMany(const float* x, const float* y, const float* z, int count, float (*out)[3]) const;
 
 	// The display bytes of the linear sky along a world direction, at the exposure it was built with.
 	void lookupDisplay(float x, float y, float z, unsigned char out[3]) const;

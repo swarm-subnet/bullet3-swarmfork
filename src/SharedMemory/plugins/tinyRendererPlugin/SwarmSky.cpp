@@ -752,6 +752,42 @@ void SwarmSky::irradiance(const float normal[3], float out[3]) const
 	}
 }
 
+void SwarmSky::irradianceMany(const float* x, const float* y, const float* z, int count, float (*out)[3]) const
+{
+	int n = 0;
+#if defined(__GNUC__)
+	if (m_daylightBuilt)
+	{
+		typedef float Lanes __attribute__((vector_size(32)));
+		const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0};
+		const float c1 = 0.429043f, c2 = 0.511664f, c3 = 0.743125f, c4 = 0.886227f, c5 = 0.247708f;
+		for (; n + 8 <= count; n += 8)
+		{
+			// irradiance on each lane: the same terms added in the same order.
+			Lanes vx, vy, vz;
+			memcpy(&vx, x + n, sizeof(vx));
+			memcpy(&vy, y + n, sizeof(vy));
+			memcpy(&vz, z + n, sizeof(vz));
+			for (int k = 0; k < 3; k++)
+			{
+				Lanes e = c1 * m_sh[8][k] * (vx * vx - vy * vy) + c3 * m_sh[6][k] * vz * vz + c4 * m_sh[0][k] - c5 * m_sh[6][k];
+				e += 2.0f * c1 * (m_sh[4][k] * vx * vy + m_sh[7][k] * vx * vz + m_sh[5][k] * vy * vz);
+				e += 2.0f * c2 * (m_sh[3][k] * vx + m_sh[1][k] * vy + m_sh[2][k] * vz);
+				e *= 0.3183098861837907f;
+				e = e > zero ? e : zero;
+				for (int l = 0; l < 8; l++)
+					out[n + l][k] = e[l];
+			}
+		}
+	}
+#endif
+	for (; n < count; n++)
+	{
+		const float normal[3] = {x[n], y[n], z[n]};
+		irradiance(normal, out[n]);
+	}
+}
+
 void SwarmSky::lookupDisplay(float x, float y, float z, unsigned char out[3]) const
 {
 	if (!m_daylightBuilt)
