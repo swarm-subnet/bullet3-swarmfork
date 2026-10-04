@@ -916,14 +916,16 @@ static inline FilterLanes wrapUnit8(FilterLanes value)
 	return filterSelect(f < zero, f + 1.f, f);
 }
 
-// sampleBilinear on each lane, from the level of its own texture each lane names. A texel's bytes come from one
-// four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it; a
-// one-texel three-byte image is read from a copy with a spare byte in front, which gives the same bytes.
-static inline void bilinear8(SharedTexture* const tex[8], FilterInts level, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4])
+// The image each lane reads at its level: where its bytes start and its size. A one-texel three-byte image is read from
+// a copy with a spare byte in front, which gives the same bytes; the copy lives in `lone`, which must outlive the reads.
+struct FilterLevel8
 {
-	FilterLongs baseLo, baseHi;
-	FilterInts w, h;
-	unsigned char lone[8][4];
+	FilterLongs m_baseLo, m_baseHi;
+	FilterInts m_w, m_h;
+};
+
+static inline void filterLevel8(SharedTexture* const tex[8], FilterInts level, FilterInts bpp, unsigned char lone[8][4], FilterLevel8& out)
+{
 	for (int l = 0; l < 8; l++)
 	{
 		TGAImage& img = level[l] == 0 ? tex[l]->img_ : *tex[l]->mips_[level[l] - 1];
@@ -935,12 +937,20 @@ static inline void bilinear8(SharedTexture* const tex[8], FilterInts level, Filt
 			base = (long long)(size_t)&lone[l][1];
 		}
 		if (l < 4)
-			baseLo[l] = base;
+			out.m_baseLo[l] = base;
 		else
-			baseHi[l - 4] = base;
-		w[l] = img.get_width();
-		h[l] = img.get_height();
+			out.m_baseHi[l - 4] = base;
+		out.m_w[l] = img.get_width();
+		out.m_h[l] = img.get_height();
 	}
+}
+
+// sampleBilinear on each lane, from the level of its own texture `images` names. A texel's bytes come from one
+// four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it.
+static inline void bilinear8(const FilterLevel8& images, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4])
+{
+	const FilterLongs baseLo = images.m_baseLo, baseHi = images.m_baseHi;
+	const FilterInts w = images.m_w, h = images.m_h;
 	const FilterLanes x = u * __builtin_convertvector(w, FilterLanes) - 0.5f;
 	const FilterLanes y = v * __builtin_convertvector(h, FilterLanes) - 0.5f;
 	const FilterLanes fx = (FilterLanes)_mm256_round_ps((__m256)x, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
@@ -1027,6 +1037,12 @@ static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f
 	int most = 1;
 	for (int l = 0; l < 8; l++)
 		most = taps[l] > most ? taps[l] : most;
+	// A lane reads the same two levels at every tap, so their images are looked up once.
+	unsigned char lone[2][8][4];
+	FilterLevel8 fine, coarse;
+	filterLevel8(tex, level, bpp, lone[0], fine);
+	if (blend)
+		filterLevel8(tex, coarser, bpp, lone[1], coarse);
 	FilterInts sum[4] = {zero, zero, zero, zero};
 	for (int k = 0; k < most; k++)
 	{
@@ -1034,10 +1050,10 @@ static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f
 		const FilterInts many = taps > one;
 		const FilterLanes uk = filterSelect(many, wrapUnit8(u + along0 * f), u), vk = filterSelect(many, wrapUnit8(v + along1 * f), v);
 		FilterInts a[4], b[4];
-		bilinear8(tex, level, uk, vk, bpp, a);
+		bilinear8(fine, uk, vk, bpp, a);
 		if (blend)
 		{
-			bilinear8(tex, coarser, uk, vk, bpp, b);
+			bilinear8(coarse, uk, vk, bpp, b);
 			for (int c = 0; c < 4; c++)
 				a[c] = filterSelect(weight != 0, (a[c] * (256 - weight) + b[c] * weight + 128) >> 8, a[c]);
 		}
