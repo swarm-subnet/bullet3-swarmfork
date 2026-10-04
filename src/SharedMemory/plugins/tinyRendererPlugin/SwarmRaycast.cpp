@@ -5576,6 +5576,48 @@ bool isEdge(const int* ids, const float* w, int width, int height, int row, int 
 	return false;
 }
 
+// isEdge for columns col0 up to col1 of one row into `edge`, eight at a time where all four neighbours are inside the frame.
+void edgeRow(const int* ids, const float* w, int width, int height, int row, int col0, int col1, float tolerance, bool* edge)
+{
+	int col = col0;
+#if defined(__GNUC__)
+	if (row > 0 && row + 1 < height)
+	{
+		if (col == 0 && col < col1)
+		{
+			edge[0] = isEdge(ids, w, width, height, row, 0, tolerance);
+			col++;
+		}
+		const SwarmLaneMask8 magnitude = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+		for (; col + 8 <= col1 && col + 8 < width; col += 8)
+		{
+			const size_t offset = (size_t)row * width + col;
+			SwarmLaneMask8 id, left, right, up, down;
+			SwarmLanes8 wc, wl, wr, wu, wd;
+			memcpy(&id, ids + offset, sizeof(id));
+			memcpy(&left, ids + offset - 1, sizeof(left));
+			memcpy(&right, ids + offset + 1, sizeof(right));
+			memcpy(&up, ids + offset - width, sizeof(up));
+			memcpy(&down, ids + offset + width, sizeof(down));
+			memcpy(&wc, w + offset, sizeof(wc));
+			memcpy(&wl, w + offset - 1, sizeof(wl));
+			memcpy(&wr, w + offset + 1, sizeof(wr));
+			memcpy(&wu, w + offset - width, sizeof(wu));
+			memcpy(&wd, w + offset + width, sizeof(wd));
+			// fabsf on each lane is the value with its sign bit cleared.
+			const SwarmLanes8 limit = tolerance * (SwarmLanes8)((SwarmLaneMask8)wc & magnitude);
+			const SwarmLanes8 across = (SwarmLanes8)((SwarmLaneMask8)((wl + wr) - 2.0f * wc) & magnitude);
+			const SwarmLanes8 along = (SwarmLanes8)((SwarmLaneMask8)((wu + wd) - 2.0f * wc) & magnitude);
+			const SwarmLaneMask8 hit = (left != id) | (right != id) | (up != id) | (down != id) | (across > limit) | (along > limit);
+			for (int l = 0; l < 8; l++)
+				edge[col - col0 + l] = hit[l] != 0;
+		}
+	}
+#endif
+	for (; col < col1; col++)
+		edge[col - col0] = isEdge(ids, w, width, height, row, col, tolerance);
+}
+
 // A convex polygon on the frame, in ndc; a pixel square clipped by three edges has at most seven corners.
 struct Polygon
 {
@@ -5652,7 +5694,7 @@ void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by,
 	const double ex = bx - ax, ey = by - ay;
 	for (int i = 0; i < poly.m_n; i++)
 	{
-		const int k = (i + 1) % poly.m_n;
+		const int k = i + 1 < poly.m_n ? i + 1 : 0;
 		const double px = poly.m_x[i], py = poly.m_y[i], qx = poly.m_x[k], qy = poly.m_y[k];
 		const double dp = (ex * (py - ay) - ey * (px - ax)) * sign;
 		const double dq = (ex * (qy - ay) - ey * (qx - ax)) * sign;
@@ -5678,7 +5720,7 @@ double polygonArea(const Polygon& poly, double& cx, double& cy)
 	double twice = 0.0, sx = 0.0, sy = 0.0;
 	for (int i = 0; i < poly.m_n; i++)
 	{
-		const int k = (i + 1) % poly.m_n;
+		const int k = i + 1 < poly.m_n ? i + 1 : 0;
 		const double cross = poly.m_x[i] * poly.m_y[k] - poly.m_x[k] * poly.m_y[i];
 		twice += cross;
 		sx += (poly.m_x[i] + poly.m_x[k]) * cross;
@@ -5832,9 +5874,11 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
+		bool edge[kTileSize];
+		edgeRow(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col0, col1, tolerance, edge);
 		for (int col = col0; col < col1; col++)
 		{
-			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, tolerance))
+			if (!edge[col - col0])
 				continue;
 			const size_t offset = (size_t)row * width + col;
 			const double ndcX = pixelNdcX(col, width);
