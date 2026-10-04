@@ -3591,6 +3591,47 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	return shadowFinish(job, point, unitNormal, litShare, blocked, shadowArgs);
 }
 
+// shadowMapBlocked for count points of one map at once: eight at a time in vector lanes where the build has AVX2, each
+// lane shadowMapBlocked's steps on its one cell; the cells a lane reads are cast first, as shadowMapBlocked casts them.
+void shadowBlockedMany(const ShadowMap& map, const float (*points)[3], const float (*normals)[3], int count, bool* blocked)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; map.m_built && k + 8 <= count; k += 8)
+	{
+		Lanes p[3], n[3];
+		for (int l = 0; l < 8; l++)
+			for (int i = 0; i < 3; i++)
+			{
+				p[i][l] = points[k + l][i];
+				n[i][l] = normals[k + l][i];
+			}
+		const Lanes facing = (n[0] * map.m_lightDir[0] + n[1] * map.m_lightDir[1]) + n[2] * map.m_lightDir[2];
+		Lanes rel[3];
+		for (int i = 0; i < 3; i++)
+			rel[i] = (p[i] + n[i] * map.m_cell) - map.m_origin[i];
+		const Lanes u = ((rel[0] * map.m_axisU[0] + rel[1] * map.m_axisU[1]) + rel[2] * map.m_axisU[2]) / map.m_cell;
+		const Lanes v = ((rel[0] * map.m_axisV[0] + rel[1] * map.m_axisV[1]) + rel[2] * map.m_axisV[2]) / map.m_cell;
+		const Ints dark = facing <= zero;
+		const Ints read = ~dark & (u >= zero) & (v >= zero) & (u < (float)map.m_cols) & (v < (float)map.m_rows);
+		const Ints iu = __builtin_convertvector(u, Ints), iv = __builtin_convertvector(v, Ints);
+		for (int l = 0; l < 8; l++)
+			if (read[l])
+				ensureShadowCells(map, iu[l], iu[l], iv[l], iv[l]);
+		const Lanes depth = -((rel[0] * map.m_lightDir[0] + rel[1] * map.m_lightDir[1]) + rel[2] * map.m_lightDir[2]);
+		const Lanes cell = (Lanes)_mm256_i32gather_ps(map.m_depth.get(), (__m256i)(read & (iv * map.m_cols + iu)), 4);
+		const Ints behind = read & (depth > cell + map.m_cell);
+		for (int l = 0; l < 8; l++)
+			blocked[k + l] = dark[l] || behind[l];
+	}
+#endif
+	for (; k < count; k++)
+		blocked[k] = shadowMapBlocked(map, points[k], normals[k]);
+}
+
 // shadowMapLit for count points at once, each with its own map and unit normal: eight at a time in vector lanes where
 // the build has AVX2 and all eight read the inside of one map, each lane shadowMapLit's steps and its nine cells added
 // in the same order; any other group point by point.
@@ -4291,7 +4332,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	// before the wait reads the shadow: a cut-out that may be a veil, or a pane the ray passes through.
 	const bool waitable = deferColour && !shading->m_thermal && !(shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
 						  !(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
-	const bool shadowLater = waitable && shading->m_shadow && shading->m_daylight && job.m_shadowMap;
+	const bool shadowLater = waitable && shading->m_shadow && job.m_shadowMap;
 	float shadow = 1.0f;
 	if (shading->m_shadow && !shading->m_thermal && !shadowLater)
 	{
@@ -5423,10 +5464,19 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					points[n][c] = wait.m_point[c];
 				maps[n] = shadowMapFor(job, points[n]);
 			}
-			if (numLate)
+			if (numLate && job.m_shading->m_daylight)
+			{
 				shadowLitMany(maps, points, normals, numLate, lit);
-			for (int n = 0; n < numLate; n++)
-				shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], lit[n], lit[n] <= 0.0f, shadowArgs);
+				for (int n = 0; n < numLate; n++)
+					shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], lit[n], lit[n] <= 0.0f, shadowArgs);
+			}
+			else if (numLate)
+			{
+				bool blocked[kTileSize * kTileSize];
+				shadowBlockedMany(*job.m_shadowMap, points, normals, numLate, blocked);
+				for (int n = 0; n < numLate; n++)
+					shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], 1.0f, blocked[n], shadowArgs);
+			}
 		}
 		for (int i = 0; i < numShades; i++)
 		{
