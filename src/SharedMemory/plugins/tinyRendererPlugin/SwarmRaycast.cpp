@@ -5579,6 +5579,141 @@ bool paintedHit(const TileJob& job, const CameraSetup& setup, const TilePaint& p
 	return true;
 }
 
+// shadeHitFinish for the tile's waiting fragment-shaded hits listed in `which`, eight at a time in vector lanes where
+// the build has AVX2 and the light is linear: each lane the scalar steps on its own hit, in their order, a step the
+// scalar code skips masked off; table reads stay per hit. Every byte is the one shadeHitFinish writes.
+void shadeHitFinishMany(const SwarmRaycastShading& shading, const ShadeWait* shades, const int* which, int count, const float (*normals)[3],
+						const TinyRender::Vec2f* uvs, const TGAColor* texels, unsigned char* const* outs)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.0f;
+	const Ints none = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; shading.m_linearLight && k + 8 <= count; k += 8)
+	{
+		Lanes n[3], base[3], face[3], view[3], point[3], shadow, spec[3];
+		Ints exponent;
+		for (int l = 0; l < 8; l++)
+		{
+			const int i = which[k + l];
+			const ShadeWait& wait = shades[i];
+			TinyRender::Model* model = wait.m_surface->m_model;
+			exponent[l] = (int)model->specular(uvs[i]);
+			const TinyRender::Vec4f& rgba = model->getColorRGBA();
+			TGAColor color = texels[i];
+			float b[3];
+			for (int c = 0; c < 3; c++)
+				b[c] = kSwarmSrgbToLinear[(unsigned char)(color[c] * rgba[c])];
+			if (shading.m_nearInfrared)
+				b[0] = b[1] = b[2] = nearInfraredAlbedo(b);
+			const float* specular = &model->getSpecularColor()[0];
+			for (int c = 0; c < 3; c++)
+			{
+				n[c][l] = normals[i][c];
+				base[c][l] = b[c];
+				face[c][l] = wait.m_faceNormal[c];
+				view[c][l] = wait.m_dir[c];
+				point[c][l] = wait.m_point[c];
+				spec[c][l] = specular[c];
+			}
+			shadow[l] = wait.m_shadow;
+		}
+		const float* L = shading.m_lightDir;
+		const Lanes nDotL = (n[0] * L[0] + n[1] * L[1]) + n[2] * L[2];
+		Lanes reflection[3];
+		for (int c = 0; c < 3; c++)
+			reflection[c] = n[c] * (nDotL * 2.0f) - L[c];
+		const Lanes rLength = (Lanes)_mm256_sqrt_ps((__m256)((reflection[0] * reflection[0] + reflection[1] * reflection[1]) + reflection[2] * reflection[2]));
+		const Ints rSome = rLength > zero;
+		const Lanes rInv = 1.0f / (rSome ? rLength : one);
+		for (int c = 0; c < 3; c++)
+			reflection[c] = rSome ? reflection[c] * rInv : reflection[c];
+		// powInt on each lane: a lane multiplies only where its own exponent has the bit, as the scalar loop does.
+		Lanes x = reflection[2] > zero ? reflection[2] : zero, specular = one;
+		for (Ints e = exponent; _mm256_movemask_ps((__m256)(e > none)); e >>= 1)
+		{
+			specular = ((e & 1) != none) & (e > none) ? specular * x : specular;
+			x *= x;
+		}
+		const Lanes diffuse = nDotL > zero ? nDotL : zero;
+		Lanes lit[3];
+		for (int c = 0; c < 3; c++)
+			lit[c] = shading.m_ambientCoeff * base[c] * shading.m_ambientColor[c] +
+					 shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base[c] * shading.m_lightColor[c];
+		if (shading.m_spot)
+		{
+			// spotIrradiance on each lane, a lane that returns early held at zero.
+			Lanes facing[3];
+			const Ints flip = ((n[0] * face[0] + n[1] * face[1]) + n[2] * face[2]) < zero;
+			for (int c = 0; c < 3; c++)
+				facing[c] = flip ? -n[c] : n[c];
+			Lanes toLamp[3];
+			for (int c = 0; c < 3; c++)
+				toLamp[c] = shading.m_spotPosition[c] - point[c];
+			const Lanes distance2 = (toLamp[0] * toLamp[0] + toLamp[1] * toLamp[1]) + toLamp[2] * toLamp[2];
+			const Lanes distance = (Lanes)_mm256_sqrt_ps((__m256)distance2);
+			const Lanes reach = distance / shading.m_spotRange;
+			for (int c = 0; c < 3; c++)
+				toLamp[c] /= distance;
+			const Lanes towards = (facing[0] * toLamp[0] + facing[1] * toLamp[1]) + facing[2] * toLamp[2];
+			const float* sd = shading.m_spotDirection;
+			const Lanes axis = -((sd[0] * toLamp[0] + sd[1] * toLamp[1]) + sd[2] * toLamp[2]);
+			const Ints lights = (distance2 > zero) & (reach < one) & (towards > zero) & (axis > shading.m_spotCosOuter);
+			Lanes cone = (axis - shading.m_spotCosOuter) / (shading.m_spotCosInner - shading.m_spotCosOuter);
+			cone = cone < one ? cone : one;
+			cone = cone * cone * (3.0f - 2.0f * cone);
+			const Lanes reach2 = reach * reach;
+			const Lanes window = 1.0f - reach2 * reach2;
+			const Lanes lamp = lights ? shading.m_spotIntensity * towards * cone * (window * window) / distance2 : zero;
+			for (int c = 0; c < 3; c++)
+				lit[c] += lamp * base[c];
+		}
+		float sky[3][8];
+		if (shading.m_glint.m_enabled)
+		{
+			// applyLinear on each lane, its sky colour read from the table per hit.
+			const TinyRenderGlint& g = shading.m_glint;
+			Lanes toCamera[3];
+			for (int c = 0; c < 3; c++)
+				toCamera[c] = -view[c];
+			Lanes nDotV = (n[0] * toCamera[0] + n[1] * toCamera[1]) + n[2] * toCamera[2];
+			const Ints behind = nDotV < zero;
+			const Lanes side = behind ? zero - 1.0f : one;
+			nDotV = behind ? -nDotV : nDotV;
+			const Lanes up = (n[g.m_upAxis] * side) * (2.0f * nDotV) - toCamera[g.m_upAxis];
+			const Lanes t = up < zero ? zero : up;
+			const Lanes f = 1.0f - nDotV;
+			const Lanes f2 = f * f;
+			const Lanes fresnel = 0.04f + 0.96f * (f2 * f2 * f);
+			for (int c = 0; c < 3; c++)
+			{
+				const Lanes level = g.m_skyHorizon[c] + (g.m_skyZenith[c] - g.m_skyHorizon[c]) * t;
+				for (int l = 0; l < 8; l++)
+					sky[c][l] = swarmUnitToLinear(level[l]);
+				Lanes s;
+				memcpy(&s, sky[c], sizeof(s));
+				const Lanes w = spec[c] * fresnel;
+				lit[c] = lit[c] + (s - lit[c]) * w;
+			}
+		}
+		for (int l = 0; l < 8; l++)
+		{
+			unsigned char* out = outs[which[k + l]];
+			for (int c = 0; c < 3; c++)
+				out[c] = swarmLinearToSrgb(lit[c][l]);
+		}
+	}
+#endif
+	for (; k < count; k++)
+	{
+		const int i = which[k];
+		const ShadeWait& wait = shades[i];
+		shadeHitFinish(shading, *wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow, wait.m_point, outs[i]);
+	}
+}
+
 // The tile's waiting hits shaded together: their footprints, shadows, normals and textures, then their light, which joins
 // the colours waiting in `waiting`; then every waiting colour is finished and written.
 void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccludedArguments* shadowArgs, ShadeWait* shades,
@@ -5718,15 +5853,14 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			dayShadows[numDay++] = wait.m_shadow;
 		}
 		daylightLightMany(*job.m_shading, daySurfaces, dayNormals, dayBases, dayDirs, dayShadows, numDay, dayLit);
-		int skyFor[kTileSize * kTileSize], numSky = 0;
+		int skyFor[kTileSize * kTileSize], numSky = 0, fragments[kTileSize * kTileSize], numFragments = 0;
 		const int firstSky = numWaiting;
 		for (int i = 0, day = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
 			if (wait.m_kind == ShadeWait::kFragment)
 			{
-				shadeHitFinish(*job.m_shading, *wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow,
-							   wait.m_point, shadeOut[i]);
+				fragments[numFragments++] = i;
 				continue;
 			}
 			float base[3], moduleLit[3];
@@ -5742,6 +5876,7 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			skyFor[numSky++] = i;
 			waitingOut[numWaiting++] = shadeOut[i];
 		}
+		shadeHitFinishMany(*job.m_shading, shades, fragments, numFragments, normals, uvs, texels, shadeOut);
 		// Their horizon colours under haze, looked up together: the sky's colour just above the horizon each way.
 		const SwarmRaycastShading& shading = *job.m_shading;
 		if (shading.m_hazeDistance > 0.0f && shading.m_sky && numSky)
