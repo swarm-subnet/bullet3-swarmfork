@@ -9352,6 +9352,19 @@ static const int kSwarmLookChroma[8][8] = {
 	{47, 66, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99},
 	{99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}};
 
+// The render threads' count, as b3GetSwarmRenderThreads reads it: SWARM_RENDER_THREADS, default 2, held to 1..16.
+static int swarmLookThreads(void)
+{
+	static int cached = 0;
+	if (cached <= 0)
+	{
+		const char* env = getenv("SWARM_RENDER_THREADS");
+		const int n = env && env[0] ? atoi(env) : 2;
+		cached = n < 1 ? 1 : (n > 16 ? 16 : n);
+	}
+	return cached;
+}
+
 // One plane of whole numbers through the 8 x 8 DCT, rounded to a JPEG table's steps at a quality and back, in place.
 // The plane's whole numbers are exact in float32; the transform runs in doubles.
 // Every product and sum is a whole number under 2^53, exact in a double in any order, and the one inexact step, the
@@ -9420,6 +9433,74 @@ static void swarmLookQuantise(float* plane, int height, int width, const int tab
 		}
 }
 
+// The video look of `height` rows (a multiple of 16) of a frame `width` wide, from `in` into `dst`, with the band's own
+// brightness, colour and shift planes. Every step reads only its band: the 2 x 2 colour squares and the 8 x 8 blocks of
+// both resolutions never cross a 16-row boundary, so bands drawn apart give the bytes the whole frame gives.
+static void swarmLookBand(const float* in, float* dst, float* luma, float* cb, float* cr, float* shift, int height, int width, int quality)
+{
+	const int halfWidth = width / 2;
+	int row, col, i;
+	// Colour as whole numbers, clipped and rounded half to even, then brightness and the two colour planes in fixed
+	// point, all in float32 as the Python one: every value a whole number under 2^24, so exact.
+	for (i = 0; i < height * width * 3; i++)
+	{
+		const float value = in[i];
+		const float low = value < 0.0f ? 0.0f : value;
+		dst[i] = low > 1.0f ? 1.0f : low;
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] = nearbyintf(dst[i] * 255.0f);
+	// Brightness is never negative, so its floor division by 2^16 is a whole-number shift.
+	for (i = 0; i < height * width; i++)
+	{
+		const float* rgb = dst + (size_t)i * 3;
+		luma[i] = (float)((int)(rgb[0] * 19595.0f + rgb[1] * 38470.0f + rgb[2] * 7471.0f + 32768.0f) >> 16) - 128.0f;
+	}
+	// Each 2 x 2 square averaged for the colour planes.
+	for (row = 0; row < height / 2; row++)
+		for (col = 0; col < halfWidth; col++)
+		{
+			const float* top = dst + ((size_t)(2 * row) * width + 2 * col) * 3;
+			const float* bottom = top + (size_t)width * 3;
+			float half[3];
+			int c;
+			for (c = 0; c < 3; c++)
+				half[c] = floorf((top[c] + bottom[c] + top[3 + c] + bottom[3 + c] + 2.0f) * 0.25f);
+			cb[(size_t)row * halfWidth + col] = floorf((half[0] * -11059.0f + half[1] * -21709.0f + half[2] * 32768.0f + 32768.0f) * (1.0f / 65536.0f));
+			cr[(size_t)row * halfWidth + col] = floorf((half[0] * 32768.0f + half[1] * -27439.0f + half[2] * -5329.0f + 32768.0f) * (1.0f / 65536.0f));
+		}
+	swarmLookQuantise(luma, height, width, kSwarmLookLuma, quality);
+	swarmLookQuantise(cb, height / 2, halfWidth, kSwarmLookChroma, quality);
+	swarmLookQuantise(cr, height / 2, halfWidth, kSwarmLookChroma, quality);
+	// The colour shift of each 2 x 2 square, in doubles as its products pass 2^24, then added to the brightness of
+	// its four dots, clipped, and all divided.
+	for (i = 0; i < (height / 2) * halfWidth; i++)
+	{
+		const double u = cb[i], v = cr[i];
+		shift[i * 3] = (float)floor((v * 91881.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 1] = (float)floor((u * -22554.0 + v * -46802.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 2] = (float)floor((u * 116130.0 + 32768.0) * (1.0 / 65536.0));
+	}
+	for (row = 0; row < height; row++)
+	{
+		const float* squares = shift + (size_t)(row / 2) * halfWidth * 3;
+		const float* brightness = luma + (size_t)row * width;
+		float* line = dst + (size_t)row * width * 3;
+		for (col = 0; col < halfWidth; col++)
+		{
+			int c;
+			for (c = 0; c < 6; c++)
+			{
+				const float value = squares[col * 3 + c % 3] + (brightness[2 * col + c / 3] + 128.0f);
+				const float low = value < 0.0f ? 0.0f : value;
+				line[col * 6 + c] = low > 255.0f ? 255.0f : low;
+			}
+		}
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] /= 255.0f;
+}
+
 // swarmStreamLook(frame, out, quality): the video look of a float32 colour frame (height x width x 3, both multiples of
 // 16, values 0 to 1) written into out, a writable float32 array of the same shape, byte for byte what the Python
 // stream_look returns: colour at half resolution, 8 x 8 blocks quantised at the JPEG quality.
@@ -9428,7 +9509,7 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 	PyObject *frameObj, *outObj;
 	int quality;
 	Py_buffer frame, out;
-	int height, width, row, col, i;
+	int height, width, threads;
 	float *luma, *cb, *cr, *shift;
 	if (!PyArg_ParseTuple(args, "OOi", &frameObj, &outObj, &quality))
 		return NULL;
@@ -9469,70 +9550,19 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 		PyBuffer_Release(&out);
 		return PyErr_NoMemory();
 	}
+	threads = swarmLookThreads();
 	Py_BEGIN_ALLOW_THREADS
 	{
 		const float* in = (const float*)frame.buf;
 		float* dst = (float*)out.buf;
 		const int halfWidth = width / 2;
-		// Colour as whole numbers, clipped and rounded half to even, then brightness and the two colour planes in fixed
-		// point, all in float32 as the Python one: every value a whole number under 2^24, so exact.
-		for (i = 0; i < height * width * 3; i++)
-		{
-			const float value = in[i];
-			const float low = value < 0.0f ? 0.0f : value;
-			dst[i] = low > 1.0f ? 1.0f : low;
-		}
-		for (i = 0; i < height * width * 3; i++)
-			dst[i] = nearbyintf(dst[i] * 255.0f);
-		// Brightness is never negative, so its floor division by 2^16 is a whole-number shift.
-		for (i = 0; i < height * width; i++)
-		{
-			const float* rgb = dst + (size_t)i * 3;
-			luma[i] = (float)((int)(rgb[0] * 19595.0f + rgb[1] * 38470.0f + rgb[2] * 7471.0f + 32768.0f) >> 16) - 128.0f;
-		}
-		// Each 2 x 2 square averaged for the colour planes.
-		for (row = 0; row < height / 2; row++)
-			for (col = 0; col < halfWidth; col++)
-			{
-				const float* top = dst + ((size_t)(2 * row) * width + 2 * col) * 3;
-				const float* bottom = top + (size_t)width * 3;
-				float half[3];
-				int c;
-				for (c = 0; c < 3; c++)
-					half[c] = floorf((top[c] + bottom[c] + top[3 + c] + bottom[3 + c] + 2.0f) * 0.25f);
-				cb[(size_t)row * halfWidth + col] = floorf((half[0] * -11059.0f + half[1] * -21709.0f + half[2] * 32768.0f + 32768.0f) * (1.0f / 65536.0f));
-				cr[(size_t)row * halfWidth + col] = floorf((half[0] * 32768.0f + half[1] * -27439.0f + half[2] * -5329.0f + 32768.0f) * (1.0f / 65536.0f));
-			}
-		swarmLookQuantise(luma, height, width, kSwarmLookLuma, quality);
-		swarmLookQuantise(cb, height / 2, halfWidth, kSwarmLookChroma, quality);
-		swarmLookQuantise(cr, height / 2, halfWidth, kSwarmLookChroma, quality);
-		// The colour shift of each 2 x 2 square, in doubles as its products pass 2^24, then added to the brightness of
-		// its four dots, clipped, and all divided.
-		for (i = 0; i < (height / 2) * halfWidth; i++)
-		{
-			const double u = cb[i], v = cr[i];
-			shift[i * 3] = (float)floor((v * 91881.0 + 32768.0) * (1.0 / 65536.0));
-			shift[i * 3 + 1] = (float)floor((u * -22554.0 + v * -46802.0 + 32768.0) * (1.0 / 65536.0));
-			shift[i * 3 + 2] = (float)floor((u * 116130.0 + 32768.0) * (1.0 / 65536.0));
-		}
-		for (row = 0; row < height; row++)
-		{
-			const float* squares = shift + (size_t)(row / 2) * halfWidth * 3;
-			const float* brightness = luma + (size_t)row * width;
-			float* line = dst + (size_t)row * width * 3;
-			for (col = 0; col < halfWidth; col++)
-			{
-				int c;
-				for (c = 0; c < 6; c++)
-				{
-					const float value = squares[col * 3 + c % 3] + (brightness[2 * col + c / 3] + 128.0f);
-					const float low = value < 0.0f ? 0.0f : value;
-					line[col * 6 + c] = low > 255.0f ? 255.0f : low;
-				}
-			}
-		}
-		for (i = 0; i < height * width * 3; i++)
-			dst[i] /= 255.0f;
+		int band;
+		// The render threads take bands of 16 rows each, the whole look of each band on one thread.
+#pragma omp parallel for num_threads(threads) schedule(static)
+		for (band = 0; band < height / 16; band++)
+			swarmLookBand(in + (size_t)band * 16 * width * 3, dst + (size_t)band * 16 * width * 3, luma + (size_t)band * 16 * width,
+						  cb + (size_t)band * 8 * halfWidth, cr + (size_t)band * 8 * halfWidth, shift + (size_t)band * 8 * halfWidth * 3, 16,
+						  width, quality);
 	}
 	Py_END_ALLOW_THREADS
 	free(luma);

@@ -1,5 +1,8 @@
 """swarmStreamLook: the live video look of a colour frame, the same bytes on every machine, and its argument checks."""
 import hashlib
+import os
+import subprocess
+import sys
 import unittest
 
 import numpy as np
@@ -27,6 +30,16 @@ class StreamLookTest(unittest.TestCase):
     p.swarmStreamLook(frame(), out, 70)
     self.assertEqual(hashlib.sha256(out.tobytes()).hexdigest(), PINNED_SHA256)
 
+  def test_thread_counts_give_the_same_bytes(self):
+    """1, 2 and 4 render threads, each in its own process, give the pinned look and one look of other frames."""
+    hashes = set()
+    for threads in ("1", "2", "4"):
+      env = dict(os.environ, SWARM_RENDER_THREADS=threads)
+      lines = subprocess.check_output([sys.executable, __file__, "looks"], env=env, text=True).split()
+      self.assertEqual(lines[0], PINNED_SHA256)
+      hashes.add(" ".join(lines))
+    self.assertEqual(len(hashes), 1)
+
   def test_bad_frames_are_refused(self):
     """Wrong types, shapes, sizes off the 16-dot grid and qualities outside 1 to 100 raise instead of drawing."""
     good = np.zeros((32, 32, 3), np.float32)
@@ -41,5 +54,20 @@ class StreamLookTest(unittest.TestCase):
       p.swarmStreamLook(good, out, 70)
 
 
+def looks():
+  """Print the hash of frame()'s look at quality 70, then of small and odd-sized frames at other qualities."""
+  out = np.empty((480, 640, 3), np.float32)
+  p.swarmStreamLook(frame(), out, 70)
+  print(hashlib.sha256(out.tobytes()).hexdigest())
+  for seed, (height, width), quality in ((5, (16, 16), 1), (6, (48, 80), 35), (7, (96, 32), 95), (8, (480, 640), 100)):
+    source = frame(seed)[:height, :width].copy()
+    out = np.empty_like(source)
+    p.swarmStreamLook(source, out, quality)
+    print(hashlib.sha256(out.tobytes()).hexdigest())
+
+
 if __name__ == '__main__':
-  unittest.main()
+  if len(sys.argv) > 1 and sys.argv[1] == "looks":
+    looks()
+  else:
+    unittest.main()
