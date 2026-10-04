@@ -1390,6 +1390,29 @@ struct ForestGrid
 	std::vector<unsigned> m_treePlacement;
 };
 const float kForestCell = 16.0f;
+
+// The triangle a ray landed on, enough to find its corners again.
+struct HitId
+{
+	unsigned m_inst;
+	unsigned m_geom;
+	unsigned m_prim;
+	// Inside the forest: the batch and the placement within it.
+	unsigned m_inst1;
+	unsigned m_instPrim1;
+};
+
+// Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
+// id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
+// before any ray, which is the sky or the clear colour, and the colour buffer after pass one.
+struct EdgeScratch
+{
+	std::vector<int> m_ids;
+	std::vector<HitId> m_hits;
+	std::vector<float> m_inverseEyeDepth;
+	std::vector<unsigned char> m_background;
+	std::vector<unsigned char> m_rgb1;
+};
 }  // namespace
 
 struct SwarmRaycast::Data
@@ -1447,6 +1470,8 @@ struct SwarmRaycast::Data
 	unsigned long long m_movedBase;
 	// ER_SWARM_RASTER: per render thread scratch, the frame's chunks and cut-out sources, and the forest's grid.
 	std::vector<RasterLane> m_rasterLanes;
+	// The edge pass's scratch per camera, kept from picture to picture so its buffers are not made and filled each time.
+	std::vector<EdgeScratch> m_edgeScratch;
 	std::vector<RasterJob> m_rasterJobs;
 	std::vector<RasterSource> m_rasterSources;
 	ForestGrid m_forestGrid;
@@ -3409,17 +3434,6 @@ struct TileJob
 	bool m_alphaCutout;
 };
 
-// The triangle a ray landed on, enough to find its corners again.
-struct HitId
-{
-	unsigned m_inst;
-	unsigned m_geom;
-	unsigned m_prim;
-	// Inside the forest: the batch and the placement within it.
-	unsigned m_inst1;
-	unsigned m_instPrim1;
-};
-
 // What one ray brings back: the clip depth and its reciprocal eye depth, the segmentation id and
 // triangle of its hit, and the shaded colour when the job carries a light and the body is known.
 // What a daylight hit's shading needs once its tile reads the textures: the surface, where on its triangle the hit
@@ -3515,18 +3529,6 @@ inline void daylightOut(const SwarmRaycastShading& shading, const float lit[3], 
 	daylightPrepare(shading, lit, viewDir, distance, out.m_colour);
 	out.m_deferred = true;
 }
-
-// Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
-// id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
-// before any ray, which is the sky or the clear colour, and the colour buffer after pass one.
-struct EdgeScratch
-{
-	std::vector<int> m_ids;
-	std::vector<HitId> m_hits;
-	std::vector<float> m_inverseEyeDepth;
-	std::vector<unsigned char> m_background;
-	std::vector<unsigned char> m_rgb1;
-};
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
@@ -6023,7 +6025,12 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			if (!hit)
 			{
 				if (scratch)
+				{
+					scratch->m_ids[offset] = -1;
+					HitId& none = scratch->m_hits[offset];
+					none.m_inst = none.m_geom = none.m_prim = none.m_inst1 = none.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
 					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
+				}
 				continue;
 			}
 			target.m_depth[offset] = sample.m_depth;
@@ -6899,7 +6906,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		job.m_hitPoints = &memory->m_points[0];
 	}
 
-	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
+	// The edge pass's per-pixel ids, hits and depths are kept from picture to picture and every pixel's are written by its
+	// tile in the first pass, hit or miss, before the edge pass reads any; a camera without them this time has them emptied.
+	std::vector<EdgeScratch>& scratch = m_data->m_edgeScratch;
+	scratch.resize((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
 	std::vector<float> radiance(thermal ? numPixels * (size_t)numTargets : 0);
 	std::vector<std::vector<MoverRect> > movers((size_t)numTargets);
 	for (size_t i = 0; i < scratch.size() && shading->m_creaseFill; i++)
@@ -6908,12 +6918,17 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	for (size_t i = 0; i < scratch.size(); i++)
 	{
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
+		{
+			scratch[i].m_ids.clear();
+			scratch[i].m_hits.clear();
+			scratch[i].m_inverseEyeDepth.clear();
+			scratch[i].m_background.clear();
+			scratch[i].m_rgb1.clear();
 			continue;
-		HitId none;
-		none.m_inst = none.m_geom = none.m_prim = none.m_inst1 = none.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
-		scratch[i].m_ids.assign(numPixels, -1);
-		scratch[i].m_hits.assign(numPixels, none);
-		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
+		}
+		scratch[i].m_ids.resize(numPixels);
+		scratch[i].m_hits.resize(numPixels);
+		scratch[i].m_inverseEyeDepth.resize(numPixels);
 		if (!targets[i].m_background)
 			scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 	}
