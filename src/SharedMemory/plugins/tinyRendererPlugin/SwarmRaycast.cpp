@@ -3364,9 +3364,10 @@ struct Sample
 	// A daylight colour left for its tile's batched write instead of written to m_rgb, when the caller asks for that.
 	bool m_deferred;
 	DaylightColour m_colour;
-	// A daylight hit whose shading waits for its tile, so the tile reads its samples' textures together.
+	// A hit whose shading waits for its tile, so the tile reads its samples' textures together; it is written straight
+	// into the tile's slot m_shade points at.
 	bool m_shadeDeferred;
-	ShadeWait m_shade;
+	ShadeWait* m_shade;
 };
 
 // Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
@@ -3374,7 +3375,7 @@ inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hi
 						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3],
 						bool footprintLater, const float rawDir[3], const float wound[3], bool shadowLater)
 {
-	ShadeWait& wait = out.m_shade;
+	ShadeWait& wait = *out.m_shade;
 	wait.m_surface = surface;
 	wait.m_u = hit.u;
 	wait.m_v = hit.v;
@@ -5359,6 +5360,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		{
 			Sample sample;
 			sample.m_radiance = 0.0f;
+			sample.m_shade = &shades[numShades];
 			const size_t offset = (size_t)row * width + col;
 			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
 			FoundHit found;
@@ -5386,10 +5388,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
 			if (sample.m_shaded && !radiance && sample.m_shadeDeferred)
-			{
-				shades[numShades] = sample.m_shade;
 				shadeOut[numShades++] = &target.m_rgb[offset * 3];
-			}
 			else if (sample.m_shaded && !radiance && sample.m_deferred)
 			{
 				waiting[numWaiting] = sample.m_colour;
