@@ -226,6 +226,8 @@ struct CachedTree
 	int m_users;
 	TreeCache::iterator m_entry;
 	IdleTrees::iterator m_idle;
+	// Built with Embree's robust flag; forest trees are not, and never share a tree with a mesh that is.
+	bool m_robust;
 };
 
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
@@ -245,6 +247,8 @@ struct MeshTree
 	int m_refs;
 	bool m_dirty;
 	bool m_world;
+	// Traced with Embree's robust flag, as every tree is but a forest batch's.
+	bool m_robust;
 	// Set once the mesh has been rewritten: its tree then lives in a scene that refits instead of rebuilding.
 	bool m_refitting;
 	// The body transform a world tree was built for; the body counts as moved once it differs.
@@ -850,7 +854,7 @@ IdleTrees gIdleTrees;
 size_t gIdleWeight = 0;
 
 // The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
-CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
+CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices, bool robust)
 {
 	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
 	const std::pair<size_t, size_t> key(numVertices, numTriangles);
@@ -858,7 +862,7 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	for (TreeCache::iterator it = range.first; it != range.second; ++it)
 	{
 		CachedTree* tree = it->second;
-		if (memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
+		if (tree->m_robust != robust || memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
 			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
 			continue;
 		if (tree->m_users++ == 0)
@@ -871,8 +875,9 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	CachedTree* tree = new CachedTree;
 	tree->m_triangles = numTriangles;
 	tree->m_users = 1;
+	tree->m_robust = robust;
 	tree->m_scene = rtcNewScene(device);
-	rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
+	rtcSetSceneFlags(tree->m_scene, robust ? RTC_SCENE_FLAG_ROBUST : RTC_SCENE_FLAG_NONE);
 	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
 	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
 	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
@@ -891,6 +896,8 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	unsigned long long diskKey = b3DiskCacheHash("SWCTREE1", 8);
 	diskKey = b3DiskCacheHash(&vertices[0], numVertices * 3 * sizeof(float), diskKey);
 	diskKey = b3DiskCacheHash(&indices[0], indices.size() * sizeof(unsigned), diskKey);
+	if (!robust)
+		diskKey = b3DiskCacheHash("FAST", 4, diskKey);
 	const bool onDisk = b3DiskCachePath(diskKey, "ctree", diskPath);
 	if (onDisk && b3DiskCacheRead(diskPath, image) && !image.empty())
 		rtcSwarmLoadTree(tree->m_scene, &image[0], image.size());
@@ -1389,6 +1396,9 @@ struct SwarmRaycast::Data
 	RTCScene m_staticShadows;  // Allocated only when a flagged placement needs the shadow map.
 	bool m_staticShadowsDirty;
 	std::map<unsigned long long, MeshTree*> m_sharedTrees;
+	// Forest batches' trees, traced without Embree's robust flag, whose watertight edge test is a large share of forest
+	// tracing and only moves rare leaf pixels; every other tree keeps it, so other scenes keep their bytes.
+	std::map<unsigned long long, MeshTree*> m_forestTrees;
 	// The forest: every batch's instance array, reached from the top and shadow scenes through one instance.
 	RTCScene m_forest;
 	RTCGeometry m_forestInstance;
@@ -1825,6 +1835,7 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = false;
 		tree->m_refitting = false;
+		tree->m_robust = true;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true);
@@ -1839,7 +1850,7 @@ struct SwarmRaycast::Data
 		tree.m_cached = 0;
 		if (!tree.m_world)
 		{
-			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices);
+			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices, tree.m_robust);
 			tree.m_scene = tree.m_cached->m_scene;
 			tree.m_geometry = tree.m_cached->m_geometry;
 			return;
@@ -1864,6 +1875,7 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = true;
 		tree->m_refitting = false;
+		tree->m_robust = true;
 		memcpy(tree->m_pose, transform, sizeof(tree->m_pose));
 		const unsigned long long key = treeCacheKey(model, worldTransform, localScaling);
 		char path[1024];
@@ -1885,12 +1897,13 @@ struct SwarmRaycast::Data
 	}
 
 	// Content hashes share canonical trees even when model storage sharing is disabled.
-	MeshTree* acquireSharedTree(TinyRender::Model* model, bool deformed)
+	MeshTree* acquireSharedTree(TinyRender::Model* model, bool deformed, bool robust = true)
 	{
 		const unsigned long long hash = deformed ? 0 : model->meshHash();
-		std::map<unsigned long long, MeshTree*>::iterator found = m_sharedTrees.find(hash);
+		std::map<unsigned long long, MeshTree*>& shared = robust ? m_sharedTrees : m_forestTrees;
+		std::map<unsigned long long, MeshTree*>::iterator found = shared.find(hash);
 		// A hash match must also match in size, so a collision builds its own tree instead of borrowing one.
-		if (hash && found != m_sharedTrees.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
+		if (hash && found != shared.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
 			found->second->m_vertices.size() == (size_t)model->nverts() * 3 + kVertexPadding)
 		{
 			found->second->m_refs++;
@@ -1901,12 +1914,13 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = false;
 		tree->m_refitting = false;
+		tree->m_robust = robust;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true, false);
 		buildTree(*tree, 0);
 		if (hash)
-			m_sharedTrees[hash] = tree;
+			shared[hash] = tree;
 		return tree;
 	}
 
@@ -1920,10 +1934,11 @@ struct SwarmRaycast::Data
 				m_trees.erase(it);
 				break;
 			}
-		for (std::map<unsigned long long, MeshTree*>::iterator it = m_sharedTrees.begin(); it != m_sharedTrees.end(); ++it)
+		std::map<unsigned long long, MeshTree*>& shared = tree->m_robust ? m_sharedTrees : m_forestTrees;
+		for (std::map<unsigned long long, MeshTree*>::iterator it = shared.begin(); it != shared.end(); ++it)
 			if (it->second == tree)
 			{
-				m_sharedTrees.erase(it);
+				shared.erase(it);
 				break;
 			}
 		if (tree->m_cached)
@@ -2147,7 +2162,8 @@ struct SwarmRaycast::Data
 		if (m_forest)
 			return;
 		m_forest = rtcNewScene(m_device);
-		rtcSetSceneFlags(m_forest, RTC_SCENE_FLAG_ROBUST);
+		// Like its trees, the forest's own scene is traced without the robust flag; no other scene instances it.
+		rtcSetSceneFlags(m_forest, RTC_SCENE_FLAG_NONE);
 		rtcSetSceneBuildQuality(m_forest, RTC_BUILD_QUALITY_MEDIUM);
 		m_forestInstance = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
 		rtcSetGeometryInstancedScene(m_forestInstance, m_forest);
@@ -2180,7 +2196,7 @@ struct SwarmRaycast::Data
 			ensureForest();
 			batch = new Batch;
 			batch->m_obj = obj;
-			batch->m_tree = acquireSharedTree(obj->m_model, false);
+			batch->m_tree = acquireSharedTree(obj->m_model, false, false);
 			batch->m_transforms.assign(count * 12, 0.0f);
 			batch->m_normalRotations.assign(count * 9, 0.0f);
 			batch->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE_ARRAY);
