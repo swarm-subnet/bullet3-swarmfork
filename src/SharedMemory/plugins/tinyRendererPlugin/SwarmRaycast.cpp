@@ -3340,6 +3340,10 @@ struct ShadeWait
 	} m_kind;
 	// For the fragment shader: the hit point, which the spot light reads.
 	float m_point[3];
+	// The footprint is worked out with the tile's others when m_footprintLater; the camera ray and wound normal it needs.
+	bool m_footprintLater;
+	float m_rawDir[3];
+	float m_wound[3];
 };
 
 struct Sample
@@ -3362,7 +3366,8 @@ struct Sample
 
 // Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
 inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], const float duvdx[2],
-						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3])
+						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3],
+						bool footprintLater, const float rawDir[3], const float wound[3])
 {
 	ShadeWait& wait = out.m_shade;
 	wait.m_surface = surface;
@@ -3381,8 +3386,13 @@ inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hi
 	wait.m_shadow = shadow;
 	wait.m_distance = distance;
 	wait.m_kind = kind;
+	wait.m_footprintLater = footprintLater;
 	for (int i = 0; i < 3; i++)
+	{
 		wait.m_point[i] = point[i];
+		wait.m_rawDir[i] = rawDir[i];
+		wait.m_wound[i] = wound[i];
+	}
 	out.m_shadeDeferred = true;
 }
 
@@ -3591,6 +3601,81 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 		const float v = dot3(t2, woundNormal) / nn;
 		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
 		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+	}
+}
+
+// footprintAt for count hits at once, each given by its camera ray, triangle corners, wound normal, barycentric (u, v)
+// and corner uvs: eight at a time in vector lanes where the compiler has them, each lane footprintAt's steps in order.
+// duvdx and duvdy must start at zero, as footprintAt's callers start them.
+void footprintMany(const CameraSetup& setup, const float (*rawDir)[3], const float (*corners)[3][3], const float (*wound)[3], const float* hitU,
+				   const float* hitV, const float (*uvs)[6], int count, float (*duvdx)[2], float (*duvdy)[2])
+{
+	int k = 0;
+#if defined(__GNUC__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; k + 8 <= count; k += 8)
+	{
+		Lanes c0[3], e1[3], e2[3], to[3], n[3], dir[3], u0, u1, u2, v0, v1, v2, wu, wv;
+		for (int l = 0; l < 8; l++)
+		{
+			const int at = k + l;
+			for (int i = 0; i < 3; i++)
+			{
+				c0[i][l] = corners[at][0][i];
+				e1[i][l] = corners[at][1][i] - corners[at][0][i];
+				e2[i][l] = corners[at][2][i] - corners[at][0][i];
+				to[i][l] = corners[at][0][i] - setup.m_cam.m_origin[i];
+				n[i][l] = wound[at][i];
+				dir[i][l] = rawDir[at][i];
+			}
+			u0[l] = uvs[at][0], v0[l] = uvs[at][1], u1[l] = uvs[at][2], v1[l] = uvs[at][3], u2[l] = uvs[at][4], v2[l] = uvs[at][5];
+			wu[l] = hitU[at], wv[l] = hitV[at];
+		}
+		const Lanes nn = (n[0] * n[0] + n[1] * n[1]) + n[2] * n[2];
+		const Lanes reach = (to[0] * n[0] + to[1] * n[1]) + to[2] * n[2];
+		for (int side = 0; side < 2; side++)
+		{
+			const float* step = side == 0 ? setup.m_stepX : setup.m_stepY;
+			Lanes nd[3], w[3];
+			for (int i = 0; i < 3; i++)
+				nd[i] = dir[i] + step[i];
+			const Lanes denom = (nd[0] * n[0] + nd[1] * n[1]) + nd[2] * n[2];
+			const Ints skip = (denom == zero) | (nn == zero);
+			const Lanes sd = reach / denom;
+			for (int i = 0; i < 3; i++)
+				w[i] = (setup.m_cam.m_origin[i] + nd[i] * sd) - c0[i];
+			const Lanes t1[3] = {w[1] * e2[2] - w[2] * e2[1], w[2] * e2[0] - w[0] * e2[2], w[0] * e2[1] - w[1] * e2[0]};
+			const Lanes t2[3] = {e1[1] * w[2] - e1[2] * w[1], e1[2] * w[0] - e1[0] * w[2], e1[0] * w[1] - e1[1] * w[0]};
+			const Lanes bu = ((t1[0] * n[0] + t1[1] * n[1]) + t1[2] * n[2]) / nn;
+			const Lanes bv = ((t2[0] * n[0] + t2[1] * n[1]) + t2[2] * n[2]) / nn;
+			const Lanes outU = (u1 - u0) * (bu - wu) + (u2 - u0) * (bv - wv);
+			const Lanes outV = (v1 - v0) * (bu - wu) + (v2 - v0) * (bv - wv);
+			float (*out)[2] = side == 0 ? duvdx : duvdy;
+			for (int l = 0; l < 8; l++)
+				if (!skip[l])
+				{
+					out[k + l][0] = outU[l];
+					out[k + l][1] = outV[l];
+				}
+		}
+	}
+#endif
+	for (; k < count; k++)
+	{
+		HitSurface surface;
+		surface.m_uvs = uvs[k];
+		for (int j = 0; j < 3; j++)
+		{
+			surface.m_vertexIds[j] = (unsigned)j;
+			for (int i = 0; i < 3; i++)
+				surface.m_corners[j][i] = corners[k][j][i];
+		}
+		RTCHit hit;
+		hit.u = hitU[k];
+		hit.v = hitV[k];
+		footprintAt(setup, rawDir[k], surface, wound[k], hit, duvdx[k], duvdy[k]);
 	}
 }
 
@@ -4103,8 +4188,13 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
 	}
 
+	// A hit whose shading waits for its tile leaves its footprint to be worked out with the tile's others, unless a step
+	// before the wait reads it: a thermal frame, a cut-out that may be a veil, or a pane the ray passes through.
+	const bool footprintLater = deferColour && filtered && !shading->m_thermal &&
+								!(shading->m_daylight && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
+								!(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
-	if (filtered)
+	if (filtered && !footprintLater)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
 
 	if (shading->m_thermal)
@@ -4232,7 +4322,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			if (deferColour)
 			{
 				const float point[3] = {hx, hy, hz};
-				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point);
+				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point, footprintLater, rawDir,
+							woundNormal);
 				return true;
 			}
 			float normal[3], base[3];
@@ -4315,7 +4406,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	if (deferColour)
 	{
 		// The shading is left for the tile, which reads the textures of its samples together.
-		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment, point);
+		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment,
+					point, footprintLater, rawDir, woundNormal);
 		return true;
 	}
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
@@ -5168,6 +5260,45 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		TGAColor texels[kTileSize * kTileSize], kindTexels[kTileSize * kTileSize];
 		float normals[kTileSize * kTileSize][3];
 		int order[kTileSize * kTileSize], numDaylight = 0;
+		{
+			// The footprints left for the tile, worked out together.
+			int late[kTileSize * kTileSize], numLate = 0;
+			float rawDirs[kTileSize * kTileSize][3], corners[kTileSize * kTileSize][3][3], wounds[kTileSize * kTileSize][3];
+			float hitU[kTileSize * kTileSize], hitV[kTileSize * kTileSize], cornerUvs[kTileSize * kTileSize][6];
+			float lateX[kTileSize * kTileSize][2], lateY[kTileSize * kTileSize][2];
+			for (int i = 0; i < numShades; i++)
+			{
+				const ShadeWait& wait = shades[i];
+				if (!wait.m_footprintLater)
+					continue;
+				const int n = numLate++;
+				late[n] = i;
+				for (int c = 0; c < 3; c++)
+				{
+					rawDirs[n][c] = wait.m_rawDir[c];
+					wounds[n][c] = wait.m_wound[c];
+					for (int j = 0; j < 3; j++)
+						corners[n][j][c] = wait.m_surface.m_corners[j][c];
+				}
+				for (int j = 0; j < 3; j++)
+				{
+					const float* uv = wait.m_surface.m_uvs + (size_t)wait.m_surface.m_vertexIds[j] * 2;
+					cornerUvs[n][2 * j] = uv[0];
+					cornerUvs[n][2 * j + 1] = uv[1];
+				}
+				hitU[n] = wait.m_u;
+				hitV[n] = wait.m_v;
+				lateX[n][0] = lateX[n][1] = lateY[n][0] = lateY[n][1] = 0.0f;
+			}
+			if (numLate)
+				footprintMany(setup, rawDirs, corners, wounds, hitU, hitV, cornerUvs, numLate, lateX, lateY);
+			for (int n = 0; n < numLate; n++)
+				for (int c = 0; c < 2; c++)
+				{
+					shades[late[n]].m_duvdx[c] = lateX[n][c];
+					shades[late[n]].m_duvdy[c] = lateY[n][c];
+				}
+		}
 		for (int i = 0; i < numShades; i++)
 		{
 			const ShadeWait& wait = shades[i];
