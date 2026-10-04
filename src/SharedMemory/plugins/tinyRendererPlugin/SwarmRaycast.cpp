@@ -3406,7 +3406,7 @@ struct HitId
 // lies, the face normal, the texture footprint, the view direction, the shadow and the distance.
 struct ShadeWait
 {
-	HitSurface m_surface;
+	const HitSurface* m_surface;
 	float m_u;
 	float m_v;
 	float m_faceNormal[3];
@@ -3457,7 +3457,7 @@ inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hi
 						bool footprintLater, const float rawDir[3], const float wound[3], bool shadowLater)
 {
 	ShadeWait& wait = *out.m_shade;
-	wait.m_surface = surface;
+	wait.m_surface = &surface;
 	wait.m_u = hit.u;
 	wait.m_v = hit.v;
 	for (int i = 0; i < 3; i++)
@@ -4174,15 +4174,57 @@ struct FoundHit
 	float m_length;
 };
 
-// The last triangle a tile's rays landed on and what resolving it gave, for the next sample that lands on it too.
+// Every triangle a tile's rays landed on and what resolving it gave, so each is resolved once per tile and the tile's
+// waiting hits point at it instead of carrying a copy. A tile resolves at most one triangle per sample.
 struct SurfaceMemo
 {
-	bool m_valid;
-	unsigned m_key[5];
-	bool m_known;
-	int m_segmentation;
-	HitSurface m_surface;
-	float m_woundNormal[3];
+	struct Entry
+	{
+		unsigned m_key[5];
+		bool m_known;
+		int m_segmentation;
+		HitSurface m_surface;
+		float m_woundNormal[3];
+	};
+	static const int kSlots = 512;
+	Entry m_entries[kTileSize * kTileSize];
+	short m_slot[kSlots];
+	int m_count;
+	int m_last;
+
+	// Empty, for a new tile.
+	void clear()
+	{
+		m_count = 0;
+		m_last = 0;
+		memset(m_slot, 0, sizeof(m_slot));
+	}
+
+	// The entry for this triangle, made empty for the caller to fill when the tile has not met it; `added` says which.
+	Entry& find(const unsigned key[5], bool& added)
+	{
+		added = false;
+		if (m_count && memcmp(m_entries[m_last].m_key, key, sizeof(m_entries[0].m_key)) == 0)
+			return m_entries[m_last];
+		const unsigned mix = (key[0] * 0x9E3779B1u) ^ (key[1] * 0x85EBCA77u) ^ (key[2] * 0xC2B2AE3Du) ^ (key[3] * 0x27D4EB2Fu) ^ (key[4] * 0x165667B1u);
+		for (unsigned slot = mix >> 23;; slot = (slot + 1) & (kSlots - 1))
+		{
+			const int at = m_slot[slot] - 1;
+			if (at < 0)
+			{
+				m_last = m_count++;
+				m_slot[slot] = (short)(m_last + 1);
+				memcpy(m_entries[m_last].m_key, key, sizeof(m_entries[0].m_key));
+				added = true;
+				return m_entries[m_last];
+			}
+			if (memcmp(m_entries[at].m_key, key, sizeof(m_entries[0].m_key)) == 0)
+			{
+				m_last = at;
+				return m_entries[at];
+			}
+		}
+	}
 };
 
 // Nearer entry first, then the lesser batch and placement, so the order never depends on the order the trees were filed.
@@ -4355,15 +4397,24 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 
 	int segmentation = -1;
 	HitSurface ownSurface;
-	HitSurface& surface = memo && shading ? memo->m_surface : ownSurface;
 	float ownWound[3];
-	float* woundNormal = memo && shading ? memo->m_woundNormal : ownWound;
+	HitSurface* surfaceSlot = &ownSurface;
+	float* woundNormal = ownWound;
 	bool known;
 	const unsigned key[5] = {rayhit.hit.instID[0], rayhit.hit.geomID, rayhit.hit.primID, rayhit.hit.instID[1], rayhit.hit.instPrimID[1]};
-	if (memo && shading && memo->m_valid && memcmp(memo->m_key, key, sizeof(key)) == 0)
+	bool resolve = true;
+	SurfaceMemo::Entry* entry = 0;
+	if (memo && shading)
 	{
-		known = memo->m_known;
-		segmentation = memo->m_segmentation;
+		entry = &memo->find(key, resolve);
+		surfaceSlot = &entry->m_surface;
+		woundNormal = entry->m_woundNormal;
+	}
+	HitSurface& surface = *surfaceSlot;
+	if (!resolve)
+	{
+		known = entry->m_known;
+		segmentation = entry->m_segmentation;
 	}
 	else
 	{
@@ -4379,12 +4430,10 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			}
 			cross3(e1, e2, woundNormal);
 		}
-		if (memo && shading)
+		if (entry)
 		{
-			memo->m_valid = true;
-			memcpy(memo->m_key, key, sizeof(key));
-			memo->m_known = known;
-			memo->m_segmentation = segmentation;
+			entry->m_known = known;
+			entry->m_segmentation = segmentation;
 		}
 	}
 	out.m_segmentation = segmentation;
@@ -4412,7 +4461,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 
 	// A daylight hit whose shading waits for its tile leaves its shadow-map lookup to the tile's batch too, unless a step
 	// before the wait reads the shadow: a cut-out that may be a veil, or a pane the ray passes through.
-	const bool waitable = deferColour && !shading->m_thermal && !(shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
+	// A waiting hit points at its triangle in the tile's memo, so only a hit with one may wait.
+	const bool waitable = deferColour && memo && !shading->m_thermal && !(shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
 						  !(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
 	const bool shadowLater = waitable && shading->m_shadow && job.m_shadowMap;
 	float shadow = 1.0f;
@@ -4551,7 +4601,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
 		if (surface.m_glassBacked)
 		{
-			if (deferColour)
+			if (deferColour && memo)
 			{
 				const float point[3] = {hx, hy, hz};
 				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point, footprintLater, rawDir,
@@ -4635,7 +4685,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	}
 
 	const float point[3] = {hx, hy, hz};
-	if (deferColour)
+	if (deferColour && memo)
 	{
 		// The shading is left for the tile, which reads the textures of its samples together.
 		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment,
@@ -5459,11 +5509,11 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 					rawDirs[n][c] = wait.m_rawDir[c];
 					wounds[n][c] = wait.m_wound[c];
 					for (int j = 0; j < 3; j++)
-						corners[n][j][c] = wait.m_surface.m_corners[j][c];
+						corners[n][j][c] = wait.m_surface->m_corners[j][c];
 				}
 				for (int j = 0; j < 3; j++)
 				{
-					const float* uv = wait.m_surface.m_uvs + (size_t)wait.m_surface.m_vertexIds[j] * 2;
+					const float* uv = wait.m_surface->m_uvs + (size_t)wait.m_surface->m_vertexIds[j] * 2;
 					cornerUvs[n][2 * j] = uv[0];
 					cornerUvs[n][2 * j + 1] = uv[1];
 				}
@@ -5490,7 +5540,7 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 					continue;
 				const int n = numLate++;
 				late[n] = i;
-				shadowNormal(job.m_shading, wait.m_faceNormal, leafCard(wait.m_surface.m_doubleSided, wait.m_surface.m_hasAlpha), normals[n]);
+				shadowNormal(job.m_shading, wait.m_faceNormal, leafCard(wait.m_surface->m_doubleSided, wait.m_surface->m_hasAlpha), normals[n]);
 				for (int c = 0; c < 3; c++)
 					points[n][c] = wait.m_point[c];
 				maps[n] = shadowMapFor(job, points[n]);
@@ -5513,10 +5563,10 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 		{
 			const ShadeWait& wait = shades[i];
 			if (wait.m_kind == ShadeWait::kFragment)
-				shadeHitFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+				shadeHitFrame(*wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
 			else
 			{
-				surfaceFrame(wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+				surfaceFrame(*wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
 				order[numDaylight++] = i;
 			}
 		}
@@ -5527,7 +5577,7 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 		for (int n = 0; n < numShades; n++)
 		{
 			const ShadeWait& wait = shades[order[n]];
-			kindModels[n] = wait.m_surface.m_model;
+			kindModels[n] = wait.m_surface->m_model;
 			duvdx[n] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
 			duvdy[n] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
 		}
@@ -5555,8 +5605,8 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			const ShadeWait& wait = shades[i];
 			if (wait.m_kind != ShadeWait::kDaylight)
 				continue;
-			daySurfaces[numDay] = &wait.m_surface;
-			surfaceTint(wait.m_surface, texels[i], dayBases[numDay]);
+			daySurfaces[numDay] = wait.m_surface;
+			surfaceTint(*wait.m_surface, texels[i], dayBases[numDay]);
 			for (int c = 0; c < 3; c++)
 			{
 				dayNormals[numDay][c] = normals[i][c];
@@ -5572,7 +5622,7 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			const ShadeWait& wait = shades[i];
 			if (wait.m_kind == ShadeWait::kFragment)
 			{
-				shadeHitFinish(*job.m_shading, wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow,
+				shadeHitFinish(*job.m_shading, *wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow,
 							   wait.m_point, shadeOut[i]);
 				continue;
 			}
@@ -5580,8 +5630,8 @@ void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccluded
 			const float* lit = moduleLit;
 			if (wait.m_kind == ShadeWait::kModule)
 			{
-				surfaceTint(wait.m_surface, texels[i], base);
-				moduleLight(*job.m_shading, wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, moduleLit);
+				surfaceTint(*wait.m_surface, texels[i], base);
+				moduleLight(*job.m_shading, *wait.m_surface, normals[i], base, wait.m_dir, wait.m_shadow, moduleLit);
 			}
 			else
 				lit = dayLit[day++];
@@ -5626,7 +5676,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	if (job.m_raster)
 		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
 	SurfaceMemo memo;
-	memo.m_valid = false;
+	memo.clear();
 	// Shading and daylight colours wait here and are done together once the tile's samples are in.
 	const bool defer = job.m_shading && !radiance;
 	DaylightColour waiting[kTileSize * kTileSize];
@@ -6029,6 +6079,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	unsigned char* waitingOut[kTileSize * kTileSize];
 	ProbeWait probes[kTileSize * kTileSize];
 	int numShades = 0, numWaiting = 0, numProbes = 0;
+	SurfaceMemo memo;
+	memo.clear();
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
@@ -6136,7 +6188,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
 					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
-					const bool hit = traceRay(job, setup, px, py, args, shadowArgs, probe, reach, 0, 0, 0, defer) && probe.m_shaded;
+					const bool hit = traceRay(job, setup, px, py, args, shadowArgs, probe, reach, 0, 0, &memo, defer) && probe.m_shaded;
 					if (hit && (probe.m_shadeDeferred || probe.m_deferred))
 					{
 						ProbeWait& wait = probes[numProbes++];
