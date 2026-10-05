@@ -3904,6 +3904,12 @@ int PhysicsServerCommandProcessor::createBodyInfoStream(int bodyUniqueId, char* 
 		ser.finalizeChunk(chunk, structType, BT_MULTIBODY_CODE, mb);
 		streamSizeInBytes = ser.getCurrentBufferSize();
 	}
+	else if (bodyHandle->m_rigidBody && bodyHandle->m_rigidBodyJoints.size() == 0 && bufferSizeInBytes >= BT_HEADER_LENGTH)
+	{
+		// Without joints the stream below is the header alone: a registered name never reaches the buffer.
+		btDefaultSerializer::writeHeader((unsigned char*)bufferServerToClient);
+		streamSizeInBytes = BT_HEADER_LENGTH;
+	}
 	else if (bodyHandle->m_rigidBody)
 	{
 		btRigidBody* rb = bodyHandle->m_rigidBody;

@@ -450,7 +450,7 @@ public:
 		m_currentSize += BT_HEADER_LENGTH;
 	}
 
-	void writeHeader(unsigned char* buffer) const
+	static void writeHeader(unsigned char* buffer)
 	{
 #ifdef BT_USE_DOUBLE_PRECISION
 		memcpy(buffer, "BULLETd", 7);

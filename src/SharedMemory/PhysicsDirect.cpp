@@ -700,6 +700,19 @@ void PhysicsDirect::processBodyJointInfo(int bodyUniqueId, const SharedMemorySta
 		return;
 	}
 
+	// A stream that is a valid header alone holds no body: parsing it would find nothing and report it ok.
+	if (serverCmd.m_numDataStreamBytes == BT_HEADER_LENGTH && !strncmp(&m_data->m_bulletStreamDataServerToClient[0], "BULLET", 6))
+	{
+		BodyJointInfoCache2* bodyJoints = new BodyJointInfoCache2;
+		m_data->m_bodyJointMap.insert(bodyUniqueId, bodyJoints);
+		bodyJoints->m_bodyName = serverCmd.m_dataStreamArguments.m_bodyName;
+		if (m_data->m_verboseOutput)
+		{
+			b3Printf("Received robot description ok!\n");
+		}
+		return;
+	}
+
 	bParse::btBulletFile bf(
 		&m_data->m_bulletStreamDataServerToClient[0],
 		serverCmd.m_numDataStreamBytes);
