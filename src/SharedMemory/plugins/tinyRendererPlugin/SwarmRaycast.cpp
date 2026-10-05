@@ -6946,7 +6946,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			job.m_hintFar = &m_data->m_hintFar[0];
 		}
 		memory->m_points.resize(numPixels * 3);
-		job.m_hitPoints = &memory->m_points[0];
+		// Only an unpainted frame reads the points back as its hint, so a painted one does not write them; a hint, stale or
+		// not, changes only how long a ray takes.
+		job.m_hitPoints = raster ? 0 : &memory->m_points[0];
 	}
 
 	// The edge pass's per-pixel ids, hits and depths are kept from picture to picture and every pixel's are written by its
@@ -7032,8 +7034,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			}
 		}
 
-		// Every thread paints the chunks and trees it takes into its own lane; the loops' barriers then hand all the lanes
-		// to whichever thread traces a tile. Chunks cost very different amounts, so threads take them a few at a time as
+		// Every thread paints the chunks and trees it takes into its own lane, going on to the trees as soon as the chunks
+		// run out; the trees' barrier then hands all the lanes to whichever thread traces a tile. Chunks cost very different amounts, so threads take them a few at a time as
 		// they finish; which lane holds what never changes a tile, since painting keeps the nearest hit and the lesser key.
 		if (job.m_raster)
 		{
@@ -7043,7 +7045,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			RasterLane& lane = m_data->m_rasterLanes[0];
 #endif
 			const long long numJobs = (long long)m_data->m_rasterJobs.size();
-#pragma omp for schedule(dynamic, 4)
+#pragma omp for schedule(dynamic, 4) nowait
 			for (long long i = 0; i < numJobs; i++)
 				paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
 #pragma omp for schedule(dynamic, 16)
