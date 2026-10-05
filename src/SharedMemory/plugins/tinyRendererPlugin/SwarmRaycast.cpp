@@ -5482,29 +5482,63 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 	float(*dir)[3] = paint.m_dir;
 	float* tNear = paint.m_tNear;
 	float tFar[kTileSize * kTileSize];
-	ColumnRay columns[kTileSize];
-	for (int col = col0; col < col1; col++)
-		columnRay(cam, pixelNdcX(col, width), columns[col - col0]);
+	// Each sample's camera ray, pixelRayInColumn's steps for a whole row at once with no early way out, so the compiler
+	// runs them in vector lanes; a ray with no length then takes the values a failed pixelRay leaves.
+	const int columns = col1 - col0;
+	double nearColumn[3][kTileSize], farColumn[3][kTileSize];
+	for (int c = 0; c < columns; c++)
+	{
+		ColumnRay column;
+		columnRay(cam, pixelNdcX(col0 + c, width), column);
+		for (int i = 0; i < 3; i++)
+		{
+			nearColumn[i][c] = column.m_near[i];
+			farColumn[i][c] = column.m_far[i];
+		}
+	}
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
-		for (int col = col0; col < col1; col++)
+		const double nearRow[3] = {cam.m_near[2][0] * ndcY, cam.m_near[2][1] * ndcY, cam.m_near[2][2] * ndcY};
+		const double farRow[3] = {cam.m_far[2][0] * ndcY, cam.m_far[2][1] * ndcY, cam.m_far[2][2] * ndcY};
+		float raw[3][kTileSize], unit[3][kTileSize], length[kTileSize], toNearLength[kTileSize];
+		for (int c = 0; c < columns; c++)
 		{
-			const int k = (row - row0) * kTileSize + (col - col0);
+			float nearPoint[3], farPoint[3];
+			for (int i = 0; i < 3; i++)
+			{
+				nearPoint[i] = (float)(nearColumn[i][c] + nearRow[i]);
+				farPoint[i] = (float)(farColumn[i][c] + farRow[i]);
+				raw[i][c] = farPoint[i] - nearPoint[i];
+			}
+			length[c] = sqrtf(raw[0][c] * raw[0][c] + raw[1][c] * raw[1][c] + raw[2][c] * raw[2][c]);
+			const float invLength = 1.0f / length[c];
+			float toNear[3];
+			for (int i = 0; i < 3; i++)
+			{
+				unit[i][c] = raw[i][c] * invLength;
+				toNear[i] = nearPoint[i] - cam.m_origin[i];
+			}
+			toNearLength[c] = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+		}
+		for (int c = 0; c < columns; c++)
+		{
+			const int k = (row - row0) * kTileSize + c;
+			const bool ray = length[c] > 0.0f;
 			paint.m_t[k] = INFINITY;
 			paint.m_tri[k] = 0;
 			paint.m_rayNear[k] = INFINITY;
 			paint.m_numTrees[k] = 0;
 			paint.m_wide[k] = false;
-			paint.m_ray[k] = pixelRayInColumn(cam, columns[col - col0], ndcY, dir[k], paint.m_rawDir[k], tNear[k], paint.m_length[k]);
-			if (paint.m_ray[k])
-				tFar[k] = tNear[k] + paint.m_length[k];
-			else
+			paint.m_ray[k] = ray;
+			paint.m_length[k] = length[c];
+			for (int i = 0; i < 3; i++)
 			{
-				dir[k][0] = dir[k][1] = dir[k][2] = 0.0f;
-				tNear[k] = INFINITY;
-				tFar[k] = -INFINITY;
+				paint.m_rawDir[k][i] = raw[i][c];
+				dir[k][i] = ray ? unit[i][c] : 0.0f;
 			}
+			tNear[k] = ray ? toNearLength[c] : INFINITY;
+			tFar[k] = ray ? toNearLength[c] + length[c] : -INFINITY;
 		}
 	}
 	const std::vector<RasterLane>& lanes = *frame.m_lanes;
