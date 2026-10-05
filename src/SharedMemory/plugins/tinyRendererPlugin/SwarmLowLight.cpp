@@ -220,8 +220,16 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 			if (colour)
 				for (int col = 0; col < width; col++)
 					keep[start + col] = line[col] / (line[col] + fadeSnr2);
-			for (int col = 0; col < width; col++)
-				line[col] = SwarmGrain::gaussian(settings.m_seed, (unsigned int)(start + col));
+			int grainCol = 0;
+#if defined(__GNUC__)
+			for (; grainCol + 8 <= width; grainCol += 8)
+			{
+				const SwarmLanes8 grain = SwarmGrain::gaussian8(settings.m_seed, (unsigned int)(start + grainCol));
+				memcpy(line + grainCol, &grain, sizeof(grain));
+			}
+#endif
+			for (; grainCol < width; grainCol++)
+				line[grainCol] = SwarmGrain::gaussian(settings.m_seed, (unsigned int)(start + grainCol));
 			SwarmGrain::blurRow(line, fineRows + start, width, fineTap, fineRadius);
 		}
 		if (!colour)
@@ -294,6 +302,19 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 		SwarmGrain::blurRow(cr, crRows + (size_t)by * hw, hw, chromaTap, chromaRadius);
 	}
 
+	// Each full-width column's two half-width neighbours and its weight between them, the same for every row.
+	std::vector<int> upLeft(colour ? (size_t)width : 0), upRight(colour ? (size_t)width : 0);
+	std::vector<float> upWeight(colour ? (size_t)width : 0);
+	for (int col = 0; colour && col < width; col++)
+	{
+		float fx = ((float)col + 0.5f) * 0.5f - 0.5f;
+		fx = fx < 0.0f ? 0.0f : fx;
+		const int x0 = (int)fx < hw - 1 ? (int)fx : hw - 1;
+		upLeft[(size_t)col] = x0;
+		upRight[(size_t)col] = x0 + 1 < hw ? x0 + 1 : x0;
+		upWeight[(size_t)col] = fx - (float)x0 < 1.0f ? fx - (float)x0 : 1.0f;
+	}
+
 	// Pass 2: the meter on one thread while the others start; the fine grain blurred down its columns and laid on the
 	// luma, which is blurred along its rows; the colour blurred down its columns and read across bilinearly to full width.
 	float gain = settings.m_gainCap;
@@ -324,11 +345,8 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 				float* crOut = crWide + (size_t)hy * width;
 				for (int col = 0; col < width; col++)
 				{
-					float fx = ((float)col + 0.5f) * 0.5f - 0.5f;
-					fx = fx < 0.0f ? 0.0f : fx;
-					const int x0 = (int)fx < hw - 1 ? (int)fx : hw - 1;
-					const int x1 = x0 + 1 < hw ? x0 + 1 : x0;
-					const float ax = fx - (float)x0 < 1.0f ? fx - (float)x0 : 1.0f;
+					const int x0 = upLeft[col], x1 = upRight[col];
+					const float ax = upWeight[col];
 					cbOut[col] = cbSmooth[x0] + (cbSmooth[x1] - cbSmooth[x0]) * ax;
 					crOut[col] = crSmooth[x0] + (crSmooth[x1] - crSmooth[x0]) * ax;
 				}
