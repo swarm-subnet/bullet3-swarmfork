@@ -94,6 +94,10 @@ inline SwarmDoubles4 swarmExp(SwarmDoubles4 x)
 	const double ln2 = 0.6931471805599453;
 	const SwarmDoubles4 zero = {0.0, 0.0, 0.0, 0.0};
 	const SwarmLongs4 outside = ~((x > -0.345) & (x < 0.345));
+	// With every lane inside the window n is 0: x less 0 * ln2 is x and the series times 2^0 is itself, so only the series
+	// is left, the same bits without the reduction.
+	if (!(outside[0] | outside[1] | outside[2] | outside[3]))
+		return 1.0 + x * (1.0 + x * (1.0 / 2.0 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x * (1.0 / 720.0 + x * (1.0 / 5040.0 + x * (1.0 / 40320.0 + x * (1.0 / 362880.0)))))))));
 	const SwarmLongs4 below = x < 0.0;
 	const SwarmDoubles4 half = (SwarmDoubles4)((below & (SwarmLongs4)(zero - 0.5)) | (~below & (SwarmLongs4)(zero + 0.5)));
 	SwarmLongs4 n = __builtin_convertvector(x / ln2 + half, SwarmLongs4) & outside;
