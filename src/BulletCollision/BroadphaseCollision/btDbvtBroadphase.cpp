@@ -318,6 +318,20 @@ void btDbvtBroadphase::aabbTest(const btVector3& aabbMin, const btVector3& aabbM
 }
 
 //
+bool btDbvtBroadphase::setAabbUnchanged(btBroadphaseProxy* absproxy)
+{
+	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	// The same-bounds branch of setAabb below, without comparing the bounds.
+	if (proxy->stage == STAGECOUNT || !proxy->settled)
+		return false;
+	++m_updates_call;
+	listremove(proxy, m_stageRoots[proxy->stage]);
+	proxy->stage = m_stageCurrent;
+	listappend(proxy, m_stageRoots[m_stageCurrent]);
+	return true;
+}
+
+//
 void btDbvtBroadphase::setAabb(btBroadphaseProxy* absproxy,
 							   const btVector3& aabbMin,
 							   const btVector3& aabbMax,
