@@ -5368,6 +5368,8 @@ struct TilePaint
 	float m_t[kTileSize * kTileSize];
 	float m_u[kTileSize * kTileSize];
 	float m_v[kTileSize * kTileSize];
+	// 1 / det of the painted hit's solve, which its u and v are worked out from once every triangle is in.
+	float m_inv[kTileSize * kTileSize];
 	const RasterTri* m_tri[kTileSize * kTileSize];
 	float m_rayNear[kTileSize * kTileSize];
 	// The forest trees each sample's ray enters before the painted hit, and whether only the full search will do: a
@@ -5383,9 +5385,8 @@ struct TilePaint
 	float m_length[kTileSize * kTileSize];
 };
 
-// Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
-// the box or enters it only past limit. A zero direction component keeps its slab only when the origin lies inside it.
-inline float rayEnters(const float origin[3], const float dir[3], const float lo[3], const float hi[3], float limit)
+// rayEnters with the ray's 1 / dir worked out once for all the boxes it is tested against (any value where dir is 0).
+inline float rayEntersInv(const float origin[3], const float dir[3], const float inv[3], const float lo[3], const float hi[3], float limit)
 {
 	float enter = 0.0f, leave = limit + limit * 1e-5f + 1e-4f;
 	for (int i = 0; i < 3; i++)
@@ -5396,8 +5397,7 @@ inline float rayEnters(const float origin[3], const float dir[3], const float lo
 				return INFINITY;
 			continue;
 		}
-		const float inv = 1.0f / dir[i];
-		float near = (lo[i] - origin[i]) * inv, far = (hi[i] - origin[i]) * inv;
+		float near = (lo[i] - origin[i]) * inv[i], far = (hi[i] - origin[i]) * inv[i];
 		if (near > far)
 			std::swap(near, far);
 		enter = near > enter ? near : enter;
@@ -5406,6 +5406,22 @@ inline float rayEnters(const float origin[3], const float dir[3], const float lo
 	if (!(enter <= leave))
 		return INFINITY;
 	return enter * (1.0f - 1e-5f) - 1e-4f;
+}
+
+// The 1 / dir rayEntersInv reads: each component's reciprocal, 0 where the component is 0.
+inline void rayInverse(const float dir[3], float inv[3])
+{
+	for (int i = 0; i < 3; i++)
+		inv[i] = dir[i] == 0.0f ? 0.0f : 1.0f / dir[i];
+}
+
+// Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
+// the box or enters it only past limit. A zero direction component keeps its slab only when the origin lies inside it.
+inline float rayEnters(const float origin[3], const float dir[3], const float lo[3], const float hi[3], float limit)
+{
+	float inv[3];
+	rayInverse(dir, inv);
+	return rayEntersInv(origin, dir, inv, lo, hi, limit);
 }
 
 // True when a covered sample lands on a texel the hit filter would call see-through: the same test on the same mesh,
@@ -5441,6 +5457,21 @@ bool paintedCutOut(const RasterFrame& frame, const RasterTri& tri, const float d
 	ray.dir_z = local[2];
 	ray.tfar = t;
 	return cutOutAt(source.m_model, source.m_vertices, source.m_uvs, *source.m_indices, &hit, &ray, frame.m_spread);
+}
+
+// Where a painted ray along d lands on the triangle, given 1 / det of its solve: u and v held to the triangle.
+inline void paintedUv(const RasterTri& tri, const float d[3], float inv, float& u, float& v)
+{
+	u = dot3(d, tri.m_u) * inv;
+	v = dot3(d, tri.m_v) * inv;
+	u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+	v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+	if (u + v > 1.0f)
+	{
+		const float scale = 1.0f / (u + v);
+		u *= scale;
+		v *= scale;
+	}
 }
 
 // Paints one tile: every lane's triangles reaching it keep, per sample, the nearest hit between the clip planes whose
@@ -5521,27 +5552,35 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 						continue;
 					if (t > paint.m_t[k] || (t == paint.m_t[k] && tri.m_key >= paint.m_tri[k]->m_key))
 						continue;
-					float u = dot3(d, tri.m_u) * inv, v = dot3(d, tri.m_v) * inv;
-					u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
-					v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-					if (u + v > 1.0f)
+					// Where on the triangle only a cut-out test needs now; for the rest it is worked out once for the winner.
+					if (tri.m_source)
 					{
-						const float scale = 1.0f / (u + v);
-						u *= scale;
-						v *= scale;
+						float u, v;
+						paintedUv(tri, d, inv, u, v);
+						if (paintedCutOut(frame, tri, d, t, u, v))
+							continue;
+						paint.m_u[k] = u;
+						paint.m_v[k] = v;
 					}
-					if (tri.m_source && paintedCutOut(frame, tri, d, t, u, v))
-						continue;
 					paint.m_t[k] = t;
-					paint.m_u[k] = u;
-					paint.m_v[k] = v;
+					paint.m_inv[k] = inv;
 					paint.m_tri[k] = &tri;
 				}
 			}
 		}
 	}
+	for (int row = row0; row < row1; row++)
+		for (int col = col0; col < col1; col++)
+		{
+			const int k = (row - row0) * kTileSize + (col - col0);
+			if (paint.m_tri[k] && !paint.m_tri[k]->m_source)
+				paintedUv(*paint.m_tri[k], dir[k], paint.m_inv[k], paint.m_u[k], paint.m_v[k]);
+		}
 	// Once every triangle is in, a sample is searched only where its own ray enters a rect's box before the painted hit,
 	// and only in the trees it enters while no dense chunk lies on its way and the trees fit the sample's list.
+	// Each sample's 1 / dir is worked out the first time one of its boxes is tested.
+	float inverse[kTileSize * kTileSize][3];
+	bool inverted[kTileSize * kTileSize] = {};
 	for (size_t l = 0; l < lanes.size(); l++)
 	{
 		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
@@ -5559,7 +5598,12 @@ void paintTile(const RasterFrame& frame, const Camera& cam, int width, int heigh
 					const float limit = paint.m_t[k] < tFar[k] ? paint.m_t[k] : tFar[k];
 					if (paint.m_wide[k] || !(rect.m_distance <= limit))
 						continue;
-					const float enter = rayEnters(cam.m_origin, dir[k], rect.m_lo, rect.m_hi, limit);
+					if (!inverted[k])
+					{
+						rayInverse(dir[k], inverse[k]);
+						inverted[k] = true;
+					}
+					const float enter = rayEntersInv(cam.m_origin, dir[k], inverse[k], rect.m_lo, rect.m_hi, limit);
 					if (!(enter < INFINITY))
 						continue;
 					paint.m_rayNear[k] = enter < paint.m_rayNear[k] ? enter : paint.m_rayNear[k];
