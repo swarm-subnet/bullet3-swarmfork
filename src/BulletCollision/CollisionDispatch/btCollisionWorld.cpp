@@ -155,7 +155,7 @@ void btCollisionWorld::addCollisionObject(btCollisionObject* collisionObject, in
 void btCollisionWorld::updateSingleAabb(btCollisionObject* colObj)
 {
 	btVector3 minAabb, maxAabb;
-	colObj->getCollisionShape()->getAabb(colObj->getWorldTransform(), minAabb, maxAabb);
+	colObj->getCollisionShape()->getAabb(colObj->m_worldTransform, minAabb, maxAabb);
 	//need to increase the aabb for contact thresholds
 	btVector3 contactThreshold(gContactBreakingThreshold, gContactBreakingThreshold, gContactBreakingThreshold);
 	minAabb -= contactThreshold;
@@ -175,18 +175,20 @@ void btCollisionWorld::updateSingleAabb(btCollisionObject* colObj)
 
 	if (colObj->isStaticObject())
 	{
-		colObj->m_staticAabbTransform = colObj->getWorldTransform();
+		colObj->m_staticAabbTransform = colObj->m_worldTransform;
 		colObj->m_staticAabbMin = minAabb;
 		colObj->m_staticAabbMax = maxAabb;
 		colObj->m_staticAabbShape = colObj->getCollisionShape();
 		colObj->m_staticAabbThreshold = gContactBreakingThreshold;
 		colObj->m_staticAabbRevision = m_staticAabbRevision;
+		colObj->m_staticAabbTransformRevision = colObj->m_transformRevision;
 	}
 
 	//moving objects should be moderately sized, probably something wrong if not
 	if (colObj->isStaticObject() || ((maxAabb - minAabb).length2() < btScalar(1e12)))
 	{
 		bp->setAabb(colObj->getBroadphaseHandle(), minAabb, maxAabb, m_dispatcher1);
+		colObj->m_staticAabbHeld = colObj->isStaticObject();
 	}
 	else
 	{
@@ -220,15 +222,22 @@ void btCollisionWorld::updateAabbs()
 		{
 			// An unchanged static object gets the bounds of its last update without asking the shape again.
 			if (colObj->isStaticObject() && colObj->m_staticAabbShape == colObj->getCollisionShape() &&
-				colObj->m_staticAabbRevision == m_staticAabbRevision && colObj->m_staticAabbThreshold == gContactBreakingThreshold &&
-				!memcmp(&colObj->m_staticAabbTransform, &colObj->getWorldTransform(), sizeof(btTransform)))
+				colObj->m_staticAabbRevision == m_staticAabbRevision && colObj->m_staticAabbThreshold == gContactBreakingThreshold)
 			{
-				m_broadphasePairCache->setAabb(colObj->getBroadphaseHandle(), colObj->m_staticAabbMin, colObj->m_staticAabbMax, m_dispatcher1);
+				// No transform write since then: if the proxy still holds those bounds, setAabb would only restage it.
+				if (colObj->m_staticAabbTransformRevision == colObj->m_transformRevision && colObj->m_staticAabbHeld &&
+					m_broadphasePairCache->setAabbUnchanged(colObj->getBroadphaseHandle()))
+					continue;
+				if (colObj->m_staticAabbTransformRevision == colObj->m_transformRevision ||
+					!memcmp(&colObj->m_staticAabbTransform, &colObj->m_worldTransform, sizeof(btTransform)))
+				{
+					m_broadphasePairCache->setAabb(colObj->getBroadphaseHandle(), colObj->m_staticAabbMin, colObj->m_staticAabbMax, m_dispatcher1);
+					colObj->m_staticAabbTransformRevision = colObj->m_transformRevision;
+					colObj->m_staticAabbHeld = true;
+					continue;
+				}
 			}
-			else
-			{
-				updateSingleAabb(colObj);
-			}
+			updateSingleAabb(colObj);
 		}
 	}
 }

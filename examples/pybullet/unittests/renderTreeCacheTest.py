@@ -82,8 +82,8 @@ class TestRenderTreeCache(unittest.TestCase):
     shutil.rmtree(self.cache_dir, ignore_errors=True)
 
   def cache_files(self):
-    """Every file the renderer left in the cache folder."""
-    return sorted(glob.glob(os.path.join(self.cache_dir, "*")))
+    """Every world tree file the renderer left in the cache folder; parsed models kept there are not trees."""
+    return sorted(glob.glob(os.path.join(self.cache_dir, "*.rtree")))
 
   def test_no_file_without_flag(self):
     """A grid created without the flag writes nothing."""

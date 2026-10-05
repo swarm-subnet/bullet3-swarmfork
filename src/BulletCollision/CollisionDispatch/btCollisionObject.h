@@ -81,6 +81,15 @@ protected:
 	int m_worldArrayIndex;  // index of object in world's collisionObjects array
 
 	mutable int m_activationState1;
+	///a static object's last bounds inputs, next to the flags btCollisionWorld::updateAabbs reads every step
+	const btCollisionShape* m_staticAabbShape;
+	btScalar m_staticAabbThreshold;
+	int m_staticAabbRevision;
+	///counts writes to the world transform; matching m_staticAabbTransformRevision proves the transform unchanged
+	unsigned int m_transformRevision;
+	unsigned int m_staticAabbTransformRevision;
+	///the broadphase proxy holds this object's static bounds from its last update, set by nothing since
+	bool m_staticAabbHeld;
 	mutable btScalar m_deactivationTime;
 
 	btScalar m_friction;
@@ -127,9 +136,6 @@ protected:
 	btTransform m_staticAabbTransform;
 	btVector3 m_staticAabbMin;
 	btVector3 m_staticAabbMax;
-	const btCollisionShape* m_staticAabbShape;
-	btScalar m_staticAabbThreshold;
-	int m_staticAabbRevision;
 
 	friend class btCollisionWorld;
 
@@ -386,8 +392,11 @@ public:
 		return m_internalType;
 	}
 
+	///the writable transform counts as written, so a static object's bounds are looked at again; a caller must not keep
+	///the reference to write through it later
 	btTransform& getWorldTransform()
 	{
+		m_transformRevision++;
 		return m_worldTransform;
 	}
 
@@ -399,7 +408,14 @@ public:
 	void setWorldTransform(const btTransform& worldTrans)
 	{
 		m_updateRevision++;
+		m_transformRevision++;
 		m_worldTransform = worldTrans;
+	}
+
+	///to be called by a subclass that writes m_worldTransform directly
+	void worldTransformWritten()
+	{
+		m_transformRevision++;
 	}
 
 	SIMD_FORCE_INLINE btBroadphaseProxy* getBroadphaseHandle()
@@ -415,6 +431,7 @@ public:
 	void setBroadphaseHandle(btBroadphaseProxy * handle)
 	{
 		m_broadphaseHandle = handle;
+		m_staticAabbHeld = false;
 	}
 
 	const btTransform& getInterpolationWorldTransform() const

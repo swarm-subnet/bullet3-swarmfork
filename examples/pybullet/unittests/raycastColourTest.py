@@ -101,6 +101,17 @@ class TestRaycastColour(unittest.TestCase):
     self.assertGreater(int((seg < 0).sum()), 0)
     self.assertEqual(depth.tobytes(), depth_only.tobytes())
 
+  def test_no_depth_keeps_colour_and_mask_and_hands_back_no_depth(self):
+    """ER_SWARM_NO_DEPTH leaves the colour and mask bytes as they are and hands back None in the depth's place."""
+    view = p.computeViewMatrix([3.0, -3.0, 2.5], [0, 0, 0.4], [0, 0, 1])
+    proj = p.computeProjectionMatrixFOV(70, 1.0, 0.1, 30.0)
+    flags = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX | p.ER_SWARM_RAYCAST
+    full = p.getCameraImage(SIZE, SIZE, view, proj, lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags)
+    lean = p.getCameraImage(SIZE, SIZE, view, proj, lightDirection=LIGHT, renderer=p.ER_TINY_RENDERER, flags=flags | p.ER_SWARM_NO_DEPTH)
+    self.assertIsNone(lean[3])
+    self.assertEqual(np.asarray(lean[2]).tobytes(), np.asarray(full[2]).tobytes())
+    self.assertEqual(np.asarray(lean[4]).tobytes(), np.asarray(full[4]).tobytes())
+
   def test_object_colour_and_alpha_apply(self):
     """The red box keeps only its red channel; the alpha-zero box is not drawn at all."""
     rgb, _, seg = render(p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX | p.ER_SWARM_RAYCAST)

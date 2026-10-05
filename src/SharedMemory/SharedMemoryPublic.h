@@ -922,6 +922,12 @@ enum EnumRendererAuxFlags
 	ER_SWARM_FRAME_REUSE = 524288,
 	// With ER_EDGE_ANTIALIAS: a crease inside one body fills its uncovered share from its neighbours, not a probe ray.
 	ER_SWARM_CREASE_FILL = 2097152,
+	// Ray-cast path: a lone camera paints the triangles in view to find what each pixel sees, and casts a ray only
+	// where a forest tree or a mesh too dense to paint may lie nearer.
+	ER_SWARM_RASTER = 4194304,
+	// The depth buffer is neither converted nor sent: the picture call hands back None for it, for a caller that reads
+	// only colour and mask.
+	ER_SWARM_NO_DEPTH = 8388608,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.

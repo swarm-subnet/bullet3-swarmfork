@@ -2,6 +2,7 @@
 
 #include <embree4/rtcore.h>
 #include <math.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,9 @@
 #include <thread>
 #include <vector>
 #include <xmmintrin.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -29,6 +33,7 @@
 #include "SwarmLowLight.h"
 #include "SwarmSky.h"
 #include "SwarmThermal.h"
+#include "Bullet3Common/b3DiskCache.h"
 #include "Bullet3Common/b3Logging.h"
 #include "LinearMath/btTransform.h"
 
@@ -83,6 +88,58 @@ inline void normalize3(float v[3])
 		const float inv = 1.0f / length;
 		for (int i = 0; i < 3; i++)
 			v[i] *= inv;
+	}
+}
+
+// ER_SWARM_RASTER: a run of consecutive triangles of one mesh and their box, in the mesh's own frame, so a frame drops
+// what lies outside its view before projecting a single corner.
+struct RasterChunk
+{
+	float m_lo[3];
+	float m_hi[3];
+	unsigned m_first;
+	unsigned m_count;
+};
+
+const unsigned kRasterChunkTriangles = 64;
+
+// Cuts a mesh into chunks of kRasterChunkTriangles triangles in file order, each with the box of its corners, and
+// writes the box of them all into lo and hi.
+void buildRasterChunks(const std::vector<float>& vertices, const std::vector<unsigned>& indices, std::vector<RasterChunk>& out,
+					   float lo[3], float hi[3])
+{
+	out.clear();
+	for (int i = 0; i < 3; i++)
+	{
+		lo[i] = INFINITY;
+		hi[i] = -INFINITY;
+	}
+	const size_t numTriangles = indices.size() / 3;
+	for (size_t first = 0; first < numTriangles; first += kRasterChunkTriangles)
+	{
+		RasterChunk chunk;
+		chunk.m_first = (unsigned)first;
+		chunk.m_count = (unsigned)(numTriangles - first < kRasterChunkTriangles ? numTriangles - first : kRasterChunkTriangles);
+		for (int i = 0; i < 3; i++)
+		{
+			chunk.m_lo[i] = INFINITY;
+			chunk.m_hi[i] = -INFINITY;
+		}
+		for (size_t k = first * 3; k < (first + chunk.m_count) * 3; k++)
+		{
+			const float* v = &vertices[(size_t)indices[k] * 3];
+			for (int i = 0; i < 3; i++)
+			{
+				chunk.m_lo[i] = v[i] < chunk.m_lo[i] ? v[i] : chunk.m_lo[i];
+				chunk.m_hi[i] = v[i] > chunk.m_hi[i] ? v[i] : chunk.m_hi[i];
+			}
+		}
+		for (int i = 0; i < 3; i++)
+		{
+			lo[i] = chunk.m_lo[i] < lo[i] ? chunk.m_lo[i] : lo[i];
+			hi[i] = chunk.m_hi[i] > hi[i] ? chunk.m_hi[i] : hi[i];
+		}
+		out.push_back(chunk);
 	}
 }
 
@@ -148,6 +205,10 @@ struct StaticMember
 	// The render object's texture revision the shadow maps last saw.
 	unsigned m_textureRevision;
 	int m_segmentation;
+	// ER_SWARM_RASTER: the member's triangles in world-space chunks, cut the first time a frame paints it, and their box.
+	std::vector<RasterChunk> m_chunks;
+	float m_chunksLo[3];
+	float m_chunksHi[3];
 };
 
 struct CachedTree;
@@ -165,6 +226,8 @@ struct CachedTree
 	int m_users;
 	TreeCache::iterator m_entry;
 	IdleTrees::iterator m_idle;
+	// Built with Embree's robust flag; forest trees are not, and never share a tree with a mesh that is.
+	bool m_robust;
 };
 
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
@@ -184,10 +247,17 @@ struct MeshTree
 	int m_refs;
 	bool m_dirty;
 	bool m_world;
+	// Traced with Embree's robust flag, as every tree is but a forest batch's.
+	bool m_robust;
 	// Set once the mesh has been rewritten: its tree then lives in a scene that refits instead of rebuilding.
 	bool m_refitting;
 	// The body transform a world tree was built for; the body counts as moved once it differs.
 	float m_pose[16];
+	// ER_SWARM_RASTER: the mesh's chunks in its own frame, cut the first time a frame paints it and again after a rewrite,
+	// and their box.
+	std::vector<RasterChunk> m_chunks;
+	float m_chunksLo[3];
+	float m_chunksHi[3];
 };
 
 // A world tree on disk: <SWARM_BVH_CACHE_DIR>/<key>.rtree holds the world-space vertex, index,
@@ -274,6 +344,9 @@ struct QueryContext
 	float m_pixelSpread;
 	// How far along its ray any camera ray of this thread got this frame, for the region a kept frame depends on.
 	float m_farthest;
+	// ER_SWARM_RASTER: the forest tree a ray cast straight into its mesh is in, since such a hit names no instance.
+	const Batch* m_directBatch;
+	unsigned m_directPlacement;
 };
 
 // Casts the shadow-map cells [col0, col1) x [row0, row1) along -light; each ray depends only on the map and the tree.
@@ -289,6 +362,8 @@ void castShadowCells(const ShadowMap& map, int col0, int col1, int row0, int row
 	ctx.m_alphaCutout = map.m_alphaCutout;
 	ctx.m_leafNoShadow = map.m_leafNoShadow;
 	ctx.m_pixelSpread = 0.0f;
+	ctx.m_directBatch = 0;
+	ctx.m_directPlacement = 0;
 	RTCIntersectArguments args;
 	rtcInitIntersectArguments(&args);
 	args.context = &ctx.m_context;
@@ -431,6 +506,11 @@ const Instance* hitInstance(const QueryContext* ctx, const RTCHit* hit)
 // The batch a hit inside the forest belongs to and the placement it landed on; null for any other hit.
 const Batch* hitBatch(const QueryContext* ctx, const RTCHit* hit, unsigned& placement)
 {
+	if (ctx->m_directBatch)
+	{
+		placement = ctx->m_directPlacement;
+		return ctx->m_directBatch;
+	}
 	if (!ctx->m_batches || ctx->m_forestId == RTC_INVALID_GEOMETRY_ID || hit->instID[0] != ctx->m_forestId)
 		return 0;
 	if (hit->instID[1] >= ctx->m_batches->size())
@@ -705,12 +785,16 @@ void copyAttributes(TinyRender::Model* model, const std::vector<unsigned>& indic
 	normals.assign(hasNormals ? (size_t)numVerts * 3 : 0, 0.0f);
 	if (!gatherUvs && !hasNormals)
 		return;
-	for (size_t f = 0; f * 3 + 2 < indices.size(); f++)
-		for (int j = 0; j < 3; j++)
+	// A vertex keeps what its last corner gives it, so the corners are walked from the last and each vertex is worked
+	// out at its first meeting only.
+	std::vector<unsigned char> done((size_t)numVerts, 0);
+	for (size_t f = indices.size() / 3; f-- > 0;)
+		for (int j = 2; j >= 0; j--)
 		{
 			const unsigned v = indices[f * 3 + j];
-			if (v >= (unsigned)numVerts)
+			if (v >= (unsigned)numVerts || done[v])
 				continue;
+			done[v] = 1;
 			if (gatherUvs)
 			{
 				const TinyRender::Vec2f uv = model->uv((int)f, j);
@@ -774,7 +858,7 @@ IdleTrees gIdleTrees;
 size_t gIdleWeight = 0;
 
 // The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
-CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices)
+CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices, bool robust)
 {
 	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
 	const std::pair<size_t, size_t> key(numVertices, numTriangles);
@@ -782,7 +866,7 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	for (TreeCache::iterator it = range.first; it != range.second; ++it)
 	{
 		CachedTree* tree = it->second;
-		if (memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
+		if (tree->m_robust != robust || memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0), &vertices[0], numVertices * 3 * sizeof(float)) != 0 ||
 			memcmp(rtcGetGeometryBufferData(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0), &indices[0], indices.size() * sizeof(unsigned)) != 0)
 			continue;
 		if (tree->m_users++ == 0)
@@ -795,8 +879,9 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	CachedTree* tree = new CachedTree;
 	tree->m_triangles = numTriangles;
 	tree->m_users = 1;
+	tree->m_robust = robust;
 	tree->m_scene = rtcNewScene(device);
-	rtcSetSceneFlags(tree->m_scene, RTC_SCENE_FLAG_ROBUST);
+	rtcSetSceneFlags(tree->m_scene, robust ? RTC_SCENE_FLAG_ROBUST : RTC_SCENE_FLAG_NONE);
 	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
 	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
 	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
@@ -808,7 +893,25 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
 	rtcCommitGeometry(tree->m_geometry);
 	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
+	// A tree another process of this machine built over the same arrays is loaded instead of built; the load checks the
+	// image against the geometry and builds when they differ.
+	std::string diskPath;
+	std::vector<char> image;
+	unsigned long long diskKey = b3DiskCacheHash("SWCTREE1", 8);
+	diskKey = b3DiskCacheHash(&vertices[0], numVertices * 3 * sizeof(float), diskKey);
+	diskKey = b3DiskCacheHash(&indices[0], indices.size() * sizeof(unsigned), diskKey);
+	if (!robust)
+		diskKey = b3DiskCacheHash("FAST", 4, diskKey);
+	const bool onDisk = b3DiskCachePath(diskKey, "ctree", diskPath);
+	if (onDisk && b3DiskCacheRead(diskPath, image) && !image.empty())
+		rtcSwarmLoadTree(tree->m_scene, &image[0], image.size());
 	joinCommit(tree->m_scene);
+	if (onDisk && image.empty())
+	{
+		image.resize(rtcSwarmSaveTree(tree->m_scene, 0, 0));
+		if (!image.empty() && rtcSwarmSaveTree(tree->m_scene, &image[0], image.size()) == image.size())
+			b3DiskCacheWrite(diskPath, &image[0], image.size());
+	}
 	tree->m_entry = gTreeCache.insert(std::make_pair(key, tree));
 	return tree;
 }
@@ -1192,6 +1295,124 @@ struct MoverShade
 // Lenses remembered at once (wide, zoom, thermal), and the smallest frame worth a memory, so the laser keeps none.
 const int kHitMemories = 4;
 const size_t kHintMinPixels = 64 * 64;
+
+// ER_SWARM_RASTER. What a cut-out test needs of a painted body: its texture and mesh as the hit filter reads them, and
+// for a mover the inverse of its transform's 3x3 part, which takes a camera ray into the mesh's frame as Embree does.
+struct RasterSource
+{
+	TinyRender::Model* m_model;
+	const float* m_vertices;
+	const float* m_uvs;
+	const std::vector<unsigned>* m_indices;
+	bool m_objectSpace;
+	float m_inverse[9];
+};
+
+// A painted triangle in fixed point: three edge functions over the frame's samples, already biased by the fill rule so
+// a sample on an edge two triangles share belongs to exactly one, the box of samples it may cover, the solve that gives a
+// camera ray's distance and barycentrics on the world triangle, and the ids a ray hit on it would carry.
+struct RasterTri
+{
+	long long m_edge[3];
+	long long m_stepX[3];
+	long long m_stepY[3];
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_det[3];
+	float m_u[3];
+	float m_v[3];
+	float m_t;
+	unsigned m_inst;
+	unsigned m_geom;
+	unsigned m_prim;
+	unsigned long long m_key;
+	// The body whose cut-outs a covered sample is tested on, or null when every sample is solid.
+	const RasterSource* m_source;
+};
+
+// A world box only a ray can draw, a forest tree or a chunk with more triangles than its screen box has room to paint:
+// the samples it may cover, its least distance from the eye, and the box itself, which a sample's ray must enter nearer
+// than what was painted there for the sample to be searched.
+struct RayRect
+{
+	int m_col0;
+	int m_col1;
+	int m_row0;
+	int m_row1;
+	float m_distance;
+	float m_lo[3];
+	float m_hi[3];
+	// The forest tree the box holds, its batch and placement; kNoTree for a dense chunk, which only a full search draws.
+	unsigned m_batch;
+	unsigned m_placement;
+};
+const unsigned kNoTree = ~0u;
+
+// A forest tree a sample's ray enters before the painted hit, and where it enters the tree's box.
+struct TreeCandidate
+{
+	float m_enter;
+	unsigned m_batch;
+	unsigned m_placement;
+};
+// Trees a sample keeps before it falls back to the full search.
+const int kTreeCandidates = 32;
+
+// One render thread's share of a painted frame: its triangles and rects, and per tile the ones that reach it, a rect's
+// index marked by kRectBit.
+struct RasterLane
+{
+	std::vector<RasterTri> m_tris;
+	std::vector<RayRect> m_rects;
+	std::vector<std::vector<unsigned> > m_bins;
+};
+const unsigned kRectBit = 0x80000000u;
+
+// One chunk to paint, of a static member or of a mover's mesh, and the body its cut-outs are tested on.
+struct RasterJob
+{
+	const RasterChunk* m_chunk;
+	const StaticMember* m_member;
+	const Instance* m_instance;
+	const RasterSource* m_source;
+};
+
+// The forest's trees by square cell across the ground, each tree's world box in cell order with its batch and placement.
+struct ForestGrid
+{
+	bool m_built;
+	std::vector<float> m_cellBoxes;
+	std::vector<unsigned> m_cellStart;
+	std::vector<float> m_treeBoxes;
+	std::vector<unsigned> m_treeBatch;
+	std::vector<unsigned> m_treePlacement;
+};
+const float kForestCell = 16.0f;
+
+// The triangle a ray landed on, enough to find its corners again.
+struct HitId
+{
+	unsigned m_inst;
+	unsigned m_geom;
+	unsigned m_prim;
+	// Inside the forest: the batch and the placement within it.
+	unsigned m_inst1;
+	unsigned m_instPrim1;
+};
+
+// Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
+// id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
+// before any ray, which is the sky or the clear colour, and the colour buffer after pass one.
+struct EdgeScratch
+{
+	std::vector<int> m_ids;
+	std::vector<HitId> m_hits;
+	std::vector<float> m_inverseEyeDepth;
+	std::vector<unsigned char> m_background;
+	std::vector<unsigned char> m_rgb1;
+};
 }  // namespace
 
 struct SwarmRaycast::Data
@@ -1202,6 +1423,9 @@ struct SwarmRaycast::Data
 	RTCScene m_staticShadows;  // Allocated only when a flagged placement needs the shadow map.
 	bool m_staticShadowsDirty;
 	std::map<unsigned long long, MeshTree*> m_sharedTrees;
+	// Forest batches' trees, traced without Embree's robust flag, whose watertight edge test is a large share of forest
+	// tracing and only moves rare leaf pixels; every other tree keeps it, so other scenes keep their bytes.
+	std::map<unsigned long long, MeshTree*> m_forestTrees;
 	// The forest: every batch's instance array, reached from the top and shadow scenes through one instance.
 	RTCScene m_forest;
 	RTCGeometry m_forestInstance;
@@ -1244,6 +1468,13 @@ struct SwarmRaycast::Data
 	unsigned long long m_sceneRevision;
 	std::vector<double> m_moved;
 	unsigned long long m_movedBase;
+	// ER_SWARM_RASTER: per render thread scratch, the frame's chunks and cut-out sources, and the forest's grid.
+	std::vector<RasterLane> m_rasterLanes;
+	// The edge pass's scratch per camera, kept from picture to picture so its buffers are not made and filled each time.
+	std::vector<EdgeScratch> m_edgeScratch;
+	std::vector<RasterJob> m_rasterJobs;
+	std::vector<RasterSource> m_rasterSources;
+	ForestGrid m_forestGrid;
 
 	// Notes a mover's old and new boxes for kept frames, dropping boxes all have seen, or the frames if too many wait.
 	void moverMoved(const MeshTree* tree, const float before[16], const float after[16])
@@ -1633,6 +1864,7 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = false;
 		tree->m_refitting = false;
+		tree->m_robust = true;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true);
@@ -1647,7 +1879,7 @@ struct SwarmRaycast::Data
 		tree.m_cached = 0;
 		if (!tree.m_world)
 		{
-			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices);
+			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices, tree.m_robust);
 			tree.m_scene = tree.m_cached->m_scene;
 			tree.m_geometry = tree.m_cached->m_geometry;
 			return;
@@ -1672,6 +1904,7 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = true;
 		tree->m_refitting = false;
+		tree->m_robust = true;
 		memcpy(tree->m_pose, transform, sizeof(tree->m_pose));
 		const unsigned long long key = treeCacheKey(model, worldTransform, localScaling);
 		char path[1024];
@@ -1693,12 +1926,13 @@ struct SwarmRaycast::Data
 	}
 
 	// Content hashes share canonical trees even when model storage sharing is disabled.
-	MeshTree* acquireSharedTree(TinyRender::Model* model, bool deformed)
+	MeshTree* acquireSharedTree(TinyRender::Model* model, bool deformed, bool robust = true)
 	{
 		const unsigned long long hash = deformed ? 0 : model->meshHash();
-		std::map<unsigned long long, MeshTree*>::iterator found = m_sharedTrees.find(hash);
+		std::map<unsigned long long, MeshTree*>& shared = robust ? m_sharedTrees : m_forestTrees;
+		std::map<unsigned long long, MeshTree*>::iterator found = shared.find(hash);
 		// A hash match must also match in size, so a collision builds its own tree instead of borrowing one.
-		if (hash && found != m_sharedTrees.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
+		if (hash && found != shared.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
 			found->second->m_vertices.size() == (size_t)model->nverts() * 3 + kVertexPadding)
 		{
 			found->second->m_refs++;
@@ -1709,12 +1943,13 @@ struct SwarmRaycast::Data
 		tree->m_dirty = false;
 		tree->m_world = false;
 		tree->m_refitting = false;
+		tree->m_robust = robust;
 		copyLocalVertices(model, tree->m_vertices);
 		copyIndices(model, tree->m_indices);
 		copyAttributes(model, tree->m_indices, 0, tree->m_normals, tree->m_uvs, true, false);
 		buildTree(*tree, 0);
 		if (hash)
-			m_sharedTrees[hash] = tree;
+			shared[hash] = tree;
 		return tree;
 	}
 
@@ -1728,10 +1963,11 @@ struct SwarmRaycast::Data
 				m_trees.erase(it);
 				break;
 			}
-		for (std::map<unsigned long long, MeshTree*>::iterator it = m_sharedTrees.begin(); it != m_sharedTrees.end(); ++it)
+		std::map<unsigned long long, MeshTree*>& shared = tree->m_robust ? m_sharedTrees : m_forestTrees;
+		for (std::map<unsigned long long, MeshTree*>::iterator it = shared.begin(); it != shared.end(); ++it)
 			if (it->second == tree)
 			{
-				m_sharedTrees.erase(it);
+				shared.erase(it);
 				break;
 			}
 		if (tree->m_cached)
@@ -1750,6 +1986,7 @@ struct SwarmRaycast::Data
 			return;
 		copyLocalVertices(model, tree.m_vertices);
 		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs, true);
+		tree.m_chunks.clear();
 		// A medium-quality scene ignores the geometry's refit quality and rebuilds its whole tree on every commit,
 		// so the first rewrite moves the mesh into a low-quality scene, whose two-level builder refits it in place.
 		if (!tree.m_refitting)
@@ -1954,7 +2191,8 @@ struct SwarmRaycast::Data
 		if (m_forest)
 			return;
 		m_forest = rtcNewScene(m_device);
-		rtcSetSceneFlags(m_forest, RTC_SCENE_FLAG_ROBUST);
+		// Like its trees, the forest's own scene is traced without the robust flag; no other scene instances it.
+		rtcSetSceneFlags(m_forest, RTC_SCENE_FLAG_NONE);
 		rtcSetSceneBuildQuality(m_forest, RTC_BUILD_QUALITY_MEDIUM);
 		m_forestInstance = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE);
 		rtcSetGeometryInstancedScene(m_forestInstance, m_forest);
@@ -1987,7 +2225,7 @@ struct SwarmRaycast::Data
 			ensureForest();
 			batch = new Batch;
 			batch->m_obj = obj;
-			batch->m_tree = acquireSharedTree(obj->m_model, false);
+			batch->m_tree = acquireSharedTree(obj->m_model, false, false);
 			batch->m_transforms.assign(count * 12, 0.0f);
 			batch->m_normalRotations.assign(count * 9, 0.0f);
 			batch->m_geometry = rtcNewGeometry(m_device, RTC_GEOMETRY_TYPE_INSTANCE_ARRAY);
@@ -2047,6 +2285,8 @@ struct SwarmRaycast::Data
 		}
 		if (changed || batch->m_doubleSided != obj->m_doubleSided || batch->m_textureRevision != obj->m_textureRevision)
 			m_shadowMap.m_built = m_shelterMap.m_built = false;
+		if (changed)
+			m_forestGrid.m_built = false;
 		batch->m_doubleSided = obj->m_doubleSided;
 		batch->m_hasAlpha = obj->m_model->hasAlpha();
 		batch->m_glass = obj->m_glass;
@@ -2072,6 +2312,7 @@ struct SwarmRaycast::Data
 		releaseTree(batch->m_tree);
 		m_batches[batch->m_geomId] = 0;
 		m_forestDirty = true;
+		m_forestGrid.m_built = false;
 		m_shadowMap.m_built = m_shelterMap.m_built = false;
 		delete batch;
 	}
@@ -2087,6 +2328,7 @@ struct SwarmRaycast::Data
 				delete m_batches[i];
 			}
 		m_batches.clear();
+		m_forestGrid.m_built = false;
 		if (m_forest)
 		{
 			rtcDetachGeometry(m_top, m_forestId);
@@ -2181,6 +2423,7 @@ SwarmRaycast::SwarmRaycast()
 	m_data->m_frameCount = 0;
 	m_data->m_sceneRevision = 0;
 	m_data->m_movedBase = 0;
+	m_data->m_forestGrid.m_built = false;
 	for (int i = 0; i < kHitMemories; i++)
 	{
 		m_data->m_hitMemories[i].m_lastUse = 0;
@@ -2697,19 +2940,14 @@ void shadeDaylight(const SwarmRaycastShading& shading, const HitSurface& surface
 				   const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
 				   float distance, unsigned char out[3]);
 
-void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
-			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
-			  float distance, const float point[3], unsigned char out[3])
+// The fragment shader's interpolated normal, normalised but not turned to the camera, and its texture coordinates, from
+// a hit's barycentric (u, v): shadeHit up to its texture read.
+void shadeHitFrame(const HitSurface& surface, float u, float v, const float faceNormal[3], float normal[3], TinyRender::Vec2f& uv)
 {
-	if (shading.m_daylight)
-	{
-		shadeDaylight(shading, surface, hit, faceNormal, viewDir, shadow, filtered, duvdx, duvdy, distance, out);
-		return;
-	}
-	TinyRender::Model* model = surface.m_model;
-	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
-	float normal[3] = {0.0f, 0.0f, 0.0f};
-	TinyRender::Vec2f uv(0.0f, 0.0f);
+	const float weights[3] = {1.0f - u - v, u, v};
+	for (int i = 0; i < 3; i++)
+		normal[i] = 0.0f;
+	uv = TinyRender::Vec2f(0.0f, 0.0f);
 	for (int j = 0; j < 3; j++)
 	{
 		const float* uvj = surface.m_uvs + (size_t)surface.m_vertexIds[j] * 2;
@@ -2725,7 +2963,13 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		for (int i = 0; i < 3; i++)
 			normal[i] = faceNormal[i];
 	normalize3(normal);
+}
 
+// The fragment shader from its texel on: the lit colour of the hit and its bytes.
+void shadeHitFinish(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3], TinyRender::Vec2f uv, TGAColor color,
+					const float faceNormal[3], const float viewDir[3], float shadow, const float point[3], unsigned char out[3])
+{
+	TinyRender::Model* model = surface.m_model;
 	const float nDotL = dot3(normal, shading.m_lightDir);
 	float reflection[3];
 	for (int i = 0; i < 3; i++)
@@ -2734,9 +2978,6 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 	const float specular = powInt(reflection[2] > 0.0f ? reflection[2] : 0.0f, (int)model->specular(uv));
 	const float diffuse = nDotL > 0.0f ? nDotL : 0.0f;
 
-	TGAColor color = filtered
-									 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
-									 : model->diffuse(uv);
 	const TinyRender::Vec4f& rgba = model->getColorRGBA();
 	const float toCamera[3] = {-viewDir[0], -viewDir[1], -viewDir[2]};
 	float lit[3];
@@ -2783,13 +3024,31 @@ void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, con
 		out[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
 	}
 }
-// The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
-void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
-			   float normal[3], float base[3], TinyRender::Vec2f* uvOut = 0)
+
+void shadeHit(const SwarmRaycastShading& shading, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
+			  const float viewDir[3], float shadow, bool filtered, const float duvdx[2], const float duvdy[2],
+			  float distance, const float point[3], unsigned char out[3])
 {
-	TinyRender::Model* model = surface.m_model;
-	const float weights[3] = {1.0f - hit.u - hit.v, hit.u, hit.v};
-	TinyRender::Vec2f uv(0.0f, 0.0f);
+	if (shading.m_daylight)
+	{
+		shadeDaylight(shading, surface, hit, faceNormal, viewDir, shadow, filtered, duvdx, duvdy, distance, out);
+		return;
+	}
+	float normal[3];
+	TinyRender::Vec2f uv;
+	shadeHitFrame(surface, hit.u, hit.v, faceNormal, normal, uv);
+	TGAColor color = filtered
+						 ? surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]))
+						 : surface.m_model->diffuse(uv);
+	shadeHitFinish(shading, surface, normal, uv, color, faceNormal, viewDir, shadow, point, out);
+}
+
+// A hit's shading normal turned to the camera and its texture coordinates, from its barycentric (u, v): the surface
+// up to its texture read.
+void surfaceFrame(const HitSurface& surface, float u, float v, const float faceNormal[3], float normal[3], TinyRender::Vec2f& uv)
+{
+	const float weights[3] = {1.0f - u - v, u, v};
+	uv = TinyRender::Vec2f(0.0f, 0.0f);
 	for (int i = 0; i < 3; i++)
 		normal[i] = 0.0f;
 	for (int j = 0; j < 3; j++)
@@ -2811,13 +3070,26 @@ void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNor
 	if (dot3(normal, faceNormal) < 0.0f)
 		for (int i = 0; i < 3; i++)
 			normal[i] = -normal[i];
+}
 
-	TGAColor color = filtered
-						 ? model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
-						 : model->diffuse(uv);
-	const TinyRender::Vec4f& rgba = model->getColorRGBA();
+// The linear tint of a surface from the texel read at its hit: texture times object colour.
+void surfaceTint(const HitSurface& surface, TGAColor color, float base[3])
+{
+	const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
 	for (int i = 0; i < 3; i++)
 		base[i] = kSwarmSrgbToLinear[(unsigned char)(color[i] * rgba[i])];
+}
+
+// The surface at a hit: its shading normal turned to the camera and the linear tint, texture times object colour.
+void surfaceAt(const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], bool filtered, const float duvdx[2], const float duvdy[2],
+			   float normal[3], float base[3], TinyRender::Vec2f* uvOut = 0)
+{
+	TinyRender::Vec2f uv;
+	surfaceFrame(surface, hit.u, hit.v, faceNormal, normal, uv);
+	TGAColor color = filtered
+						 ? surface.m_model->diffuseFiltered(uv, TinyRender::Vec2f(duvdx[0], duvdx[1]), TinyRender::Vec2f(duvdy[0], duvdy[1]), 4)
+						 : surface.m_model->diffuse(uv);
+	surfaceTint(surface, color, base);
 	if (uvOut)
 		*uvOut = uv;
 }
@@ -2868,6 +3140,87 @@ void daylightLight(const SwarmRaycastShading& shading, const HitSurface& surface
 	}
 }
 
+// daylightLight for count surfaces under a sky: eight at a time in vector lanes where the compiler has them, each lane
+// daylightLight's steps in their order, the sky's light and glint looked up eight at a time, so every colour is the
+// one daylightLight gives.
+void daylightLightMany(const SwarmRaycastShading& shading, const HitSurface* const* surfaces, const float (*normals)[3], const float (*bases)[3],
+					   const float (*viewDirs)[3], const float* shadows, int count, float (*lit)[3])
+{
+	int k = 0;
+#if defined(__GNUC__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.0f;
+	for (; shading.m_sky && k + 8 <= count; k += 8)
+	{
+		Lanes n[3], base[3], toCamera[3], shadow, specular[3];
+		Ints leaf;
+		for (int l = 0; l < 8; l++)
+		{
+			const HitSurface& surface = *surfaces[k + l];
+			const float* spec = &surface.m_model->getSpecularColor()[0];
+			for (int i = 0; i < 3; i++)
+			{
+				n[i][l] = normals[k + l][i];
+				base[i][l] = bases[k + l][i];
+				toCamera[i][l] = -viewDirs[k + l][i];
+				specular[i][l] = spec[i];
+			}
+			shadow[l] = shadows[k + l];
+			leaf[l] = surface.m_doubleSided && surface.m_hasAlpha ? -1 : 0;
+		}
+		const Lanes nDotL = (n[0] * shading.m_lightDir[0] + n[1] * shading.m_lightDir[1]) + n[2] * shading.m_lightDir[2];
+		Lanes direct = nDotL > zero ? nDotL : zero;
+		direct = (leaf & (nDotL < zero)) ? -nDotL * kLeafTransmit : direct;
+		float nx[8], ny[8], nz[8], skyLight[8][3];
+		memcpy(nx, &n[0], sizeof(nx));
+		memcpy(ny, &n[1], sizeof(ny));
+		memcpy(nz, &n[2], sizeof(nz));
+		shading.m_sky->irradianceMany(nx, ny, nz, 8, skyLight);
+		Lanes out[3];
+		for (int i = 0; i < 3; i++)
+		{
+			Lanes sky;
+			for (int l = 0; l < 8; l++)
+				sky[l] = skyLight[l][i];
+			out[i] = base[i] * (shading.m_ambientCoeff * sky + shadow * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
+		}
+		const Ints glint = (specular[0] > zero) | (specular[1] > zero) | (specular[2] > zero);
+		bool anyGlint = false;
+		for (int l = 0; l < 8; l++)
+			anyGlint = anyGlint || glint[l];
+		if (shading.m_glint.m_enabled && anyGlint)
+		{
+			Lanes nDotV = (n[0] * toCamera[0] + n[1] * toCamera[1]) + n[2] * toCamera[2];
+			nDotV = nDotV < zero ? zero : (nDotV > one ? one : nDotV);
+			Lanes rise = (kGlassFlatUntilCos - nDotV) / (kGlassFlatUntilCos - kGlassMirrorFromCos);
+			rise = rise < zero ? zero : (rise > one ? one : rise);
+			const Lanes fresnel = kGlassFlat + (1.0f - kGlassFlat) * rise * rise * (3.0f - 2.0f * rise);
+			float mirror[3][8], sky[8][3];
+			for (int i = 0; i < 3; i++)
+			{
+				const Lanes m = n[i] * (2.0f * nDotV) - toCamera[i];
+				memcpy(mirror[i], &m, sizeof(m));
+			}
+			shading.m_sky->radianceMany(mirror[0], mirror[1], mirror[2], 8, sky);
+			for (int i = 0; i < 3; i++)
+			{
+				Lanes s;
+				for (int l = 0; l < 8; l++)
+					s[l] = sky[l][i];
+				const Lanes w = specular[i] * fresnel;
+				out[i] = glint ? out[i] + (s - out[i]) * w : out[i];
+			}
+		}
+		for (int l = 0; l < 8; l++)
+			for (int i = 0; i < 3; i++)
+				lit[k + l][i] = out[i][l];
+	}
+#endif
+	for (; k < count; k++)
+		daylightLight(shading, *surfaces[k], normals[k], bases[k], viewDirs[k], shadows[k], lit[k]);
+}
+
 // A thin pane: the sky mirrored about it, and the share that passes through by the Fresnel of its two faces (about 8 % mirror head-on, all mirror when grazing).
 float paneLight(const SwarmRaycastShading& shading, const float normal[3], const float viewDir[3], float sky[3])
 {
@@ -2892,26 +3245,115 @@ float paneLight(const SwarmRaycastShading& shading, const float normal[3], const
 	return 1.0f - reflect;
 }
 
-// Linear light to the byte: haze by distance towards the horizon colour, exposure, the film curve.
-void daylightWrite(const SwarmRaycastShading& shading, const float litIn[3], const float viewDir[3], float distance, unsigned char out[3])
+// A glass-backed module seen in daylight, in linear light: the sky its pane mirrors, and through the pane its backsheet
+// in the pane's colour, lit and shadowed as the pane, standing in for a ray behind it.
+void moduleLight(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3], const float base[3],
+				 const float viewDir[3], float shadow, float lit[3])
 {
-	float lit[3] = {litIn[0], litIn[1], litIn[2]};
+	float sky[3], skyLight[3];
+	const float through = paneLight(shading, normal, viewDir, sky);
+	if (shading.m_sky)
+		shading.m_sky->irradiance(normal, skyLight);
+	else
+		for (int i = 0; i < 3; i++)
+			skyLight[i] = shading.m_ambientColor[i];
+	const float nDotL = dot3(normal, shading.m_lightDir);
+	const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+	const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
+	for (int i = 0; i < 3; i++)
+	{
+		const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+		lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading.m_ambientCoeff * skyLight[i] + shadow * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
+	}
+}
+
+// moduleLight for count modules at once: each module's steps as moduleLight takes them, the sky each pane mirrors and
+// the sky light on each normal looked up together, eight at a time, as daylightLightMany looks up its own.
+void moduleLightMany(const SwarmRaycastShading& shading, const HitSurface* const* surfaces, const float (*normals)[3], const float (*bases)[3],
+					 const float (*viewDirs)[3], const float* shadows, int count, float (*lit)[3])
+{
+	if (!shading.m_sky)
+	{
+		for (int k = 0; k < count; k++)
+			moduleLight(shading, *surfaces[k], normals[k], bases[k], viewDirs[k], shadows[k], lit[k]);
+		return;
+	}
+	float mirrorX[kTileSize * kTileSize], mirrorY[kTileSize * kTileSize], mirrorZ[kTileSize * kTileSize], through[kTileSize * kTileSize];
+	float normalX[kTileSize * kTileSize], normalY[kTileSize * kTileSize], normalZ[kTileSize * kTileSize];
+	float sky[kTileSize * kTileSize][3], skyLight[kTileSize * kTileSize][3];
+	for (int k = 0; k < count; k++)
+	{
+		const float* normal = normals[k];
+		const float toCamera[3] = {-viewDirs[k][0], -viewDirs[k][1], -viewDirs[k][2]};
+		float nDotV = dot3(normal, toCamera);
+		nDotV = nDotV < 0.0f ? 0.0f : (nDotV > 1.0f ? 1.0f : nDotV);
+		const float away = 1.0f - nDotV;
+		const float away2 = away * away;
+		const float face = kPaneF0 + (1.0f - kPaneF0) * away2 * away2 * away;
+		const float reflect = (2.0f * face) / (1.0f + face);
+		mirrorX[k] = normal[0] * (2.0f * nDotV) - toCamera[0];
+		mirrorY[k] = normal[1] * (2.0f * nDotV) - toCamera[1];
+		mirrorZ[k] = normal[2] * (2.0f * nDotV) - toCamera[2];
+		through[k] = 1.0f - reflect;
+		normalX[k] = normal[0];
+		normalY[k] = normal[1];
+		normalZ[k] = normal[2];
+	}
+	shading.m_sky->radianceMany(mirrorX, mirrorY, mirrorZ, count, sky);
+	shading.m_sky->irradianceMany(normalX, normalY, normalZ, count, skyLight);
+	for (int k = 0; k < count; k++)
+	{
+		const float nDotL = dot3(normals[k], shading.m_lightDir);
+		const float direct = nDotL > 0.0f ? nDotL : 0.0f;
+		const TinyRender::Vec4f& rgba = surfaces[k]->m_model->getColorRGBA();
+		for (int i = 0; i < 3; i++)
+		{
+			const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
+			lit[k][i] = (1.0f - through[k]) * sky[k][i] +
+						through[k] * bases[k][i] * backing * (shading.m_ambientCoeff * skyLight[k][i] + shadows[k] * shading.m_diffuseCoeff * direct * shading.m_lightColor[i]);
+		}
+	}
+}
+
+// A daylight colour on its way to the byte: its linear light, the horizon colour its haze blends towards and its distance.
+struct DaylightColour
+{
+	float m_lit[3];
+	float m_horizon[3];
+	float m_distance;
+};
+
+// Everything the byte of a lit colour needs from the scene: the horizon colour is only looked up under haze. With
+// skyLater, a sky's horizon colour is left for the caller to look up with others.
+void daylightPrepare(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, DaylightColour& colour,
+					 bool skyLater = false)
+{
+	for (int i = 0; i < 3; i++)
+		colour.m_lit[i] = lit[i];
+	colour.m_distance = distance;
+	if (!(shading.m_hazeDistance > 0.0f) || (skyLater && shading.m_sky))
+		return;
+	if (shading.m_sky)
+	{
+		// The haze takes the sky's colour just above the horizon in the direction of view.
+		float level[3] = {viewDir[0], viewDir[1], viewDir[2]};
+		level[shading.m_glint.m_upAxis] = 0.02f;
+		shading.m_sky->radiance(level[0], level[1], level[2], colour.m_horizon);
+	}
+	else
+		for (int i = 0; i < 3; i++)
+			colour.m_horizon[i] = swarmUnitToLinear(shading.m_glint.m_skyHorizon[i]);
+}
+
+// Linear light to the byte: haze by distance towards the horizon colour, exposure, the film curve.
+void daylightFinish(const SwarmRaycastShading& shading, const DaylightColour& colour, unsigned char out[3])
+{
+	float lit[3] = {colour.m_lit[0], colour.m_lit[1], colour.m_lit[2]};
 	if (shading.m_hazeDistance > 0.0f)
 	{
-		const float haze = 1.0f - (float)swarmExp(-(double)distance / (double)shading.m_hazeDistance);
-		float horizonColour[3];
-		if (shading.m_sky)
-		{
-			// The haze takes the sky's colour just above the horizon in the direction of view.
-			float level[3] = {viewDir[0], viewDir[1], viewDir[2]};
-			level[shading.m_glint.m_upAxis] = 0.02f;
-			shading.m_sky->radiance(level[0], level[1], level[2], horizonColour);
-		}
-		else
-			for (int i = 0; i < 3; i++)
-				horizonColour[i] = swarmUnitToLinear(shading.m_glint.m_skyHorizon[i]);
+		const float haze = 1.0f - (float)swarmExp(-(double)colour.m_distance / (double)shading.m_hazeDistance);
 		for (int i = 0; i < 3; i++)
-			lit[i] = lit[i] + (horizonColour[i] - lit[i]) * haze;
+			lit[i] = lit[i] + (colour.m_horizon[i] - lit[i]) * haze;
 	}
 
 	float exposed[3], display[3];
@@ -2920,6 +3362,66 @@ void daylightWrite(const SwarmRaycastShading& shading, const float litIn[3], con
 	SwarmAgx::apply(exposed, display);
 	for (int i = 0; i < 3; i++)
 		out[i] = SwarmAgx::toByte(display[i]);
+}
+
+// The byte of a lit colour in one go.
+void daylightWrite(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, unsigned char out[3])
+{
+	DaylightColour colour;
+	daylightPrepare(shading, lit, viewDir, distance, colour);
+	daylightFinish(shading, colour, out);
+}
+
+// daylightFinish for many colours: eight at a time in vector lanes where the compiler has them, each lane the steps of
+// one colour in their order, so every byte is the one daylightFinish writes.
+void daylightFinishAll(const SwarmRaycastShading& shading, const DaylightColour* colours, int count, unsigned char* const* outs)
+{
+	int k = 0;
+#if defined(__GNUC__)
+	const bool haze = shading.m_hazeDistance > 0.0f;
+	for (; k + 8 <= count; k += 8)
+	{
+		SwarmLanes8 lit[3], display[3];
+		for (int i = 0; i < 3; i++)
+			for (int l = 0; l < 8; l++)
+				lit[i][l] = colours[k + l].m_lit[i];
+		if (haze)
+		{
+			SwarmDoubles4 low, high;
+			for (int l = 0; l < 4; l++)
+			{
+				low[l] = -(double)colours[k + l].m_distance;
+				high[l] = -(double)colours[k + 4 + l].m_distance;
+			}
+			low = swarmExp(low / (double)shading.m_hazeDistance);
+			high = swarmExp(high / (double)shading.m_hazeDistance);
+			SwarmLanes8 haze8;
+			for (int l = 0; l < 4; l++)
+			{
+				haze8[l] = 1.0f - (float)low[l];
+				haze8[4 + l] = 1.0f - (float)high[l];
+			}
+			for (int i = 0; i < 3; i++)
+			{
+				SwarmLanes8 horizon;
+				for (int l = 0; l < 8; l++)
+					horizon[l] = colours[k + l].m_horizon[i];
+				lit[i] = lit[i] + (horizon - lit[i]) * haze8;
+			}
+		}
+		for (int i = 0; i < 3; i++)
+			lit[i] = lit[i] * shading.m_exposure;
+		SwarmAgx::apply8(lit, display);
+		for (int i = 0; i < 3; i++)
+		{
+			const SwarmLaneMask8 bytes = __builtin_convertvector(display[i] * 255.0f + 0.5f, SwarmLaneMask8);
+			for (int l = 0; l < 8; l++)
+				outs[k + l][i] = (unsigned char)bytes[l];
+		}
+	}
+#endif
+	for (; k < count; k++)
+		daylightFinish(shading, colours[k], outs[k]);
 }
 
 // Daylight shading of one hit, in linear light: sky by direction plus sun, glass reflecting the sky, haze by distance, the film curve on the write.
@@ -2942,6 +3444,8 @@ struct CameraSetup
 	float m_stepY[3];
 	bool m_valid;
 };
+
+struct RasterFrame;
 
 // Everything a thread needs to trace one tile; all of it is read-only during the frame.
 struct TileJob
@@ -2973,21 +3477,43 @@ struct TileJob
 	float* m_hitPoints;
 	// Where the movers can shade, when the movers answer the shadow rays; null otherwise.
 	const MoverShade* m_moverShade;
-};
-
-// The triangle a ray landed on, enough to find its corners again.
-struct HitId
-{
-	unsigned m_inst;
-	unsigned m_geom;
-	unsigned m_prim;
-	// Inside the forest: the batch and the placement within it.
-	unsigned m_inst1;
-	unsigned m_instPrim1;
+	// ER_SWARM_RASTER: the frame's painted triangles and rects, when the camera paints instead of searching; null otherwise.
+	const RasterFrame* m_raster;
+	bool m_alphaCutout;
 };
 
 // What one ray brings back: the clip depth and its reciprocal eye depth, the segmentation id and
 // triangle of its hit, and the shaded colour when the job carries a light and the body is known.
+// What a daylight hit's shading needs once its tile reads the textures: the surface, where on its triangle the hit
+// lies, the face normal, the texture footprint, the view direction, the shadow and the distance.
+struct ShadeWait
+{
+	const HitSurface* m_surface;
+	float m_u;
+	float m_v;
+	float m_faceNormal[3];
+	float m_duvdx[2];
+	float m_duvdy[2];
+	float m_dir[3];
+	float m_shadow;
+	float m_distance;
+	// Which shading waits: an opaque daylight surface, a glass-backed module in daylight, or the fragment shader.
+	enum Kind
+	{
+		kDaylight,
+		kModule,
+		kFragment
+	} m_kind;
+	// For the fragment shader: the hit point, which the spot light reads.
+	float m_point[3];
+	// The footprint is worked out with the tile's others when m_footprintLater; the camera ray and wound normal it needs.
+	// The shadow likewise when m_shadowLater, from the hit point and face normal.
+	bool m_footprintLater;
+	bool m_shadowLater;
+	float m_rawDir[3];
+	float m_wound[3];
+};
+
 struct Sample
 {
 	float m_depth;
@@ -2998,19 +3524,59 @@ struct Sample
 	unsigned char m_rgb[3];
 	// ER_SWARM_THERMAL: the in-band radiance reaching the camera along the ray, the sky's on a miss.
 	float m_radiance;
+	// A daylight colour left for its tile's batched write instead of written to m_rgb, when the caller asks for that.
+	bool m_deferred;
+	DaylightColour m_colour;
+	// A hit whose shading waits for its tile, so the tile reads its samples' textures together; it is written straight
+	// into the tile's slot m_shade points at.
+	bool m_shadeDeferred;
+	ShadeWait* m_shade;
 };
 
-// Per-camera scratch for the edge pass, all of it written by pass one and only read by pass two: the
-// id, triangle and 1/zEye of every pixel (-1 and an invalid primitive for a miss), the colour buffer
-// before any ray, which is the sky or the clear colour, and the colour buffer after pass one.
-struct EdgeScratch
+// Leaves a daylight hit's shading for its tile: what the shading needs is kept in the sample.
+inline void waitForTile(Sample& out, const HitSurface& surface, const RTCHit& hit, const float faceNormal[3], const float duvdx[2],
+						const float duvdy[2], const float dir[3], float shadow, float distance, ShadeWait::Kind kind, const float point[3],
+						bool footprintLater, const float rawDir[3], const float wound[3], bool shadowLater)
 {
-	std::vector<int> m_ids;
-	std::vector<HitId> m_hits;
-	std::vector<float> m_inverseEyeDepth;
-	std::vector<unsigned char> m_background;
-	std::vector<unsigned char> m_rgb1;
-};
+	ShadeWait& wait = *out.m_shade;
+	wait.m_surface = &surface;
+	wait.m_u = hit.u;
+	wait.m_v = hit.v;
+	for (int i = 0; i < 3; i++)
+	{
+		wait.m_faceNormal[i] = faceNormal[i];
+		wait.m_dir[i] = dir[i];
+	}
+	for (int i = 0; i < 2; i++)
+	{
+		wait.m_duvdx[i] = duvdx[i];
+		wait.m_duvdy[i] = duvdy[i];
+	}
+	wait.m_shadow = shadow;
+	wait.m_distance = distance;
+	wait.m_kind = kind;
+	wait.m_footprintLater = footprintLater;
+	wait.m_shadowLater = shadowLater;
+	for (int i = 0; i < 3; i++)
+	{
+		wait.m_point[i] = point[i];
+		wait.m_rawDir[i] = rawDir[i];
+		wait.m_wound[i] = wound[i];
+	}
+	out.m_shadeDeferred = true;
+}
+
+// A lit daylight colour's byte now, or the colour kept in the sample for its tile's batched write.
+inline void daylightOut(const SwarmRaycastShading& shading, const float lit[3], const float viewDir[3], float distance, Sample& out, bool defer)
+{
+	if (!defer)
+	{
+		daylightWrite(shading, lit, viewDir, distance, out.m_rgb);
+		return;
+	}
+	daylightPrepare(shading, lit, viewDir, distance, out.m_colour);
+	out.m_deferred = true;
+}
 
 // Relative slack on the 1/depth line test; float rounding on a plane sits three orders below it.
 const float kEdgeTolerance = 1e-3f;
@@ -3106,24 +3672,29 @@ bool castMoverShade(const std::vector<Instance*>& instances, const float lightDi
 
 // The share of the sun a point keeps: the map answers for the static bodies and the ray for the rest, softly under daylight; faceNormal need not be unit.
 // A leaf card with leaf shadows off asks from its sunward side, since its back-light is not its own shadow.
-float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
+// The normal a shadow is looked up with: the face normal made unit, turned to the light for a leaf card when leaf
+// shadows are off, so the light through it is not cancelled by the map's rule that a face turned from the sun is dark.
+inline void shadowNormal(const SwarmRaycastShading* shading, const float faceNormal[3], bool leaf, float unitNormal[3])
 {
-	const SwarmRaycastShading* shading = job.m_shading;
-	float unitNormal[3] = {faceNormal[0], faceNormal[1], faceNormal[2]};
+	for (int i = 0; i < 3; i++)
+		unitNormal[i] = faceNormal[i];
 	normalize3(unitNormal);
 	if (leaf && shading->m_leafNoShadow && dot3(unitNormal, shading->m_lightDir) < 0.0f)
 		for (int i = 0; i < 3; i++)
 			unitNormal[i] = -unitNormal[i];
-	float litShare = 1.0f;
-	bool blocked = false;
-	if (job.m_shadowMap && shading->m_daylight)
-	{
-		const ShadowMap* map = (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
-		litShare = shadowMapLit(*map, point, unitNormal);
-		blocked = litShare <= 0.0f;
-	}
-	else
-		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+}
+
+// The map a daylight point is looked up in: the fine core grid where it covers the point, else the main map.
+inline const ShadowMap* shadowMapFor(const TileJob& job, const float point[3])
+{
+	return (job.m_shadowCore && shadowMapCovers(*job.m_shadowCore, point)) ? job.m_shadowCore : job.m_shadowMap;
+}
+
+// The light a point keeps once the map has answered: a shadow ray into the movers or the whole scene where the map did
+// not already block it, then the shadow coefficient.
+float shadowFinish(const TileJob& job, const float point[3], const float unitNormal[3], float litShare, bool blocked, RTCOccludedArguments* shadowArgs)
+{
+	const SwarmRaycastShading* shading = job.m_shading;
 	const RTCScene occluders = job.m_shadowMap ? job.m_movers : job.m_top;
 	const float origin[3] = {point[0] + unitNormal[0] * kShadowBias, point[1] + unitNormal[1] * kShadowBias, point[2] + unitNormal[2] * kShadowBias};
 	bool reachable = true;
@@ -3153,6 +3724,142 @@ float shadowAt(const TileJob& job, const float point[3], const float faceNormal[
 	if (shading->m_daylight)
 		return blocked ? shading->m_shadowLightCoeff : shading->m_shadowLightCoeff + (1.0f - shading->m_shadowLightCoeff) * litShare;
 	return blocked ? shading->m_shadowLightCoeff : 1.0f;
+}
+
+float shadowAt(const TileJob& job, const float point[3], const float faceNormal[3], bool leaf, RTCOccludedArguments* shadowArgs)
+{
+	const SwarmRaycastShading* shading = job.m_shading;
+	float unitNormal[3];
+	shadowNormal(shading, faceNormal, leaf, unitNormal);
+	float litShare = 1.0f;
+	bool blocked = false;
+	if (job.m_shadowMap && shading->m_daylight)
+	{
+		litShare = shadowMapLit(*shadowMapFor(job, point), point, unitNormal);
+		blocked = litShare <= 0.0f;
+	}
+	else
+		blocked = job.m_shadowMap && shadowMapBlocked(*job.m_shadowMap, point, unitNormal);
+	return shadowFinish(job, point, unitNormal, litShare, blocked, shadowArgs);
+}
+
+// shadowMapBlocked for count points of one map at once: eight at a time in vector lanes where the build has AVX2, each
+// lane shadowMapBlocked's steps on its one cell; the cells a lane reads are cast first, as shadowMapBlocked casts them.
+void shadowBlockedMany(const ShadowMap& map, const float (*points)[3], const float (*normals)[3], int count, bool* blocked)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; map.m_built && k + 8 <= count; k += 8)
+	{
+		Lanes p[3], n[3];
+		for (int l = 0; l < 8; l++)
+			for (int i = 0; i < 3; i++)
+			{
+				p[i][l] = points[k + l][i];
+				n[i][l] = normals[k + l][i];
+			}
+		const Lanes facing = (n[0] * map.m_lightDir[0] + n[1] * map.m_lightDir[1]) + n[2] * map.m_lightDir[2];
+		Lanes rel[3];
+		for (int i = 0; i < 3; i++)
+			rel[i] = (p[i] + n[i] * map.m_cell) - map.m_origin[i];
+		const Lanes u = ((rel[0] * map.m_axisU[0] + rel[1] * map.m_axisU[1]) + rel[2] * map.m_axisU[2]) / map.m_cell;
+		const Lanes v = ((rel[0] * map.m_axisV[0] + rel[1] * map.m_axisV[1]) + rel[2] * map.m_axisV[2]) / map.m_cell;
+		const Ints dark = facing <= zero;
+		const Ints read = ~dark & (u >= zero) & (v >= zero) & (u < (float)map.m_cols) & (v < (float)map.m_rows);
+		const Ints iu = __builtin_convertvector(u, Ints), iv = __builtin_convertvector(v, Ints);
+		for (int l = 0; l < 8; l++)
+			if (read[l])
+				ensureShadowCells(map, iu[l], iu[l], iv[l], iv[l]);
+		const Lanes depth = -((rel[0] * map.m_lightDir[0] + rel[1] * map.m_lightDir[1]) + rel[2] * map.m_lightDir[2]);
+		const Lanes cell = (Lanes)_mm256_i32gather_ps(map.m_depth.get(), (__m256i)(read & (iv * map.m_cols + iu)), 4);
+		const Ints behind = read & (depth > cell + map.m_cell);
+		for (int l = 0; l < 8; l++)
+			blocked[k + l] = dark[l] || behind[l];
+	}
+#endif
+	for (; k < count; k++)
+		blocked[k] = shadowMapBlocked(map, points[k], normals[k]);
+}
+
+// shadowMapLit for count points at once, each with its own map and unit normal: eight at a time in vector lanes where
+// the build has AVX2 and all eight read the inside of one map, each lane shadowMapLit's steps and its nine cells added
+// in the same order; any other group point by point.
+void shadowLitMany(const ShadowMap* const* maps, const float (*points)[3], const float (*normals)[3], int count, float* lit)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.0f, half = zero + 0.5f;
+	for (; k + 8 <= count; k += 8)
+	{
+		const ShadowMap& map = *maps[k];
+		bool same = map.m_built;
+		for (int l = 1; l < 8 && same; l++)
+			same = maps[k + l] == &map;
+		if (!same)
+		{
+			for (int l = 0; l < 8; l++)
+				lit[k + l] = shadowMapLit(*maps[k + l], points[k + l], normals[k + l]);
+			continue;
+		}
+		Lanes p[3], n[3];
+		for (int l = 0; l < 8; l++)
+			for (int i = 0; i < 3; i++)
+			{
+				p[i][l] = points[k + l][i];
+				n[i][l] = normals[k + l][i];
+			}
+		const Lanes facing = (n[0] * map.m_lightDir[0] + n[1] * map.m_lightDir[1]) + n[2] * map.m_lightDir[2];
+		Lanes rel[3];
+		for (int i = 0; i < 3; i++)
+			rel[i] = (p[i] + n[i] * map.m_cell) - map.m_origin[i];
+		const Lanes u = ((rel[0] * map.m_axisU[0] + rel[1] * map.m_axisU[1]) + rel[2] * map.m_axisU[2]) / map.m_cell;
+		const Lanes v = ((rel[0] * map.m_axisV[0] + rel[1] * map.m_axisV[1]) + rel[2] * map.m_axisV[2]) / map.m_cell;
+		const Ints outside = ~(u >= zero) | ~(v >= zero) | (u >= (float)map.m_cols) | (v >= (float)map.m_rows);
+		const Lanes depth = -((rel[0] * map.m_lightDir[0] + rel[1] * map.m_lightDir[1]) + rel[2] * map.m_lightDir[2]) - map.m_cell;
+		const Lanes su = u - 1.0f, sv = v - 1.0f;
+		const Lanes flU = (Lanes)_mm256_round_ps((__m256)su, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+		const Lanes flV = (Lanes)_mm256_round_ps((__m256)sv, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+		const Ints iu = __builtin_convertvector(flU, Ints), iv = __builtin_convertvector(flV, Ints);
+		const Lanes fu = su - __builtin_convertvector(iu, Lanes), fv = sv - __builtin_convertvector(iv, Lanes);
+		const Ints dark = ~(facing > zero);
+		// Lanes the vector path reads: facing the light, on the map, and with all nine cells inside it.
+		const Ints read = ~dark & ~outside & (iu >= 0) & (iv >= 0) & (iu + 2 < map.m_cols) & (iv + 2 < map.m_rows);
+		// A lane on the map but too near its border for the inside path makes the whole group go point by point.
+		bool border = false;
+		for (int l = 0; l < 8; l++)
+			border |= !dark[l] && !outside[l] && !read[l];
+		if (border)
+		{
+			for (int l = 0; l < 8; l++)
+				lit[k + l] = shadowMapLit(map, points[k + l], normals[k + l]);
+			continue;
+		}
+		for (int l = 0; l < 8; l++)
+			if (read[l])
+				ensureShadowCells(map, iu[l], iu[l] + 2, iv[l], iv[l] + 2);
+		const Lanes weightU[3] = {half * (one - fu), half, half * fu};
+		const Lanes weightV[3] = {half * (one - fv), half, half * fv};
+		const Ints first = (read & (iv * map.m_cols + iu));
+		Lanes sum = zero;
+		for (int dv = 0; dv < 3; dv++)
+			for (int du = 0; du < 3; du++)
+			{
+				const Ints at = read & (first + dv * map.m_cols + du);
+				const Lanes cell = (Lanes)_mm256_i32gather_ps(map.m_depth.get(), (__m256i)at, 4);
+				sum += ~(depth > cell) & read ? weightV[dv] * weightU[du] : zero;
+			}
+		const Lanes result = dark ? zero : (outside ? one : sum);
+		for (int l = 0; l < 8; l++)
+			lit[k + l] = result[l];
+	}
+#endif
+	for (; k < count; k++)
+		lit[k] = shadowMapLit(*maps[k], points[k], normals[k]);
 }
 
 // A hit's texture footprint from the right and upper neighbours' rays on its plane; woundNormal keeps the weights' sign.
@@ -3193,6 +3900,78 @@ void footprintAt(const CameraSetup& setup, const float rawDir[3], const HitSurfa
 		const float v = dot3(t2, woundNormal) / nn;
 		out[k][0] = (uv1[0] - uv0[0]) * (u - weights[0]) + (uv2[0] - uv0[0]) * (v - weights[1]);
 		out[k][1] = (uv1[1] - uv0[1]) * (u - weights[0]) + (uv2[1] - uv0[1]) * (v - weights[1]);
+	}
+}
+
+// footprintAt for count hits at once, each given by its camera ray, triangle corners, wound normal, barycentric (u, v)
+// and corner uvs: eight at a time in vector lanes where the compiler has them, each lane footprintAt's steps in order.
+// duvdx and duvdy must start at zero, as footprintAt's callers start them.
+void footprintMany(const CameraSetup& setup, ShadeWait* shades, const int* late, int count)
+{
+	int k = 0;
+#if defined(__GNUC__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; k + 8 <= count; k += 8)
+	{
+		Lanes c0[3], e1[3], e2[3], to[3], n[3], dir[3], u0, u1, u2, v0, v1, v2, wu, wv;
+		for (int l = 0; l < 8; l++)
+		{
+			const ShadeWait& wait = shades[late[k + l]];
+			const HitSurface& surface = *wait.m_surface;
+			const float(*corners)[3] = surface.m_corners;
+			for (int i = 0; i < 3; i++)
+			{
+				c0[i][l] = corners[0][i];
+				e1[i][l] = corners[1][i] - corners[0][i];
+				e2[i][l] = corners[2][i] - corners[0][i];
+				to[i][l] = corners[0][i] - setup.m_cam.m_origin[i];
+				n[i][l] = wait.m_wound[i];
+				dir[i][l] = wait.m_rawDir[i];
+			}
+			const float* uv0 = surface.m_uvs + (size_t)surface.m_vertexIds[0] * 2;
+			const float* uv1 = surface.m_uvs + (size_t)surface.m_vertexIds[1] * 2;
+			const float* uv2 = surface.m_uvs + (size_t)surface.m_vertexIds[2] * 2;
+			u0[l] = uv0[0], v0[l] = uv0[1], u1[l] = uv1[0], v1[l] = uv1[1], u2[l] = uv2[0], v2[l] = uv2[1];
+			wu[l] = wait.m_u, wv[l] = wait.m_v;
+		}
+		const Lanes nn = (n[0] * n[0] + n[1] * n[1]) + n[2] * n[2];
+		const Lanes reach = (to[0] * n[0] + to[1] * n[1]) + to[2] * n[2];
+		for (int side = 0; side < 2; side++)
+		{
+			const float* step = side == 0 ? setup.m_stepX : setup.m_stepY;
+			Lanes nd[3], w[3];
+			for (int i = 0; i < 3; i++)
+				nd[i] = dir[i] + step[i];
+			const Lanes denom = (nd[0] * n[0] + nd[1] * n[1]) + nd[2] * n[2];
+			const Ints skip = (denom == zero) | (nn == zero);
+			const Lanes sd = reach / denom;
+			for (int i = 0; i < 3; i++)
+				w[i] = (setup.m_cam.m_origin[i] + nd[i] * sd) - c0[i];
+			const Lanes t1[3] = {w[1] * e2[2] - w[2] * e2[1], w[2] * e2[0] - w[0] * e2[2], w[0] * e2[1] - w[1] * e2[0]};
+			const Lanes t2[3] = {e1[1] * w[2] - e1[2] * w[1], e1[2] * w[0] - e1[0] * w[2], e1[0] * w[1] - e1[1] * w[0]};
+			const Lanes bu = ((t1[0] * n[0] + t1[1] * n[1]) + t1[2] * n[2]) / nn;
+			const Lanes bv = ((t2[0] * n[0] + t2[1] * n[1]) + t2[2] * n[2]) / nn;
+			const Lanes outU = (u1 - u0) * (bu - wu) + (u2 - u0) * (bv - wv);
+			const Lanes outV = (v1 - v0) * (bu - wu) + (v2 - v0) * (bv - wv);
+			for (int l = 0; l < 8; l++)
+				if (!skip[l])
+				{
+					float* out = side == 0 ? shades[late[k + l]].m_duvdx : shades[late[k + l]].m_duvdy;
+					out[0] = outU[l];
+					out[1] = outV[l];
+				}
+		}
+	}
+#endif
+	for (; k < count; k++)
+	{
+		ShadeWait& wait = shades[late[k]];
+		RTCHit hit;
+		hit.u = wait.m_u;
+		hit.v = wait.m_v;
+		footprintAt(setup, wait.m_rawDir, *wait.m_surface, wait.m_wound, hit, wait.m_duvdx, wait.m_duvdy);
 	}
 }
 
@@ -3410,24 +4189,37 @@ inline void reached(RTCIntersectArguments* args, float t)
 		ctx->m_farthest = t;
 }
 
-// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
-// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss.
-bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
-			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0)
+// A camera's ray through the frame position (ndcX, ndcY): its unit and raw direction, how far along it the near plane
+// lies and how much further the far plane; false when the near and far points coincide.
+// A column's share of its rays' near and far plane points, basis[0] + basis[1] ndcX, the sum planePoint starts with.
+struct ColumnRay
 {
-	const Camera& cam = setup.m_cam;
-	const SwarmRaycastShading* shading = job.m_shading;
-	const bool filtered = job.m_filtered;
-	if (landed)
-		landed[0] = landed[1] = landed[2] = NAN;
+	double m_near[3];
+	double m_far[3];
+};
 
+inline void columnRay(const Camera& cam, double ndcX, ColumnRay& out)
+{
+	for (int i = 0; i < 3; i++)
+	{
+		out.m_near[i] = cam.m_near[0][i] + cam.m_near[1][i] * ndcX;
+		out.m_far[i] = cam.m_far[0][i] + cam.m_far[1][i] * ndcX;
+	}
+}
+
+// pixelRay from a column's share: planePoint adds left to right, so finishing its sum here gives the same points.
+inline bool pixelRayInColumn(const Camera& cam, const ColumnRay& column, double ndcY, float dir[3], float rawDir[3], float& tNear,
+							 float& length)
+{
 	float nearPoint[3], farPoint[3];
-	planePoint(cam.m_near, ndcX, ndcY, nearPoint);
-	planePoint(cam.m_far, ndcX, ndcY, farPoint);
-	float dir[3], rawDir[3];
+	for (int i = 0; i < 3; i++)
+	{
+		nearPoint[i] = (float)(column.m_near[i] + cam.m_near[2][i] * ndcY);
+		farPoint[i] = (float)(column.m_far[i] + cam.m_far[2][i] * ndcY);
+	}
 	for (int i = 0; i < 3; i++)
 		dir[i] = rawDir[i] = farPoint[i] - nearPoint[i];
-	const float length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+	length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
 	if (!(length > 0.0f))
 		return false;
 	const float invLength = 1.0f / length;
@@ -3437,7 +4229,219 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		dir[i] *= invLength;
 		toNear[i] = nearPoint[i] - cam.m_origin[i];
 	}
-	const float tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+	tNear = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+	return true;
+}
+
+bool pixelRay(const Camera& cam, double ndcX, double ndcY, float dir[3], float rawDir[3], float& tNear, float& length)
+{
+	ColumnRay column;
+	columnRay(cam, ndcX, column);
+	return pixelRayInColumn(cam, column, ndcY, dir, rawDir, tNear, length);
+}
+
+// What is already known of a ray's first hit: nothing, so it is searched with an along-ray depth hint; a hit to shade as
+// it stands; a miss; or the few forest trees a nearer hit can only be in.
+enum FoundKind
+{
+	kFoundSearch,
+	kFoundHit,
+	kFoundMiss,
+	kFoundTrees
+};
+
+// For kFoundTrees: the painted hit, when there is one, and the forest trees the ray enters before it, which are the
+// only places a nearer hit can be.
+struct FoundHit
+{
+	FoundKind m_kind;
+	float m_reach;
+	bool m_painted;
+	float m_t;
+	RTCHit m_hit;
+	const TreeCandidate* m_trees;
+	int m_numTrees;
+	// The sample's camera ray as painting worked it out, so it is not worked out again: false when there is none.
+	bool m_ray;
+	const float* m_dir;
+	const float* m_rawDir;
+	float m_tNear;
+	float m_length;
+};
+
+// Every triangle a tile's rays landed on and what resolving it gave, so each is resolved once per tile and the tile's
+// waiting hits point at it instead of carrying a copy. A tile resolves at most one triangle per sample.
+struct SurfaceMemo
+{
+	struct Entry
+	{
+		unsigned m_key[5];
+		bool m_known;
+		int m_segmentation;
+		HitSurface m_surface;
+		float m_woundNormal[3];
+	};
+	static const int kSlots = 512;
+	Entry m_entries[kTileSize * kTileSize];
+	short m_slot[kSlots];
+	int m_count;
+	int m_last;
+	// The painted triangle m_last was found for, when the last finding came from paintedHit; null otherwise.
+	const void* m_lastTri;
+
+	// Empty, for a new tile.
+	void clear()
+	{
+		m_count = 0;
+		m_last = 0;
+		m_lastTri = 0;
+		memset(m_slot, 0, sizeof(m_slot));
+	}
+
+	// The entry for this triangle, made empty for the caller to fill when the tile has not met it; `added` says which.
+	Entry& find(const unsigned key[5], bool& added)
+	{
+		added = false;
+		m_lastTri = 0;
+		if (m_count && memcmp(m_entries[m_last].m_key, key, sizeof(m_entries[0].m_key)) == 0)
+			return m_entries[m_last];
+		const unsigned mix = (key[0] * 0x9E3779B1u) ^ (key[1] * 0x85EBCA77u) ^ (key[2] * 0xC2B2AE3Du) ^ (key[3] * 0x27D4EB2Fu) ^ (key[4] * 0x165667B1u);
+		for (unsigned slot = mix >> 23;; slot = (slot + 1) & (kSlots - 1))
+		{
+			const int at = m_slot[slot] - 1;
+			if (at < 0)
+			{
+				m_last = m_count++;
+				m_slot[slot] = (short)(m_last + 1);
+				memcpy(m_entries[m_last].m_key, key, sizeof(m_entries[0].m_key));
+				added = true;
+				return m_entries[m_last];
+			}
+			if (memcmp(m_entries[at].m_key, key, sizeof(m_entries[0].m_key)) == 0)
+			{
+				m_last = at;
+				return m_entries[at];
+			}
+		}
+	}
+};
+
+// Nearer entry first, then the lesser batch and placement, so the order never depends on the order the trees were filed.
+inline bool enteredBefore(const TreeCandidate& a, const TreeCandidate& b)
+{
+	if (a.m_enter != b.m_enter)
+		return a.m_enter < b.m_enter;
+	return a.m_batch != b.m_batch ? a.m_batch < b.m_batch : a.m_placement < b.m_placement;
+}
+
+// The first hit of a ray that can only meet something nearer than its painted hit inside a few forest trees: each
+// tree's mesh is searched in the tree's own frame, nearest box first, until the next box starts past the nearest hit.
+// The hit then names the forest, the batch and the placement, as a hit found through the forest's instances does.
+void treesHit(const TileJob& job, RTCRayHit& rayhit, const FoundHit& found, RTCIntersectArguments* args)
+{
+	TreeCandidate order[kTreeCandidates];
+	for (int i = 0; i < found.m_numTrees; i++)
+	{
+		int j = i;
+		while (j > 0 && enteredBefore(found.m_trees[i], order[j - 1]))
+		{
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = found.m_trees[i];
+	}
+	QueryContext* ctx = (QueryContext*)args->context;
+	float nearest = found.m_painted ? found.m_t : rayhit.ray.tfar;
+	bool inTree = false;
+	for (int i = 0; i < found.m_numTrees && order[i].m_enter <= nearest; i++)
+	{
+		const Batch* batch = order[i].m_batch < job.m_batches->size() ? (*job.m_batches)[order[i].m_batch] : 0;
+		if (!batch)
+			continue;
+		// The inverse of the placement's 3x3 part is the transpose of the inverse transpose the batch keeps for normals.
+		const float* inverse = &batch->m_normalRotations[(size_t)order[i].m_placement * 9];
+		const float* placement = &batch->m_transforms[(size_t)order[i].m_placement * 12];
+		const float org[3] = {rayhit.ray.org_x - placement[9], rayhit.ray.org_y - placement[10], rayhit.ray.org_z - placement[11]};
+		const float dir[3] = {rayhit.ray.dir_x, rayhit.ray.dir_y, rayhit.ray.dir_z};
+		float localOrg[3], localDir[3];
+		for (int r = 0; r < 3; r++)
+		{
+			localOrg[r] = (inverse[r] * org[0] + inverse[3 + r] * org[1]) + inverse[6 + r] * org[2];
+			localDir[r] = (inverse[r] * dir[0] + inverse[3 + r] * dir[1]) + inverse[6 + r] * dir[2];
+		}
+		RTCRayHit local;
+		local.ray.org_x = localOrg[0];
+		local.ray.org_y = localOrg[1];
+		local.ray.org_z = localOrg[2];
+		local.ray.dir_x = localDir[0];
+		local.ray.dir_y = localDir[1];
+		local.ray.dir_z = localDir[2];
+		local.ray.tnear = rayhit.ray.tnear;
+		local.ray.tfar = nearest;
+		local.ray.time = 0.0f;
+		local.ray.mask = (unsigned)-1;
+		local.ray.id = 0;
+		local.ray.flags = 0;
+		local.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+		local.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+		ctx->m_directBatch = batch;
+		ctx->m_directPlacement = order[i].m_placement;
+		rtcIntersect1(batch->m_tree->m_scene, &local, args);
+		ctx->m_directBatch = 0;
+		if (local.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+			continue;
+		nearest = local.ray.tfar;
+		inTree = true;
+		rayhit.hit = local.hit;
+		for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+		{
+			rayhit.hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+			rayhit.hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+		}
+		rayhit.hit.instID[0] = job.m_forestId;
+		rayhit.hit.instPrimID[0] = 0;
+		rayhit.hit.instID[1] = order[i].m_batch;
+		rayhit.hit.instPrimID[1] = order[i].m_placement;
+	}
+	if (inTree)
+		rayhit.ray.tfar = nearest;
+	else if (found.m_painted)
+	{
+		rayhit.ray.tfar = found.m_t;
+		rayhit.hit = found.m_hit;
+	}
+}
+
+// One ray of a camera through the frame position (ndcX, ndcY). False on a miss; a hit fills `out`.
+// `reach` is the ray's depth hint, and `landed`, when given, takes its hit point or NaN on a miss. `found`, when given,
+// replaces the search for the first hit: shaded as it stands, a miss, or searched with its own along-ray reach.
+bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double ndcY,
+			  RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs, Sample& out, float reach = INFINITY, float* landed = 0,
+			  const FoundHit* found = 0, SurfaceMemo* memo = 0, bool deferColour = false)
+{
+	const Camera& cam = setup.m_cam;
+	const SwarmRaycastShading* shading = job.m_shading;
+	const bool filtered = job.m_filtered;
+	out.m_deferred = false;
+	out.m_shadeDeferred = false;
+	if (landed)
+		landed[0] = landed[1] = landed[2] = NAN;
+
+	float dir[3], rawDir[3], tNear, length;
+	if (found)
+	{
+		if (!found->m_ray)
+			return false;
+		for (int i = 0; i < 3; i++)
+		{
+			dir[i] = found->m_dir[i];
+			rawDir[i] = found->m_rawDir[i];
+		}
+		tNear = found->m_tNear;
+		length = found->m_length;
+	}
+	else if (!pixelRay(cam, ndcX, ndcY, dir, rawDir, tNear, length))
+		return false;
 	// The sky along the ray, only for a ray that ends on it: a miss, an unknown body, or what a thermal veil leaves.
 	const bool thermalSky = shading && shading->m_thermal;
 
@@ -3459,7 +4463,15 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 	// Along this ray the hint lies at its depth over the ray's share of the camera's axis.
 	const float facing = -dot3(cam.m_viewRow2, dir);
-	firstHit(job.m_top, rayhit, facing > 0.0f ? reach / facing : INFINITY, args);
+	if (found && found->m_kind == kFoundHit)
+	{
+		rayhit.ray.tfar = found->m_t;
+		rayhit.hit = found->m_hit;
+	}
+	else if (found && found->m_kind == kFoundTrees)
+		treesHit(job, rayhit, *found, args);
+	else if (!found || found->m_kind == kFoundSearch)
+		firstHit(job.m_top, rayhit, found ? found->m_reach : (facing > 0.0f ? reach / facing : INFINITY), args);
 	reached(args, rayhit.ray.tfar);
 	if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
 	{
@@ -3483,14 +4495,55 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	out.m_inverseEyeDepth = 1.0f / zEye;
 
 	int segmentation = -1;
-	HitSurface surface;
-	const bool known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, shading ? &surface : 0);
+	HitSurface ownSurface;
+	float ownWound[3];
+	HitSurface* surfaceSlot = &ownSurface;
+	float* woundNormal = ownWound;
+	bool known;
+	const unsigned key[5] = {rayhit.hit.instID[0], rayhit.hit.geomID, rayhit.hit.primID, rayhit.hit.instID[1], rayhit.hit.instPrimID[1]};
+	bool resolve = true;
+	SurfaceMemo::Entry* entry = 0;
+	if (memo && shading)
+	{
+		entry = &memo->find(key, resolve);
+		surfaceSlot = &entry->m_surface;
+		woundNormal = entry->m_woundNormal;
+	}
+	HitSurface& surface = *surfaceSlot;
+	if (!resolve)
+	{
+		known = entry->m_known;
+		segmentation = entry->m_segmentation;
+	}
+	else
+	{
+		known = resolveHit(rayhit.hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, shading ? &surface : 0);
+		// The triangle's own normal, kept as wound for the barycentric solve.
+		if (shading && known)
+		{
+			float e1[3], e2[3];
+			for (int i = 0; i < 3; i++)
+			{
+				e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+				e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+			}
+			cross3(e1, e2, woundNormal);
+		}
+		if (entry)
+		{
+			entry->m_known = known;
+			entry->m_segmentation = segmentation;
+		}
+	}
 	out.m_segmentation = segmentation;
 	out.m_hit.m_inst = rayhit.hit.instID[0];
 	out.m_hit.m_geom = rayhit.hit.geomID;
 	out.m_hit.m_prim = rayhit.hit.primID;
 	out.m_hit.m_inst1 = rayhit.hit.instID[1];
 	out.m_hit.m_instPrim1 = rayhit.hit.instPrimID[1];
+	// A painted frame mixes painted and searched hits, so outside the forest neither names a second instance level.
+	if (job.m_raster && rayhit.hit.instID[0] != job.m_forestId)
+		out.m_hit.m_inst1 = out.m_hit.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
 	out.m_shaded = shading && known;
 	if (!out.m_shaded)
 	{
@@ -3499,28 +4552,30 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		return true;
 	}
 
-	// The triangle's own normal, kept as wound for the barycentric solve, and a copy turned
-	// towards the camera for shading and for the side the shadow ray leaves from.
-	float woundNormal[3], faceNormal[3], e1[3], e2[3];
-	for (int i = 0; i < 3; i++)
-	{
-		e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
-		e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
-	}
-	cross3(e1, e2, woundNormal);
+	// The wound normal turned towards the camera for shading and for the side the shadow ray leaves from.
+	float faceNormal[3];
 	const bool awayFromCamera = dot3(woundNormal, dir) > 0.0f;
 	for (int i = 0; i < 3; i++)
 		faceNormal[i] = awayFromCamera ? -woundNormal[i] : woundNormal[i];
 
+	// A daylight hit whose shading waits for its tile leaves its shadow-map lookup to the tile's batch too, unless a step
+	// before the wait reads the shadow: a cut-out that may be a veil, or a pane the ray passes through.
+	// A waiting hit points at its triangle in the tile's memo, so only a hit with one may wait.
+	const bool waitable = deferColour && memo && !shading->m_thermal && !(shading->m_daylight && filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) &&
+						  !(shading->m_daylight && surface.m_glass && !surface.m_glassBacked);
+	const bool shadowLater = waitable && shading->m_shadow && job.m_shadowMap;
 	float shadow = 1.0f;
-	if (shading->m_shadow && !shading->m_thermal)
+	if (shading->m_shadow && !shading->m_thermal && !shadowLater)
 	{
 		const float point[3] = {hx, hy, hz};
 		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
 	}
 
+	// A hit whose shading waits for its tile leaves its footprint to be worked out with the tile's others, unless a step
+	// before the wait reads it: a thermal frame, a cut-out that may be a veil, or a pane the ray passes through.
+	const bool footprintLater = waitable && filtered;
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
-	if (filtered)
+	if (filtered && !footprintLater)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
 
 	if (shading->m_thermal)
@@ -3629,7 +4684,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 			}
 			for (int i = 0; i < 3; i++)
 				lit[i] = coverage * lit[i] + (1.0f - coverage) * behind[i];
-			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			daylightOut(*shading, lit, dir, t, out, deferColour);
 			return true;
 		}
 	}
@@ -3645,24 +4700,17 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		float paneDuvdx[2] = {duvdx[0], duvdx[1]}, paneDuvdy[2] = {duvdy[0], duvdy[1]};
 		if (surface.m_glassBacked)
 		{
-			// A module: its backsheet in the pane's colour, lit and shadowed as the pane, stands in for a ray behind it.
-			float normal[3], base[3], sky[3], skyLight[3];
-			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
-			const float through = paneLight(*shading, normal, dir, sky);
-			if (shading->m_sky)
-				shading->m_sky->irradiance(normal, skyLight);
-			else
-				for (int i = 0; i < 3; i++)
-					skyLight[i] = shading->m_ambientColor[i];
-			const float nDotL = dot3(normal, shading->m_lightDir);
-			const float direct = nDotL > 0.0f ? nDotL : 0.0f;
-			const TinyRender::Vec4f& rgba = surface.m_model->getColorRGBA();
-			for (int i = 0; i < 3; i++)
+			if (deferColour && memo)
 			{
-				const float backing = kSwarmSrgbToLinear[(unsigned char)(kPaneBacking * rgba[i])];
-				lit[i] = (1.0f - through) * sky[i] + through * base[i] * backing * (shading->m_ambientCoeff * skyLight[i] + shadow * shading->m_diffuseCoeff * direct * shading->m_lightColor[i]);
+				const float point[3] = {hx, hy, hz};
+				waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, ShadeWait::kModule, point, footprintLater, rawDir,
+							woundNormal, shadowLater);
+				return true;
 			}
-			daylightWrite(*shading, lit, dir, t, out.m_rgb);
+			float normal[3], base[3];
+			surfaceAt(surface, rayhit.hit, faceNormal, filtered, duvdx, duvdy, normal, base);
+			moduleLight(*shading, surface, normal, base, dir, shadow, lit);
+			daylightOut(*shading, lit, dir, t, out, false);
 			return true;
 		}
 		for (int depth = 0; depth < kPaneDepth; depth++)
@@ -3731,11 +4779,18 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				lit[i] += weight[i] * behind[i];
 			break;
 		}
-		daylightWrite(*shading, lit, dir, t, out.m_rgb);
+		daylightOut(*shading, lit, dir, t, out, deferColour);
 		return true;
 	}
 
 	const float point[3] = {hx, hy, hz};
+	if (deferColour && memo)
+	{
+		// The shading is left for the tile, which reads the textures of its samples together.
+		waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, shadow, t, shading->m_daylight ? ShadeWait::kDaylight : ShadeWait::kFragment,
+					point, footprintLater, rawDir, woundNormal, shadowLater);
+		return true;
+	}
 	shadeHit(*shading, surface, rayhit.hit, faceNormal, dir, shadow, filtered, duvdx, duvdy, t, point, out.m_rgb);
 	return true;
 }
@@ -3759,6 +4814,1286 @@ inline float inverseEyeDepth(const Camera& cam, float depth)
 	return 1.0f / (-(depth + cam.m_p23) / cam.m_p22);
 }
 
+// ER_SWARM_RASTER. The frame a lone camera paints: its projection in double, the six planes of its view, the eye, the
+// frame size and tile grid, and the static tree's instance id a painted static hit carries.
+struct RasterView
+{
+	double m_viewProj[4][4];
+	double m_planes[6][4];
+	float m_origin[3];
+	int m_width;
+	int m_height;
+	int m_tilesX;
+	unsigned m_staticId;
+};
+
+// What the tiles read of a painted frame: every thread's lane, and the footprint angle the cut-out test reads at.
+struct RasterFrame
+{
+	const std::vector<RasterLane>* m_lanes;
+	int m_tilesX;
+	float m_spread;
+};
+
+// Sub-pixel steps of the fixed-point frame; how many frame half-widths a triangle may reach past the frame before it is
+// clipped; and how many triangles per sample of its screen box make a chunk cheaper to search than to paint.
+const int kSubPixel = 256;
+const double kGuardBand = 16.0;
+const float kDenseTriangles = 4.0f;
+// Sign of Embree's geometric normal against the cross product of a triangle's edges from its first corner.
+const float kEmbreeNormalSign = 1.0f;
+
+// The view's planes from projection times view, each a combination of its rows that is positive inside.
+void setupRasterView(const Camera& cam, int width, int height, unsigned staticId, RasterView& view)
+{
+	memcpy(view.m_viewProj, cam.m_viewProj, sizeof(view.m_viewProj));
+	const double(*m)[4] = cam.m_viewProj;
+	for (int c = 0; c < 4; c++)
+	{
+		view.m_planes[0][c] = m[3][c] + m[0][c];
+		view.m_planes[1][c] = m[3][c] - m[0][c];
+		view.m_planes[2][c] = m[3][c] + m[1][c];
+		view.m_planes[3][c] = m[3][c] - m[1][c];
+		view.m_planes[4][c] = m[3][c] + m[2][c];
+		view.m_planes[5][c] = m[3][c] - m[2][c];
+	}
+	for (int i = 0; i < 3; i++)
+		view.m_origin[i] = cam.m_origin[i];
+	view.m_width = width;
+	view.m_height = height;
+	view.m_tilesX = (width + kTileSize - 1) / kTileSize;
+	view.m_staticId = staticId;
+}
+
+// False only when the box lies wholly outside one plane of the view; a NaN box counts as seen.
+bool boxVisible(const RasterView& view, const float lo[3], const float hi[3])
+{
+	for (int k = 0; k < 6; k++)
+	{
+		const double* p = view.m_planes[k];
+		const double d = p[0] * (p[0] >= 0.0 ? hi[0] : lo[0]) + p[1] * (p[1] >= 0.0 ? hi[1] : lo[1]) + p[2] * (p[2] >= 0.0 ? hi[2] : lo[2]) + p[3];
+		if (d < 0.0)
+			return false;
+	}
+	return true;
+}
+
+// The box around a mesh box carried by a column-major transform, a hair wider for the rounding of its corners.
+void worldBox(const float m[16], const float lo[3], const float hi[3], float outLo[3], float outHi[3])
+{
+	for (int i = 0; i < 3; i++)
+	{
+		outLo[i] = INFINITY;
+		outHi[i] = -INFINITY;
+	}
+	for (int k = 0; k < 8; k++)
+	{
+		const float corner[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+		float world[3];
+		transformPoint(m, corner, world);
+		for (int i = 0; i < 3; i++)
+		{
+			outLo[i] = world[i] < outLo[i] ? world[i] : outLo[i];
+			outHi[i] = world[i] > outHi[i] ? world[i] : outHi[i];
+		}
+	}
+	for (int i = 0; i < 3; i++)
+	{
+		const float margin = 1e-4f + 1e-6f * (fabsf(outLo[i]) + fabsf(outHi[i]));
+		outLo[i] -= margin;
+		outHi[i] += margin;
+	}
+}
+
+// The samples a box may cover, one more each side, or the whole frame when a corner lies at or behind the eye.
+bool boxRect(const RasterView& view, const float lo[3], const float hi[3], RayRect& rect)
+{
+	double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+	bool whole = false;
+	for (int k = 0; k < 8 && !whole; k++)
+	{
+		const double c[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+		double clip[4];
+		for (int r = 0; r < 4; r++)
+			clip[r] = view.m_viewProj[r][0] * c[0] + view.m_viewProj[r][1] * c[1] + view.m_viewProj[r][2] * c[2] + view.m_viewProj[r][3];
+		const double x = (clip[0] / clip[3] + 1.0) * 0.5 * view.m_width;
+		const double y = (1.0 - clip[1] / clip[3]) * 0.5 * view.m_height - 1.0;
+		if (!(clip[3] > 1e-6) || !(x == x) || !(y == y))
+		{
+			whole = true;
+			break;
+		}
+		x0 = x < x0 ? x : x0;
+		x1 = x > x1 ? x : x1;
+		y0 = y < y0 ? y : y0;
+		y1 = y > y1 ? y : y1;
+	}
+	if (whole)
+	{
+		rect.m_col0 = rect.m_row0 = 0;
+		rect.m_col1 = view.m_width - 1;
+		rect.m_row1 = view.m_height - 1;
+		return true;
+	}
+	// Held to the frame before the conversion, so a corner just in front of the eye cannot overflow an int.
+	const double right = view.m_width + 1.0, bottom = view.m_height + 1.0;
+	x0 = x0 < -2.0 ? -2.0 : (x0 > right ? right : x0);
+	x1 = x1 < -2.0 ? -2.0 : (x1 > right ? right : x1);
+	y0 = y0 < -2.0 ? -2.0 : (y0 > bottom ? bottom : y0);
+	y1 = y1 < -2.0 ? -2.0 : (y1 > bottom ? bottom : y1);
+	rect.m_col0 = (int)floor(x0) - 1;
+	rect.m_col1 = (int)ceil(x1) + 1;
+	rect.m_row0 = (int)floor(y0) - 1;
+	rect.m_row1 = (int)ceil(y1) + 1;
+	rect.m_col0 = rect.m_col0 < 0 ? 0 : rect.m_col0;
+	rect.m_row0 = rect.m_row0 < 0 ? 0 : rect.m_row0;
+	rect.m_col1 = rect.m_col1 >= view.m_width ? view.m_width - 1 : rect.m_col1;
+	rect.m_row1 = rect.m_row1 >= view.m_height ? view.m_height - 1 : rect.m_row1;
+	return rect.m_col0 <= rect.m_col1 && rect.m_row0 <= rect.m_row1;
+}
+
+// The least distance from the eye to the box, a hair short, so no ray's rounded distance into the box falls under it.
+float boxDistance(const float origin[3], const float lo[3], const float hi[3])
+{
+	float sum = 0.0f;
+	for (int i = 0; i < 3; i++)
+	{
+		const float below = lo[i] - origin[i], above = origin[i] - hi[i];
+		const float gap = below > above ? below : above;
+		sum += gap > 0.0f ? gap * gap : 0.0f;
+	}
+	return sqrtf(sum) * (1.0f - 1e-5f) - 1e-4f;
+}
+
+// Files an item under every tile its samples reach.
+void binInto(RasterLane& lane, const RasterView& view, int col0, int col1, int row0, int row1, unsigned index)
+{
+	for (int ty = row0 / kTileSize; ty <= row1 / kTileSize; ty++)
+		for (int tx = col0 / kTileSize; tx <= col1 / kTileSize; tx++)
+			lane.m_bins[(size_t)ty * view.m_tilesX + tx].push_back(index);
+}
+
+// Keeps a ray rect in the lane and files it under its tiles.
+void addRayRect(RasterLane& lane, const RasterView& view, const RayRect& rect)
+{
+	binInto(lane, view, rect.m_col0, rect.m_col1, rect.m_row0, rect.m_row1, (unsigned)lane.m_rects.size() | kRectBit);
+	lane.m_rects.push_back(rect);
+}
+
+struct ClipVertex
+{
+	double m_p[4];
+};
+
+// How far inside a plane a clip-space point lies: the near plane, then the four sides of the guard band.
+inline double guardDistance(const ClipVertex& v, int plane)
+{
+	switch (plane)
+	{
+		case 0:
+			return v.m_p[2] + v.m_p[3];
+		case 1:
+			return kGuardBand * v.m_p[3] - v.m_p[0];
+		case 2:
+			return kGuardBand * v.m_p[3] + v.m_p[0];
+		case 3:
+			return kGuardBand * v.m_p[3] - v.m_p[1];
+		default:
+			return kGuardBand * v.m_p[3] + v.m_p[1];
+	}
+}
+
+inline bool clipBefore(const ClipVertex& a, const ClipVertex& b)
+{
+	for (int k = 0; k < 4; k++)
+		if (a.m_p[k] != b.m_p[k])
+			return a.m_p[k] < b.m_p[k];
+	return false;
+}
+
+// Keeps the part of a polygon inside one plane. A cut edge is interpolated from its lesser end, so an edge two triangles
+// share is cut at the same point by both and the painted surface keeps no crack along it.
+int clipPolygon(const ClipVertex* in, int n, int plane, ClipVertex* out)
+{
+	int kept = 0;
+	for (int i = 0; i < n; i++)
+	{
+		const ClipVertex& p = in[i];
+		const ClipVertex& q = in[(i + 1) % n];
+		const double dp = guardDistance(p, plane), dq = guardDistance(q, plane);
+		if (dp >= 0.0)
+			out[kept++] = p;
+		if ((dp >= 0.0) != (dq >= 0.0))
+		{
+			const bool flip = clipBefore(q, p);
+			const ClipVertex& a = flip ? q : p;
+			const ClipVertex& b = flip ? p : q;
+			const double da = flip ? dq : dp, db = flip ? dp : dq;
+			const double t = da / (da - db);
+			for (int k = 0; k < 4; k++)
+				out[kept].m_p[k] = a.m_p[k] + (b.m_p[k] - a.m_p[k]) * t;
+			kept++;
+		}
+	}
+	return kept;
+}
+
+inline long long floorDiv(long long a, long long b)
+{
+	return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+// Puts one clipped piece of a triangle on the frame in fixed point; a piece with no area or no sample adds nothing.
+void addScreenTriangle(RasterLane& lane, const RasterView& view, const ClipVertex* const corners[3], const RasterTri& world)
+{
+	long long x[3], y[3];
+	for (int j = 0; j < 3; j++)
+	{
+		const double* p = corners[j]->m_p;
+		x[j] = (long long)floor((p[0] / p[3] + 1.0) * 0.5 * view.m_width * kSubPixel + 0.5);
+		y[j] = (long long)floor(((1.0 - p[1] / p[3]) * 0.5 * view.m_height - 1.0) * kSubPixel + 0.5);
+	}
+	const long long area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+	if (area == 0)
+		return;
+	if (area < 0)
+	{
+		std::swap(x[1], x[2]);
+		std::swap(y[1], y[2]);
+	}
+	const long long minX = std::min(x[0], std::min(x[1], x[2])), maxX = std::max(x[0], std::max(x[1], x[2]));
+	const long long minY = std::min(y[0], std::min(y[1], y[2])), maxY = std::max(y[0], std::max(y[1], y[2]));
+	const int col0 = (int)std::max(-floorDiv(-minX, kSubPixel), 0LL);
+	const int col1 = (int)std::min(floorDiv(maxX, kSubPixel), (long long)view.m_width - 1);
+	const int row0 = (int)std::max(-floorDiv(-minY, kSubPixel), 0LL);
+	const int row1 = (int)std::min(floorDiv(maxY, kSubPixel), (long long)view.m_height - 1);
+	if (col0 > col1 || row0 > row1)
+		return;
+	RasterTri tri = world;
+	for (int i = 0; i < 3; i++)
+	{
+		const int k = (i + 1) % 3;
+		const long long dx = x[k] - x[i], dy = y[k] - y[i];
+		// A sample exactly on an edge belongs to the one triangle of the two sharing it that owns the edge.
+		const bool owns = dy > 0 || (dy == 0 && dx < 0);
+		tri.m_edge[i] = dy * x[i] - dx * y[i] - (owns ? 0 : 1);
+		tri.m_stepX[i] = -dy * kSubPixel;
+		tri.m_stepY[i] = dx * kSubPixel;
+	}
+	// A triangle whose box holds a few samples and covers none of them, by the edge test paintTile makes, paints nothing.
+	if ((long long)(col1 - col0 + 1) * (row1 - row0 + 1) <= 4)
+	{
+		bool covers = false;
+		for (int row = row0; row <= row1 && !covers; row++)
+			for (int col = col0; col <= col1 && !covers; col++)
+			{
+				const long long e0 = tri.m_edge[0] + tri.m_stepX[0] * col + tri.m_stepY[0] * row;
+				const long long e1 = tri.m_edge[1] + tri.m_stepX[1] * col + tri.m_stepY[1] * row;
+				const long long e2 = tri.m_edge[2] + tri.m_stepX[2] * col + tri.m_stepY[2] * row;
+				covers = (e0 | e1 | e2) >= 0;
+			}
+		if (!covers)
+			return;
+	}
+	tri.m_col0 = col0;
+	tri.m_col1 = col1;
+	tri.m_row0 = row0;
+	tri.m_row1 = row1;
+	binInto(lane, view, col0, col1, row0, row1, (unsigned)lane.m_tris.size());
+	lane.m_tris.push_back(tri);
+}
+
+// Puts one world triangle on the frame: dropped when single-sided and turned away from the eye, as the camera ray's
+// filter drops it, or when wholly outside one side of the view; clipped to the near plane and the guard band otherwise.
+void paintTriangle(RasterLane& lane, const RasterView& view, const float c[3][3], bool doubleSided, unsigned inst, unsigned geom,
+				   unsigned prim, const RasterSource* source)
+{
+	float e1[3], e2[3], toEye[3], normal[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = c[1][i] - c[0][i];
+		e2[i] = c[2][i] - c[0][i];
+		toEye[i] = view.m_origin[i] - c[0][i];
+	}
+	cross3(e1, e2, normal);
+	// Every camera ray onto the plane meets the normal at the sign it has against the first corner seen from the eye.
+	if (!doubleSided && -kEmbreeNormalSign * dot3(normal, toEye) >= 0.0f)
+		return;
+	ClipVertex v[3];
+	for (int j = 0; j < 3; j++)
+		for (int r = 0; r < 4; r++)
+			v[j].m_p[r] = view.m_viewProj[r][0] * c[j][0] + view.m_viewProj[r][1] * c[j][1] + view.m_viewProj[r][2] * c[j][2] + view.m_viewProj[r][3];
+	for (int axis = 0; axis < 3; axis++)
+		for (int side = -1; side <= 1; side += 2)
+		{
+			bool out = true;
+			for (int j = 0; j < 3 && out; j++)
+				out = !(v[j].m_p[3] + side * v[j].m_p[axis] >= 0.0);
+			if (out)
+				return;
+		}
+	// The Moller-Trumbore solve with the eye as every ray's origin: its determinant and the barycentric and distance
+	// numerators are each a constant vector dotted with the ray's direction.
+	RasterTri world;
+	cross3(e2, e1, world.m_det);
+	cross3(e2, toEye, world.m_u);
+	cross3(toEye, e1, world.m_v);
+	world.m_t = dot3(e2, world.m_v);
+	world.m_inst = inst;
+	world.m_geom = geom;
+	world.m_prim = prim;
+	world.m_key = ((unsigned long long)inst << 48) ^ ((unsigned long long)geom << 32) ^ prim;
+	world.m_source = source;
+	bool inside = true;
+	for (int plane = 0; plane < 5 && inside; plane++)
+		for (int j = 0; j < 3 && inside; j++)
+			inside = guardDistance(v[j], plane) >= 0.0;
+	if (inside)
+	{
+		const ClipVertex* const corners[3] = {&v[0], &v[1], &v[2]};
+		addScreenTriangle(lane, view, corners, world);
+		return;
+	}
+	ClipVertex polygon[2][10];
+	int n = 3;
+	for (int j = 0; j < 3; j++)
+		polygon[0][j] = v[j];
+	int current = 0;
+	for (int plane = 0; plane < 5 && n >= 3; plane++)
+	{
+		n = clipPolygon(polygon[current], n, plane, polygon[1 - current]);
+		current = 1 - current;
+	}
+	for (int j = 1; j + 1 < n; j++)
+	{
+		const ClipVertex* const corners[3] = {&polygon[current][0], &polygon[current][j], &polygon[current][j + 1]};
+		addScreenTriangle(lane, view, corners, world);
+	}
+}
+
+// Paints one chunk; one with more triangles than its screen box has samples to spare leaves its box to rays instead.
+void paintJob(RasterLane& lane, const RasterView& view, const RasterJob& job)
+{
+	const RasterChunk& chunk = *job.m_chunk;
+	const Instance* inst = job.m_instance;
+	float lo[3], hi[3];
+	if (inst)
+		worldBox(inst->m_transform, chunk.m_lo, chunk.m_hi, lo, hi);
+	else
+		for (int i = 0; i < 3; i++)
+		{
+			lo[i] = chunk.m_lo[i];
+			hi[i] = chunk.m_hi[i];
+		}
+	RayRect rect;
+	if (!boxVisible(view, lo, hi) || !boxRect(view, lo, hi, rect))
+		return;
+	const float samples = (float)(rect.m_col1 - rect.m_col0 + 1) * (float)(rect.m_row1 - rect.m_row0 + 1);
+	if ((float)chunk.m_count > kDenseTriangles * samples)
+	{
+		rect.m_distance = boxDistance(view.m_origin, lo, hi);
+		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
+		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		rect.m_batch = kNoTree;
+		rect.m_placement = 0;
+		addRayRect(lane, view, rect);
+		return;
+	}
+	const float* vertices = inst ? &inst->m_tree->m_vertices[0] : &job.m_member->m_vertices[0];
+	const unsigned* indices = inst ? &inst->m_tree->m_indices[0] : &job.m_member->m_indices[0];
+	const bool doubleSided = inst ? inst->m_doubleSided : job.m_member->m_doubleSided;
+	const unsigned instId = inst ? inst->m_geomId : view.m_staticId;
+	const unsigned geomId = inst ? 0u : job.m_member->m_geomId;
+	for (unsigned t = chunk.m_first; t < chunk.m_first + chunk.m_count; t++)
+	{
+		// Corners land on the floats resolveHit gives the same triangle, so painting and shading agree on where it is.
+		float c[3][3];
+		for (int j = 0; j < 3; j++)
+		{
+			const float* p = vertices + (size_t)indices[(size_t)t * 3 + j] * 3;
+			if (inst)
+				transformPoint(inst->m_transform, p, c[j]);
+			else
+				for (int i = 0; i < 3; i++)
+					c[j][i] = p[i];
+		}
+		paintTriangle(lane, view, c, doubleSided, instId, geomId, t, job.m_source);
+	}
+}
+
+// Leaves a ray rect for every enabled tree of a cell in view.
+void paintForestCell(RasterLane& lane, const RasterView& view, const ForestGrid& grid, size_t cell, const std::vector<Batch*>& batches)
+{
+	if (!boxVisible(view, &grid.m_cellBoxes[cell * 6], &grid.m_cellBoxes[cell * 6 + 3]))
+		return;
+	for (unsigned k = grid.m_cellStart[cell]; k < grid.m_cellStart[cell + 1]; k++)
+	{
+		const Batch* batch = batches[grid.m_treeBatch[k]];
+		if (!batch || !batch->m_enabled)
+			continue;
+		const float* lo = &grid.m_treeBoxes[(size_t)k * 6];
+		const float* hi = lo + 3;
+		RayRect rect;
+		if (!boxVisible(view, lo, hi) || !boxRect(view, lo, hi, rect))
+			continue;
+		rect.m_distance = boxDistance(view.m_origin, lo, hi);
+		memcpy(rect.m_lo, lo, sizeof(rect.m_lo));
+		memcpy(rect.m_hi, hi, sizeof(rect.m_hi));
+		rect.m_batch = grid.m_treeBatch[k];
+		rect.m_placement = grid.m_treePlacement[k];
+		addRayRect(lane, view, rect);
+	}
+}
+
+// Files every tree of every batch under the square cell its box's centre falls in, with its world box a hair wider
+// than its mesh, and gives every cell the box around its trees.
+void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
+{
+	struct Tree
+	{
+		long long m_x;
+		long long m_y;
+		unsigned m_batch;
+		unsigned m_placement;
+		float m_box[6];
+		bool operator<(const Tree& other) const { return m_x != other.m_x ? m_x < other.m_x : m_y < other.m_y; }
+	};
+	std::vector<Tree> trees;
+	for (size_t b = 0; b < batches.size(); b++)
+	{
+		const Batch* batch = batches[b];
+		if (!batch)
+			continue;
+		const std::vector<float>& vertices = batch->m_tree->m_vertices;
+		float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+		for (size_t i = 0; i + kVertexPadding < vertices.size(); i += 3)
+			for (int k = 0; k < 3; k++)
+			{
+				lo[k] = vertices[i + k] < lo[k] ? vertices[i + k] : lo[k];
+				hi[k] = vertices[i + k] > hi[k] ? vertices[i + k] : hi[k];
+			}
+		if (!(lo[0] <= hi[0] && lo[1] <= hi[1] && lo[2] <= hi[2]))
+			continue;
+		for (size_t p = 0; (p + 1) * 12 <= batch->m_transforms.size(); p++)
+		{
+			const float* t = &batch->m_transforms[p * 12];
+			Tree tree;
+			tree.m_batch = (unsigned)b;
+			tree.m_placement = (unsigned)p;
+			for (int r = 0; r < 3; r++)
+			{
+				tree.m_box[r] = INFINITY;
+				tree.m_box[3 + r] = -INFINITY;
+			}
+			for (int k = 0; k < 8; k++)
+			{
+				const double c[3] = {k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1], k & 4 ? hi[2] : lo[2]};
+				for (int r = 0; r < 3; r++)
+				{
+					const float w = (float)((double)t[9 + r] + (double)t[r] * c[0] + (double)t[3 + r] * c[1] + (double)t[6 + r] * c[2]);
+					tree.m_box[r] = w < tree.m_box[r] ? w : tree.m_box[r];
+					tree.m_box[3 + r] = w > tree.m_box[3 + r] ? w : tree.m_box[3 + r];
+				}
+			}
+			for (int r = 0; r < 3; r++)
+			{
+				const float margin = 1e-3f + 1e-5f * (fabsf(tree.m_box[r]) + fabsf(tree.m_box[3 + r]));
+				tree.m_box[r] -= margin;
+				tree.m_box[3 + r] += margin;
+			}
+			const double midX = 0.5 * ((double)tree.m_box[0] + tree.m_box[3]), midY = 0.5 * ((double)tree.m_box[1] + tree.m_box[4]);
+			tree.m_x = fabs(midX) < 1e12 ? (long long)floor(midX / kForestCell) : 0;
+			tree.m_y = fabs(midY) < 1e12 ? (long long)floor(midY / kForestCell) : 0;
+			trees.push_back(tree);
+		}
+	}
+	// Cell order, trees of one cell in their filing order: a counting sort over the cells the trees span, which gives what
+	// a stable sort gives, or that sort itself when the span is too wide to count.
+	long long loX = 0, hiX = -1, loY = 0, hiY = -1;
+	for (size_t i = 0; i < trees.size(); i++)
+	{
+		loX = i == 0 || trees[i].m_x < loX ? trees[i].m_x : loX;
+		hiX = i == 0 || trees[i].m_x > hiX ? trees[i].m_x : hiX;
+		loY = i == 0 || trees[i].m_y < loY ? trees[i].m_y : loY;
+		hiY = i == 0 || trees[i].m_y > hiY ? trees[i].m_y : hiY;
+	}
+	const long long spanX = hiX - loX + 1, spanY = hiY - loY + 1;
+	if (!trees.empty() && spanX > 0 && spanY > 0 && spanX <= 4096 && spanY <= 4096 && spanX * spanY <= 4 * (long long)trees.size() + 65536)
+	{
+		std::vector<unsigned> start((size_t)(spanX * spanY) + 1, 0);
+		for (size_t i = 0; i < trees.size(); i++)
+			start[(size_t)((trees[i].m_x - loX) * spanY + (trees[i].m_y - loY)) + 1]++;
+		for (size_t c = 1; c < start.size(); c++)
+			start[c] += start[c - 1];
+		std::vector<Tree> sorted(trees.size());
+		for (size_t i = 0; i < trees.size(); i++)
+			sorted[start[(size_t)((trees[i].m_x - loX) * spanY + (trees[i].m_y - loY))]++] = trees[i];
+		trees.swap(sorted);
+	}
+	else
+		std::stable_sort(trees.begin(), trees.end());
+	grid.m_cellBoxes.clear();
+	grid.m_cellStart.clear();
+	grid.m_treeBoxes.resize(trees.size() * 6);
+	grid.m_treeBatch.resize(trees.size());
+	grid.m_treePlacement.resize(trees.size());
+	for (size_t i = 0; i < trees.size(); i++)
+	{
+		if (i == 0 || trees[i].m_x != trees[i - 1].m_x || trees[i].m_y != trees[i - 1].m_y)
+		{
+			grid.m_cellStart.push_back((unsigned)i);
+			for (int r = 0; r < 3; r++)
+				grid.m_cellBoxes.push_back(INFINITY);
+			for (int r = 0; r < 3; r++)
+				grid.m_cellBoxes.push_back(-INFINITY);
+		}
+		float* cell = &grid.m_cellBoxes[grid.m_cellBoxes.size() - 6];
+		for (int r = 0; r < 3; r++)
+		{
+			cell[r] = trees[i].m_box[r] < cell[r] ? trees[i].m_box[r] : cell[r];
+			cell[3 + r] = trees[i].m_box[3 + r] > cell[3 + r] ? trees[i].m_box[3 + r] : cell[3 + r];
+		}
+		memcpy(&grid.m_treeBoxes[i * 6], trees[i].m_box, sizeof(trees[i].m_box));
+		grid.m_treeBatch[i] = trees[i].m_batch;
+		grid.m_treePlacement[i] = trees[i].m_placement;
+	}
+	grid.m_cellStart.push_back((unsigned)trees.size());
+	grid.m_built = true;
+}
+
+// A tile's painted result per sample: the nearest painted hit, where on its triangle, and the least distance at which a
+// ray rect asks for a search.
+struct TilePaint
+{
+	float m_t[kTileSize * kTileSize];
+	float m_u[kTileSize * kTileSize];
+	float m_v[kTileSize * kTileSize];
+	// 1 / det of the painted hit's solve, which its u and v are worked out from once every triangle is in.
+	float m_inv[kTileSize * kTileSize];
+	const RasterTri* m_tri[kTileSize * kTileSize];
+	float m_rayNear[kTileSize * kTileSize];
+	// The forest trees each sample's ray enters before the painted hit, and whether only the full search will do: a
+	// dense chunk lies on the way, or more trees than kTreeCandidates.
+	TreeCandidate m_trees[kTileSize * kTileSize][kTreeCandidates];
+	int m_numTrees[kTileSize * kTileSize];
+	bool m_wide[kTileSize * kTileSize];
+	// Each sample's camera ray, worked out once for painting and shading both; m_ray is false where it has none.
+	bool m_ray[kTileSize * kTileSize];
+	float m_dir[kTileSize * kTileSize][3];
+	float m_rawDir[kTileSize * kTileSize][3];
+	float m_tNear[kTileSize * kTileSize];
+	float m_length[kTileSize * kTileSize];
+};
+
+// rayEnters with the ray's 1 / dir worked out once for all the boxes it is tested against (any value where dir is 0).
+inline float rayEntersInv(const float origin[3], const float dir[3], const float inv[3], const float lo[3], const float hi[3], float limit)
+{
+	float enter = 0.0f, leave = limit + limit * 1e-5f + 1e-4f;
+	for (int i = 0; i < 3; i++)
+	{
+		if (dir[i] == 0.0f)
+		{
+			if (!(origin[i] >= lo[i] && origin[i] <= hi[i]))
+				return INFINITY;
+			continue;
+		}
+		float near = (lo[i] - origin[i]) * inv[i], far = (hi[i] - origin[i]) * inv[i];
+		if (near > far)
+			std::swap(near, far);
+		enter = near > enter ? near : enter;
+		leave = far < leave ? far : leave;
+	}
+	if (!(enter <= leave))
+		return INFINITY;
+	return enter * (1.0f - 1e-5f) - 1e-4f;
+}
+
+// The 1 / dir rayEntersInv reads: each component's reciprocal, 0 where the component is 0.
+inline void rayInverse(const float dir[3], float inv[3])
+{
+	for (int i = 0; i < 3; i++)
+		inv[i] = dir[i] == 0.0f ? 0.0f : 1.0f / dir[i];
+}
+
+// Where a ray from origin along dir enters a box no later than limit, a hair early for rounding; INFINITY when it misses
+// the box or enters it only past limit. A zero direction component keeps its slab only when the origin lies inside it.
+inline float rayEnters(const float origin[3], const float dir[3], const float lo[3], const float hi[3], float limit)
+{
+	float inv[3];
+	rayInverse(dir, inv);
+	return rayEntersInv(origin, dir, inv, lo, hi, limit);
+}
+
+// True when a covered sample lands on a texel the hit filter would call see-through: the same test on the same mesh,
+// with the camera ray carried into the mesh's frame for a mover as Embree carries it.
+bool paintedCutOut(const RasterFrame& frame, const RasterTri& tri, const float dir[3], float t, float u, float v)
+{
+	const RasterSource& source = *tri.m_source;
+	const unsigned* ids = &(*source.m_indices)[(size_t)tri.m_prim * 3];
+	const float* p0 = source.m_vertices + (size_t)ids[0] * 3;
+	const float* p1 = source.m_vertices + (size_t)ids[1] * 3;
+	const float* p2 = source.m_vertices + (size_t)ids[2] * 3;
+	float e1[3], e2[3], normal[3];
+	for (int i = 0; i < 3; i++)
+	{
+		e1[i] = p1[i] - p0[i];
+		e2[i] = p2[i] - p0[i];
+	}
+	cross3(e1, e2, normal);
+	RTCHit hit;
+	hit.primID = tri.m_prim;
+	hit.u = u;
+	hit.v = v;
+	hit.Ng_x = normal[0];
+	hit.Ng_y = normal[1];
+	hit.Ng_z = normal[2];
+	float local[3] = {dir[0], dir[1], dir[2]};
+	if (source.m_objectSpace)
+		for (int r = 0; r < 3; r++)
+			local[r] = dot3(source.m_inverse + r * 3, dir);
+	RTCRay ray;
+	ray.dir_x = local[0];
+	ray.dir_y = local[1];
+	ray.dir_z = local[2];
+	ray.tfar = t;
+	return cutOutAt(source.m_model, source.m_vertices, source.m_uvs, *source.m_indices, &hit, &ray, frame.m_spread);
+}
+
+// Where a painted ray along d lands on the triangle, given 1 / det of its solve: u and v held to the triangle.
+inline void paintedUv(const RasterTri& tri, const float d[3], float inv, float& u, float& v)
+{
+	u = dot3(d, tri.m_u) * inv;
+	v = dot3(d, tri.m_v) * inv;
+	u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+	v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+	if (u + v > 1.0f)
+	{
+		const float scale = 1.0f / (u + v);
+		u *= scale;
+		v *= scale;
+	}
+}
+
+// Paints one tile: every lane's triangles reaching it keep, per sample, the nearest hit between the clip planes whose
+// texel is solid, nearer ties going to the lesser key, so the order the triangles come in never changes the result.
+void paintTile(const RasterFrame& frame, const Camera& cam, int width, int height, int row0, int row1, int col0, int col1, TilePaint& paint)
+{
+	const int tile = (row0 / kTileSize) * frame.m_tilesX + col0 / kTileSize;
+	float(*dir)[3] = paint.m_dir;
+	float* tNear = paint.m_tNear;
+	float tFar[kTileSize * kTileSize];
+	// Each sample's camera ray, pixelRayInColumn's steps for a whole row at once with no early way out, so the compiler
+	// runs them in vector lanes; a ray with no length then takes the values a failed pixelRay leaves.
+	const int columns = col1 - col0;
+	double nearColumn[3][kTileSize], farColumn[3][kTileSize];
+	for (int c = 0; c < columns; c++)
+	{
+		ColumnRay column;
+		columnRay(cam, pixelNdcX(col0 + c, width), column);
+		for (int i = 0; i < 3; i++)
+		{
+			nearColumn[i][c] = column.m_near[i];
+			farColumn[i][c] = column.m_far[i];
+		}
+	}
+	for (int row = row0; row < row1; row++)
+	{
+		const double ndcY = pixelNdcY(row, height);
+		const double nearRow[3] = {cam.m_near[2][0] * ndcY, cam.m_near[2][1] * ndcY, cam.m_near[2][2] * ndcY};
+		const double farRow[3] = {cam.m_far[2][0] * ndcY, cam.m_far[2][1] * ndcY, cam.m_far[2][2] * ndcY};
+		float raw[3][kTileSize], unit[3][kTileSize], length[kTileSize], toNearLength[kTileSize];
+		for (int c = 0; c < columns; c++)
+		{
+			float nearPoint[3], farPoint[3];
+			for (int i = 0; i < 3; i++)
+			{
+				nearPoint[i] = (float)(nearColumn[i][c] + nearRow[i]);
+				farPoint[i] = (float)(farColumn[i][c] + farRow[i]);
+				raw[i][c] = farPoint[i] - nearPoint[i];
+			}
+			length[c] = sqrtf(raw[0][c] * raw[0][c] + raw[1][c] * raw[1][c] + raw[2][c] * raw[2][c]);
+			const float invLength = 1.0f / length[c];
+			float toNear[3];
+			for (int i = 0; i < 3; i++)
+			{
+				unit[i][c] = raw[i][c] * invLength;
+				toNear[i] = nearPoint[i] - cam.m_origin[i];
+			}
+			toNearLength[c] = sqrtf(toNear[0] * toNear[0] + toNear[1] * toNear[1] + toNear[2] * toNear[2]);
+		}
+		for (int c = 0; c < columns; c++)
+		{
+			const int k = (row - row0) * kTileSize + c;
+			const bool ray = length[c] > 0.0f;
+			paint.m_t[k] = INFINITY;
+			paint.m_tri[k] = 0;
+			paint.m_rayNear[k] = INFINITY;
+			paint.m_numTrees[k] = 0;
+			paint.m_wide[k] = false;
+			paint.m_ray[k] = ray;
+			paint.m_length[k] = length[c];
+			for (int i = 0; i < 3; i++)
+			{
+				paint.m_rawDir[k][i] = raw[i][c];
+				dir[k][i] = ray ? unit[i][c] : 0.0f;
+			}
+			tNear[k] = ray ? toNearLength[c] : INFINITY;
+			tFar[k] = ray ? toNearLength[c] + length[c] : -INFINITY;
+		}
+	}
+	const std::vector<RasterLane>& lanes = *frame.m_lanes;
+	for (size_t l = 0; l < lanes.size(); l++)
+	{
+		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
+		for (size_t b = 0; b < bin.size(); b++)
+		{
+			if (bin[b] & kRectBit)
+				continue;
+			const RasterTri& tri = lanes[l].m_tris[bin[b]];
+			const int r0 = std::max(tri.m_row0, row0), r1 = std::min(tri.m_row1, row1 - 1);
+			const int c0 = std::max(tri.m_col0, col0), c1 = std::min(tri.m_col1, col1 - 1);
+			// An edge function is linear over the rectangle, so its largest value there is at a corner, and along a row at
+			// one end: where an edge is negative even there, no sample is covered and the rectangle or row is skipped.
+			long long rowGain[3];
+			bool empty = false;
+			for (int i = 0; i < 3; i++)
+			{
+				rowGain[i] = std::max(0LL, tri.m_stepX[i] * (c1 - c0));
+				const long long best = tri.m_edge[i] + tri.m_stepX[i] * c0 + rowGain[i] + std::max(tri.m_stepY[i] * r0, tri.m_stepY[i] * r1);
+				empty = empty || best < 0;
+			}
+			if (empty)
+				continue;
+			for (int row = r0; row <= r1; row++)
+			{
+				long long e0 = tri.m_edge[0] + tri.m_stepX[0] * c0 + tri.m_stepY[0] * row;
+				long long e1 = tri.m_edge[1] + tri.m_stepX[1] * c0 + tri.m_stepY[1] * row;
+				long long e2 = tri.m_edge[2] + tri.m_stepX[2] * c0 + tri.m_stepY[2] * row;
+				if (e0 + rowGain[0] < 0 || e1 + rowGain[1] < 0 || e2 + rowGain[2] < 0)
+					continue;
+				for (int col = c0; col <= c1; col++, e0 += tri.m_stepX[0], e1 += tri.m_stepX[1], e2 += tri.m_stepX[2])
+				{
+					if ((e0 | e1 | e2) < 0)
+						continue;
+					const int k = (row - row0) * kTileSize + (col - col0);
+					const float* d = dir[k];
+					const float det = dot3(d, tri.m_det);
+					if (det == 0.0f)
+						continue;
+					const float inv = 1.0f / det;
+					const float t = tri.m_t * inv;
+					if (!(t >= tNear[k] && t <= tFar[k]))
+						continue;
+					if (t > paint.m_t[k] || (t == paint.m_t[k] && tri.m_key >= paint.m_tri[k]->m_key))
+						continue;
+					// Where on the triangle only a cut-out test needs now; for the rest it is worked out once for the winner.
+					if (tri.m_source)
+					{
+						float u, v;
+						paintedUv(tri, d, inv, u, v);
+						if (paintedCutOut(frame, tri, d, t, u, v))
+							continue;
+						paint.m_u[k] = u;
+						paint.m_v[k] = v;
+					}
+					paint.m_t[k] = t;
+					paint.m_inv[k] = inv;
+					paint.m_tri[k] = &tri;
+				}
+			}
+		}
+	}
+	for (int row = row0; row < row1; row++)
+		for (int col = col0; col < col1; col++)
+		{
+			const int k = (row - row0) * kTileSize + (col - col0);
+			if (paint.m_tri[k] && !paint.m_tri[k]->m_source)
+				paintedUv(*paint.m_tri[k], dir[k], paint.m_inv[k], paint.m_u[k], paint.m_v[k]);
+		}
+	// Once every triangle is in, a sample is searched only where its own ray enters a rect's box before the painted hit,
+	// and only in the trees it enters while no dense chunk lies on its way and the trees fit the sample's list.
+	// Each sample's 1 / dir is worked out the first time one of its boxes is tested.
+	float inverse[kTileSize * kTileSize][3];
+	bool inverted[kTileSize * kTileSize] = {};
+	for (size_t l = 0; l < lanes.size(); l++)
+	{
+		const std::vector<unsigned>& bin = lanes[l].m_bins[(size_t)tile];
+		for (size_t b = 0; b < bin.size(); b++)
+		{
+			if (!(bin[b] & kRectBit))
+				continue;
+			const RayRect& rect = lanes[l].m_rects[bin[b] & ~kRectBit];
+			const int r0 = std::max(rect.m_row0, row0), r1 = std::min(rect.m_row1, row1 - 1);
+			const int c0 = std::max(rect.m_col0, col0), c1 = std::min(rect.m_col1, col1 - 1);
+			for (int row = r0; row <= r1; row++)
+				for (int col = c0; col <= c1; col++)
+				{
+					const int k = (row - row0) * kTileSize + (col - col0);
+					const float limit = paint.m_t[k] < tFar[k] ? paint.m_t[k] : tFar[k];
+					if (paint.m_wide[k] || !(rect.m_distance <= limit))
+						continue;
+					if (!inverted[k])
+					{
+						rayInverse(dir[k], inverse[k]);
+						inverted[k] = true;
+					}
+					const float enter = rayEntersInv(cam.m_origin, dir[k], inverse[k], rect.m_lo, rect.m_hi, limit);
+					if (!(enter < INFINITY))
+						continue;
+					paint.m_rayNear[k] = enter < paint.m_rayNear[k] ? enter : paint.m_rayNear[k];
+					if (rect.m_batch == kNoTree || paint.m_numTrees[k] == kTreeCandidates)
+					{
+						paint.m_wide[k] = true;
+						continue;
+					}
+					TreeCandidate& tree = paint.m_trees[k][paint.m_numTrees[k]++];
+					tree.m_enter = enter;
+					tree.m_batch = rect.m_batch;
+					tree.m_placement = rect.m_placement;
+				}
+		}
+	}
+}
+
+// What the painting says of one sample: shade the painted hit; search only the forest trees the ray enters before it;
+// search everything, no further than just past the painted hit, where a dense chunk or too many trees lie on the way;
+// or a miss.
+void paintedFound(const TilePaint& paint, int k, FoundHit& found)
+{
+	found.m_ray = paint.m_ray[k];
+	found.m_dir = paint.m_dir[k];
+	found.m_rawDir = paint.m_rawDir[k];
+	found.m_tNear = paint.m_tNear[k];
+	found.m_length = paint.m_length[k];
+	const RasterTri* tri = paint.m_tri[k];
+	const bool search = paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k];
+	found.m_painted = tri != 0;
+	if (search && paint.m_wide[k])
+	{
+		found.m_kind = kFoundSearch;
+		found.m_reach = tri ? paint.m_t[k] + paint.m_t[k] * (1.0f / 1024.0f) + 0.01f : INFINITY;
+		return;
+	}
+	found.m_kind = search ? kFoundTrees : (tri ? kFoundHit : kFoundMiss);
+	found.m_trees = paint.m_trees[k];
+	found.m_numTrees = paint.m_numTrees[k];
+	if (!tri)
+		return;
+	found.m_t = paint.m_t[k];
+	RTCHit& hit = found.m_hit;
+	hit.Ng_x = hit.Ng_y = hit.Ng_z = 0.0f;
+	hit.u = paint.m_u[k];
+	hit.v = paint.m_v[k];
+	hit.primID = tri->m_prim;
+	hit.geomID = tri->m_geom;
+	for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+	{
+		hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+		hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+	}
+	hit.instID[0] = tri->m_inst;
+	hit.instPrimID[0] = 0;
+}
+
+// The first pass for a sample painting landed on a known triangle whose shading waits for the tile, the common case,
+// without traceRay's general route: the same steps traceRay takes for that sample, in the same order, so every value is
+// the one it writes. False, before anything but the memo is touched, when the sample needs anything else: no painted
+// hit, a search, an unknown body, a veil or a see-through pane, or a shadow ray with no map; traceRay then takes it.
+bool paintedHit(const TileJob& job, const CameraSetup& setup, const TilePaint& paint, int k, RTCIntersectArguments* args, Sample& out,
+				float* landed, SurfaceMemo& memo)
+{
+	const RasterTri* tri = paint.m_tri[k];
+	if (!paint.m_ray[k] || !tri || (paint.m_rayNear[k] < INFINITY && paint.m_rayNear[k] <= paint.m_t[k]))
+		return false;
+	const SwarmRaycastShading& shading = *job.m_shading;
+	if (shading.m_shadow && !job.m_shadowMap)
+		return false;
+	// The sample before on the same painted triangle found its entry last, so the key and the lookup are skipped.
+	bool resolve = false;
+	SurfaceMemo::Entry* found = &memo.m_entries[memo.m_last];
+	if (tri != memo.m_lastTri)
+	{
+		const unsigned key[5] = {tri->m_inst, tri->m_geom, tri->m_prim, RTC_INVALID_GEOMETRY_ID, RTC_INVALID_GEOMETRY_ID};
+		found = &memo.find(key, resolve);
+		memo.m_lastTri = tri;
+	}
+	SurfaceMemo::Entry& entry = *found;
+	HitSurface& surface = entry.m_surface;
+	if (resolve)
+	{
+		RTCHit hit;
+		hit.Ng_x = hit.Ng_y = hit.Ng_z = 0.0f;
+		hit.u = paint.m_u[k];
+		hit.v = paint.m_v[k];
+		hit.primID = tri->m_prim;
+		hit.geomID = tri->m_geom;
+		for (int l = 0; l < RTC_MAX_INSTANCE_LEVEL_COUNT; l++)
+		{
+			hit.instID[l] = RTC_INVALID_GEOMETRY_ID;
+			hit.instPrimID[l] = RTC_INVALID_GEOMETRY_ID;
+		}
+		hit.instID[0] = tri->m_inst;
+		hit.instPrimID[0] = 0;
+		int segmentation = -1;
+		entry.m_known = resolveHit(hit, job.m_staticId, *job.m_members, *job.m_instances, *job.m_batches, job.m_forestId, segmentation, &surface);
+		if (entry.m_known)
+		{
+			float e1[3], e2[3];
+			for (int i = 0; i < 3; i++)
+			{
+				e1[i] = surface.m_corners[1][i] - surface.m_corners[0][i];
+				e2[i] = surface.m_corners[2][i] - surface.m_corners[0][i];
+			}
+			cross3(e1, e2, entry.m_woundNormal);
+		}
+		entry.m_segmentation = segmentation;
+	}
+	if (!entry.m_known)
+		return false;
+	ShadeWait::Kind kind = ShadeWait::kFragment;
+	if (shading.m_daylight)
+	{
+		if ((job.m_filtered && job.m_pixelSpread > 0.0f && surface.m_hasAlpha && !surface.m_glass) || (surface.m_glass && !surface.m_glassBacked))
+			return false;
+		kind = surface.m_glass ? ShadeWait::kModule : ShadeWait::kDaylight;
+	}
+
+	const Camera& cam = setup.m_cam;
+	const float* dir = paint.m_dir[k];
+	const float t = paint.m_t[k];
+	out.m_deferred = false;
+	reached(args, t);
+	const float point[3] = {cam.m_origin[0] + dir[0] * t, cam.m_origin[1] + dir[1] * t, cam.m_origin[2] + dir[2] * t};
+	if (landed)
+		for (int i = 0; i < 3; i++)
+			landed[i] = point[i];
+	const float zEye = ((cam.m_viewRow2[0] * point[0] + cam.m_viewRow2[1] * point[1]) + cam.m_viewRow2[2] * point[2]) + cam.m_viewRow2[3];
+	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
+	out.m_inverseEyeDepth = 1.0f / zEye;
+	out.m_segmentation = entry.m_segmentation;
+	out.m_hit.m_inst = tri->m_inst;
+	out.m_hit.m_geom = tri->m_geom;
+	out.m_hit.m_prim = tri->m_prim;
+	out.m_hit.m_inst1 = out.m_hit.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
+	out.m_shaded = true;
+	const float* wound = entry.m_woundNormal;
+	float faceNormal[3];
+	const bool awayFromCamera = dot3(wound, dir) > 0.0f;
+	for (int i = 0; i < 3; i++)
+		faceNormal[i] = awayFromCamera ? -wound[i] : wound[i];
+	RTCHit hit;
+	hit.u = paint.m_u[k];
+	hit.v = paint.m_v[k];
+	const float zero[2] = {0.0f, 0.0f};
+	waitForTile(out, surface, hit, faceNormal, zero, zero, dir, 1.0f, t, kind, point, job.m_filtered, paint.m_rawDir[k], wound, shading.m_shadow);
+	return true;
+}
+
+// shadeHitFinish for the tile's waiting fragment-shaded hits listed in `which`, eight at a time in vector lanes where
+// the build has AVX2 and the light is linear: each lane the scalar steps on its own hit, in their order, a step the
+// scalar code skips masked off; table reads stay per hit. Every byte is the one shadeHitFinish writes.
+void shadeHitFinishMany(const SwarmRaycastShading& shading, const ShadeWait* shades, const int* which, int count, const float (*normals)[3],
+						const TinyRender::Vec2f* uvs, const TGAColor* texels, unsigned char* const* outs)
+{
+	int k = 0;
+#if defined(__AVX2__)
+	typedef float Lanes __attribute__((vector_size(32)));
+	typedef int Ints __attribute__((vector_size(32)));
+	const Lanes zero = {0, 0, 0, 0, 0, 0, 0, 0}, one = zero + 1.0f;
+	const Ints none = {0, 0, 0, 0, 0, 0, 0, 0};
+	for (; shading.m_linearLight && k + 8 <= count; k += 8)
+	{
+		Lanes n[3], base[3], face[3], view[3], point[3], shadow, spec[3];
+		Ints exponent;
+		for (int l = 0; l < 8; l++)
+		{
+			const int i = which[k + l];
+			const ShadeWait& wait = shades[i];
+			TinyRender::Model* model = wait.m_surface->m_model;
+			exponent[l] = (int)model->specular(uvs[i]);
+			const TinyRender::Vec4f& rgba = model->getColorRGBA();
+			TGAColor color = texels[i];
+			float b[3];
+			for (int c = 0; c < 3; c++)
+				b[c] = kSwarmSrgbToLinear[(unsigned char)(color[c] * rgba[c])];
+			if (shading.m_nearInfrared)
+				b[0] = b[1] = b[2] = nearInfraredAlbedo(b);
+			const float* specular = &model->getSpecularColor()[0];
+			for (int c = 0; c < 3; c++)
+			{
+				n[c][l] = normals[i][c];
+				base[c][l] = b[c];
+				face[c][l] = wait.m_faceNormal[c];
+				view[c][l] = wait.m_dir[c];
+				point[c][l] = wait.m_point[c];
+				spec[c][l] = specular[c];
+			}
+			shadow[l] = wait.m_shadow;
+		}
+		const float* L = shading.m_lightDir;
+		const Lanes nDotL = (n[0] * L[0] + n[1] * L[1]) + n[2] * L[2];
+		Lanes reflection[3];
+		for (int c = 0; c < 3; c++)
+			reflection[c] = n[c] * (nDotL * 2.0f) - L[c];
+		const Lanes rLength = (Lanes)_mm256_sqrt_ps((__m256)((reflection[0] * reflection[0] + reflection[1] * reflection[1]) + reflection[2] * reflection[2]));
+		const Ints rSome = rLength > zero;
+		const Lanes rInv = 1.0f / (rSome ? rLength : one);
+		for (int c = 0; c < 3; c++)
+			reflection[c] = rSome ? reflection[c] * rInv : reflection[c];
+		// powInt on each lane: a lane multiplies only where its own exponent has the bit, as the scalar loop does.
+		Lanes x = reflection[2] > zero ? reflection[2] : zero, specular = one;
+		for (Ints e = exponent; _mm256_movemask_ps((__m256)(e > none)); e >>= 1)
+		{
+			specular = ((e & 1) != none) & (e > none) ? specular * x : specular;
+			x *= x;
+		}
+		const Lanes diffuse = nDotL > zero ? nDotL : zero;
+		Lanes lit[3];
+		for (int c = 0; c < 3; c++)
+			lit[c] = shading.m_ambientCoeff * base[c] * shading.m_ambientColor[c] +
+					 shadow * (shading.m_diffuseCoeff * diffuse + shading.m_specularCoeff * specular) * base[c] * shading.m_lightColor[c];
+		if (shading.m_spot)
+		{
+			// spotIrradiance on each lane, a lane that returns early held at zero.
+			Lanes facing[3];
+			const Ints flip = ((n[0] * face[0] + n[1] * face[1]) + n[2] * face[2]) < zero;
+			for (int c = 0; c < 3; c++)
+				facing[c] = flip ? -n[c] : n[c];
+			Lanes toLamp[3];
+			for (int c = 0; c < 3; c++)
+				toLamp[c] = shading.m_spotPosition[c] - point[c];
+			const Lanes distance2 = (toLamp[0] * toLamp[0] + toLamp[1] * toLamp[1]) + toLamp[2] * toLamp[2];
+			const Lanes distance = (Lanes)_mm256_sqrt_ps((__m256)distance2);
+			const Lanes reach = distance / shading.m_spotRange;
+			for (int c = 0; c < 3; c++)
+				toLamp[c] /= distance;
+			const Lanes towards = (facing[0] * toLamp[0] + facing[1] * toLamp[1]) + facing[2] * toLamp[2];
+			const float* sd = shading.m_spotDirection;
+			const Lanes axis = -((sd[0] * toLamp[0] + sd[1] * toLamp[1]) + sd[2] * toLamp[2]);
+			const Ints lights = (distance2 > zero) & (reach < one) & (towards > zero) & (axis > shading.m_spotCosOuter);
+			Lanes cone = (axis - shading.m_spotCosOuter) / (shading.m_spotCosInner - shading.m_spotCosOuter);
+			cone = cone < one ? cone : one;
+			cone = cone * cone * (3.0f - 2.0f * cone);
+			const Lanes reach2 = reach * reach;
+			const Lanes window = 1.0f - reach2 * reach2;
+			const Lanes lamp = lights ? shading.m_spotIntensity * towards * cone * (window * window) / distance2 : zero;
+			for (int c = 0; c < 3; c++)
+				lit[c] += lamp * base[c];
+		}
+		float sky[3][8];
+		if (shading.m_glint.m_enabled)
+		{
+			// applyLinear on each lane, its sky colour read from the table per hit.
+			const TinyRenderGlint& g = shading.m_glint;
+			Lanes toCamera[3];
+			for (int c = 0; c < 3; c++)
+				toCamera[c] = -view[c];
+			Lanes nDotV = (n[0] * toCamera[0] + n[1] * toCamera[1]) + n[2] * toCamera[2];
+			const Ints behind = nDotV < zero;
+			const Lanes side = behind ? zero - 1.0f : one;
+			nDotV = behind ? -nDotV : nDotV;
+			const Lanes up = (n[g.m_upAxis] * side) * (2.0f * nDotV) - toCamera[g.m_upAxis];
+			const Lanes t = up < zero ? zero : up;
+			const Lanes f = 1.0f - nDotV;
+			const Lanes f2 = f * f;
+			const Lanes fresnel = 0.04f + 0.96f * (f2 * f2 * f);
+			for (int c = 0; c < 3; c++)
+			{
+				const Lanes level = g.m_skyHorizon[c] + (g.m_skyZenith[c] - g.m_skyHorizon[c]) * t;
+				for (int l = 0; l < 8; l++)
+					sky[c][l] = swarmUnitToLinear(level[l]);
+				Lanes s;
+				memcpy(&s, sky[c], sizeof(s));
+				const Lanes w = spec[c] * fresnel;
+				lit[c] = lit[c] + (s - lit[c]) * w;
+			}
+		}
+		for (int l = 0; l < 8; l++)
+		{
+			unsigned char* out = outs[which[k + l]];
+			for (int c = 0; c < 3; c++)
+				out[c] = swarmLinearToSrgb(lit[c][l]);
+		}
+	}
+#endif
+	for (; k < count; k++)
+	{
+		const int i = which[k];
+		const ShadeWait& wait = shades[i];
+		shadeHitFinish(shading, *wait.m_surface, normals[i], uvs[i], texels[i], wait.m_faceNormal, wait.m_dir, wait.m_shadow, wait.m_point, outs[i]);
+	}
+}
+
+// The tile's waiting hits shaded together: their footprints, shadows, normals and textures, then their light, which joins
+// the colours waiting in `waiting`; then every waiting colour is finished and written.
+void finishTileShading(const TileJob& job, const CameraSetup& setup, RTCOccludedArguments* shadowArgs, ShadeWait* shades,
+					   unsigned char* const* shadeOut, int numShades, DaylightColour* waiting, unsigned char** waitingOut, int numWaiting)
+{
+	if (numShades)
+	{
+		// The waiting hits' normals and texture coordinates, their textures read together, then their light, which
+		// joins the colours waiting for the write.
+		// Daylight surfaces read up to four texels along a slanted footprint, the fragment shader one; each kind's reads
+		// go together, in the order the samples came.
+		TinyRender::Vec2f uvs[kTileSize * kTileSize], duvdx[kTileSize * kTileSize], duvdy[kTileSize * kTileSize];
+		TGAColor texels[kTileSize * kTileSize], kindTexels[kTileSize * kTileSize];
+		float normals[kTileSize * kTileSize][3];
+		int order[kTileSize * kTileSize], numDaylight = 0;
+		{
+			// The footprints left for the tile, worked out together straight from the waiting hits, zero where none comes.
+			int late[kTileSize * kTileSize], numLate = 0;
+			for (int i = 0; i < numShades; i++)
+			{
+				ShadeWait& wait = shades[i];
+				if (!wait.m_footprintLater)
+					continue;
+				late[numLate++] = i;
+				wait.m_duvdx[0] = wait.m_duvdx[1] = wait.m_duvdy[0] = wait.m_duvdy[1] = 0.0f;
+			}
+			if (numLate)
+				footprintMany(setup, shades, late, numLate);
+			// The shadows left for the tile: the maps' lit shares together, then each point's remaining shadow ray.
+			const ShadowMap* maps[kTileSize * kTileSize];
+			float points[kTileSize * kTileSize][3], normals[kTileSize * kTileSize][3], lit[kTileSize * kTileSize];
+			numLate = 0;
+			for (int i = 0; i < numShades; i++)
+			{
+				const ShadeWait& wait = shades[i];
+				if (!wait.m_shadowLater)
+					continue;
+				const int n = numLate++;
+				late[n] = i;
+				shadowNormal(job.m_shading, wait.m_faceNormal, leafCard(wait.m_surface->m_doubleSided, wait.m_surface->m_hasAlpha), normals[n]);
+				for (int c = 0; c < 3; c++)
+					points[n][c] = wait.m_point[c];
+				maps[n] = shadowMapFor(job, points[n]);
+			}
+			if (numLate && job.m_shading->m_daylight)
+			{
+				shadowLitMany(maps, points, normals, numLate, lit);
+				for (int n = 0; n < numLate; n++)
+					shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], lit[n], lit[n] <= 0.0f, shadowArgs);
+			}
+			else if (numLate)
+			{
+				bool blocked[kTileSize * kTileSize];
+				shadowBlockedMany(*job.m_shadowMap, points, normals, numLate, blocked);
+				for (int n = 0; n < numLate; n++)
+					shades[late[n]].m_shadow = shadowFinish(job, points[n], normals[n], 1.0f, blocked[n], shadowArgs);
+			}
+		}
+		for (int i = 0; i < numShades; i++)
+		{
+			const ShadeWait& wait = shades[i];
+			if (wait.m_kind == ShadeWait::kFragment)
+				shadeHitFrame(*wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+			else
+			{
+				surfaceFrame(*wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+				order[numDaylight++] = i;
+			}
+		}
+		for (int i = 0, fragment = numDaylight; i < numShades; i++)
+			if (shades[i].m_kind == ShadeWait::kFragment)
+				order[fragment++] = i;
+		TinyRender::Model* kindModels[kTileSize * kTileSize];
+		for (int n = 0; n < numShades; n++)
+		{
+			const ShadeWait& wait = shades[order[n]];
+			kindModels[n] = wait.m_surface->m_model;
+			duvdx[n] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
+			duvdy[n] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
+		}
+		TinyRender::Vec2f kindUvs[kTileSize * kTileSize];
+		for (int n = 0; n < numShades; n++)
+			kindUvs[n] = uvs[order[n]];
+		if (job.m_filtered)
+		{
+			TinyRender::Model::diffuseFilteredMany(kindModels, kindUvs, duvdx, duvdy, numDaylight, 4, kindTexels);
+			TinyRender::Model::diffuseFilteredMany(kindModels + numDaylight, kindUvs + numDaylight, duvdx + numDaylight, duvdy + numDaylight,
+												   numShades - numDaylight, 1, kindTexels + numDaylight);
+		}
+		else
+			for (int n = 0; n < numShades; n++)
+				kindTexels[n] = kindModels[n]->diffuse(kindUvs[n]);
+		for (int n = 0; n < numShades; n++)
+			texels[order[n]] = kindTexels[n];
+		// The daylight surfaces' light, and the modules' light, each worked out together.
+		const HitSurface* daySurfaces[kTileSize * kTileSize];
+		float dayNormals[kTileSize * kTileSize][3], dayBases[kTileSize * kTileSize][3], dayDirs[kTileSize * kTileSize][3];
+		float dayShadows[kTileSize * kTileSize], dayLit[kTileSize * kTileSize][3];
+		const HitSurface* moduleSurfaces[kTileSize * kTileSize];
+		float moduleNormals[kTileSize * kTileSize][3], moduleBases[kTileSize * kTileSize][3], moduleDirs[kTileSize * kTileSize][3];
+		float moduleShadows[kTileSize * kTileSize], moduleLit[kTileSize * kTileSize][3];
+		int numDay = 0, numModule = 0;
+		for (int i = 0; i < numShades; i++)
+		{
+			const ShadeWait& wait = shades[i];
+			if (wait.m_kind == ShadeWait::kModule)
+			{
+				moduleSurfaces[numModule] = wait.m_surface;
+				surfaceTint(*wait.m_surface, texels[i], moduleBases[numModule]);
+				for (int c = 0; c < 3; c++)
+				{
+					moduleNormals[numModule][c] = normals[i][c];
+					moduleDirs[numModule][c] = wait.m_dir[c];
+				}
+				moduleShadows[numModule++] = wait.m_shadow;
+				continue;
+			}
+			if (wait.m_kind != ShadeWait::kDaylight)
+				continue;
+			daySurfaces[numDay] = wait.m_surface;
+			surfaceTint(*wait.m_surface, texels[i], dayBases[numDay]);
+			for (int c = 0; c < 3; c++)
+			{
+				dayNormals[numDay][c] = normals[i][c];
+				dayDirs[numDay][c] = wait.m_dir[c];
+			}
+			dayShadows[numDay++] = wait.m_shadow;
+		}
+		daylightLightMany(*job.m_shading, daySurfaces, dayNormals, dayBases, dayDirs, dayShadows, numDay, dayLit);
+		moduleLightMany(*job.m_shading, moduleSurfaces, moduleNormals, moduleBases, moduleDirs, moduleShadows, numModule, moduleLit);
+		int skyFor[kTileSize * kTileSize], numSky = 0, fragments[kTileSize * kTileSize], numFragments = 0;
+		const int firstSky = numWaiting;
+		for (int i = 0, day = 0, module = 0; i < numShades; i++)
+		{
+			const ShadeWait& wait = shades[i];
+			if (wait.m_kind == ShadeWait::kFragment)
+			{
+				fragments[numFragments++] = i;
+				continue;
+			}
+			const float* lit = wait.m_kind == ShadeWait::kModule ? moduleLit[module++] : dayLit[day++];
+			daylightPrepare(*job.m_shading, lit, wait.m_dir, wait.m_distance, waiting[numWaiting], true);
+			skyFor[numSky++] = i;
+			waitingOut[numWaiting++] = shadeOut[i];
+		}
+		shadeHitFinishMany(*job.m_shading, shades, fragments, numFragments, normals, uvs, texels, shadeOut);
+		// Their horizon colours under haze, looked up together: the sky's colour just above the horizon each way.
+		const SwarmRaycastShading& shading = *job.m_shading;
+		if (shading.m_hazeDistance > 0.0f && shading.m_sky && numSky)
+		{
+			float x[kTileSize * kTileSize], y[kTileSize * kTileSize], z[kTileSize * kTileSize];
+			float horizon[kTileSize * kTileSize][3];
+			for (int n = 0; n < numSky; n++)
+			{
+				float level[3] = {shades[skyFor[n]].m_dir[0], shades[skyFor[n]].m_dir[1], shades[skyFor[n]].m_dir[2]};
+				level[shading.m_glint.m_upAxis] = 0.02f;
+				x[n] = level[0];
+				y[n] = level[1];
+				z[n] = level[2];
+			}
+			shading.m_sky->radianceMany(x, y, z, numSky, horizon);
+			for (int n = 0; n < numSky; n++)
+				for (int c = 0; c < 3; c++)
+					waiting[firstSky + n].m_horizon[c] = horizon[n][c];
+		}
+	}
+	if (numWaiting)
+		daylightFinishAll(*job.m_shading, waiting, numWaiting, waitingOut);
+}
+
 // Traces the pixels [col0, col1) x [row0, row1) of one camera into its buffers. Every pixel is
 // written by exactly one call, so the tile order and the thread that runs it cannot change the bytes.
 // `scratch`, when given, records the id and triangle of every hit for the edge pass. `radiance`, under ER_SWARM_THERMAL,
@@ -3768,6 +6103,21 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				RTCIntersectArguments* args, RTCOccludedArguments* shadowArgs)
 {
 	const int width = job.m_width;
+	TilePaint paint;
+	if (job.m_raster)
+		paintTile(*job.m_raster, setup.m_cam, width, job.m_height, row0, row1, col0, col1, paint);
+	SurfaceMemo memo;
+	memo.clear();
+	// Shading and daylight colours wait here and are done together once the tile's samples are in.
+	const bool defer = job.m_shading && !radiance;
+	// A painted sample on a known triangle takes the short route; any other goes through traceRay.
+	const bool fast = job.m_raster && defer && !job.m_shading->m_thermal;
+	DaylightColour waiting[kTileSize * kTileSize];
+	unsigned char* waitingOut[kTileSize * kTileSize];
+	int numWaiting = 0;
+	ShadeWait shades[kTileSize * kTileSize];
+	unsigned char* shadeOut[kTileSize * kTileSize];
+	int numShades = 0;
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, job.m_height);
@@ -3775,10 +6125,20 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 		{
 			Sample sample;
 			sample.m_radiance = 0.0f;
+			sample.m_shade = &shades[numShades];
 			const size_t offset = (size_t)row * width + col;
-			const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
-			const bool hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach,
-									  job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0);
+			const int k = (row - row0) * kTileSize + (col - col0);
+			float* landed = job.m_hitPoints ? job.m_hitPoints + offset * 3 : 0;
+			bool hit = fast && paintedHit(job, setup, paint, k, args, sample, landed, memo);
+			if (!hit)
+			{
+				const float reach = job.m_hintFar ? hintReach(job.m_hintFar, width, job.m_height, row, col) : INFINITY;
+				FoundHit found;
+				if (job.m_raster)
+					paintedFound(paint, k, found);
+				hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach, landed, job.m_raster ? &found : 0,
+							   &memo, defer);
+			}
 			if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
@@ -3786,7 +6146,12 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			if (!hit)
 			{
 				if (scratch)
+				{
+					scratch->m_ids[offset] = -1;
+					HitId& none = scratch->m_hits[offset];
+					none.m_inst = none.m_geom = none.m_prim = none.m_inst1 = none.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
 					scratch->m_inverseEyeDepth[offset] = inverseEyeDepth(setup.m_cam, target.m_depth[offset]);
+				}
 				continue;
 			}
 			target.m_depth[offset] = sample.m_depth;
@@ -3798,11 +6163,19 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				scratch->m_hits[offset] = sample.m_hit;
 				scratch->m_inverseEyeDepth[offset] = sample.m_inverseEyeDepth;
 			}
-			if (sample.m_shaded && !radiance)
+			if (sample.m_shaded && !radiance && sample.m_shadeDeferred)
+				shadeOut[numShades++] = &target.m_rgb[offset * 3];
+			else if (sample.m_shaded && !radiance && sample.m_deferred)
+			{
+				waiting[numWaiting] = sample.m_colour;
+				waitingOut[numWaiting++] = &target.m_rgb[offset * 3];
+			}
+			else if (sample.m_shaded && !radiance)
 				for (int i = 0; i < 3; i++)
 					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
 		}
 	}
+	finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
@@ -3821,6 +6194,48 @@ bool isEdge(const int* ids, const float* w, int width, int height, int row, int 
 	if (hasUp && hasDown && fabsf((w[offset - width] + w[offset + width]) - 2.0f * w[offset]) > limit)
 		return true;
 	return false;
+}
+
+// isEdge for columns col0 up to col1 of one row into `edge`, eight at a time where all four neighbours are inside the frame.
+void edgeRow(const int* ids, const float* w, int width, int height, int row, int col0, int col1, float tolerance, bool* edge)
+{
+	int col = col0;
+#if defined(__GNUC__)
+	if (row > 0 && row + 1 < height)
+	{
+		if (col == 0 && col < col1)
+		{
+			edge[0] = isEdge(ids, w, width, height, row, 0, tolerance);
+			col++;
+		}
+		const SwarmLaneMask8 magnitude = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+		for (; col + 8 <= col1 && col + 8 < width; col += 8)
+		{
+			const size_t offset = (size_t)row * width + col;
+			SwarmLaneMask8 id, left, right, up, down;
+			SwarmLanes8 wc, wl, wr, wu, wd;
+			memcpy(&id, ids + offset, sizeof(id));
+			memcpy(&left, ids + offset - 1, sizeof(left));
+			memcpy(&right, ids + offset + 1, sizeof(right));
+			memcpy(&up, ids + offset - width, sizeof(up));
+			memcpy(&down, ids + offset + width, sizeof(down));
+			memcpy(&wc, w + offset, sizeof(wc));
+			memcpy(&wl, w + offset - 1, sizeof(wl));
+			memcpy(&wr, w + offset + 1, sizeof(wr));
+			memcpy(&wu, w + offset - width, sizeof(wu));
+			memcpy(&wd, w + offset + width, sizeof(wd));
+			// fabsf on each lane is the value with its sign bit cleared.
+			const SwarmLanes8 limit = tolerance * (SwarmLanes8)((SwarmLaneMask8)wc & magnitude);
+			const SwarmLanes8 across = (SwarmLanes8)((SwarmLaneMask8)((wl + wr) - 2.0f * wc) & magnitude);
+			const SwarmLanes8 along = (SwarmLanes8)((SwarmLaneMask8)((wu + wd) - 2.0f * wc) & magnitude);
+			const SwarmLaneMask8 hit = (left != id) | (right != id) | (up != id) | (down != id) | (across > limit) | (along > limit);
+			for (int l = 0; l < 8; l++)
+				edge[col - col0 + l] = hit[l] != 0;
+		}
+	}
+#endif
+	for (; col < col1; col++)
+		edge[col - col0] = isEdge(ids, w, width, height, row, col, tolerance);
 }
 
 // A convex polygon on the frame, in ndc; a pixel square clipped by three edges has at most seven corners.
@@ -3892,17 +6307,26 @@ bool projectCached(ProjectionCache& cache, const TileJob& job, const Camera& cam
 }
 
 // Keeps the part of `poly` on the inner side of the directed line a -> b, where inside is the side
-// `sign` says the triangle's third corner lies on.
-void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
+// `sign` says the triangle's third corner lies on. Each corner's side is worked out once; true, with `out` untouched,
+// when every corner is inside, since the clip would then hand back `poly` itself.
+bool clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by, double sign, Polygon& out)
 {
-	out.m_n = 0;
 	const double ex = bx - ax, ey = by - ay;
+	double side[8];
+	int inside = 0;
 	for (int i = 0; i < poly.m_n; i++)
 	{
-		const int k = (i + 1) % poly.m_n;
+		side[i] = (ex * (poly.m_y[i] - ay) - ey * (poly.m_x[i] - ax)) * sign;
+		inside += side[i] >= 0.0;
+	}
+	if (inside == poly.m_n)
+		return true;
+	out.m_n = 0;
+	for (int i = 0; i < poly.m_n && inside; i++)
+	{
+		const int k = i + 1 < poly.m_n ? i + 1 : 0;
 		const double px = poly.m_x[i], py = poly.m_y[i], qx = poly.m_x[k], qy = poly.m_y[k];
-		const double dp = (ex * (py - ay) - ey * (px - ax)) * sign;
-		const double dq = (ex * (qy - ay) - ey * (qx - ax)) * sign;
+		const double dp = side[i], dq = side[k];
 		if (dp >= 0.0)
 		{
 			out.m_x[out.m_n] = px;
@@ -3917,6 +6341,7 @@ void clipByEdge(const Polygon& poly, double ax, double ay, double bx, double by,
 			out.m_n++;
 		}
 	}
+	return false;
 }
 
 // Area of the polygon and its centroid; a polygon too thin to have an area reports zero and its first corner.
@@ -3925,7 +6350,7 @@ double polygonArea(const Polygon& poly, double& cx, double& cy)
 	double twice = 0.0, sx = 0.0, sy = 0.0;
 	for (int i = 0; i < poly.m_n; i++)
 	{
-		const int k = (i + 1) % poly.m_n;
+		const int k = i + 1 < poly.m_n ? i + 1 : 0;
 		const double cross = poly.m_x[i] * poly.m_y[k] - poly.m_x[k] * poly.m_y[i];
 		twice += cross;
 		sx += (poly.m_x[i] + poly.m_x[k]) * cross;
@@ -3942,15 +6367,48 @@ double polygonArea(const Polygon& poly, double& cx, double& cy)
 	return fabs(twice) * 0.5;
 }
 
-// Share of the pixel square that the triangle covers, and the centroid of that part.
-double coverage(const Polygon& square, double squareArea, const double x[3], const double y[3], double& cx, double& cy)
+// The pixel square's own area and centroid, worked out the first time a triangle covers the whole square.
+struct SquarePart
+{
+	bool m_known;
+	double m_part;
+	double m_cx;
+	double m_cy;
+};
+
+// Share of the pixel square that the triangle covers, and the centroid of that part. A clip that keeps every corner
+// hands its polygon on as it is, an empty one ends the clipping, and a square no edge cuts takes the square's own area
+// from `whole`, all as the three full clips would give it.
+double coverage(const Polygon& square, double squareArea, const double x[3], const double y[3], double& cx, double& cy, SquarePart& whole)
 {
 	const double sign = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]) >= 0.0 ? 1.0 : -1.0;
-	Polygon a, b, c;
-	clipByEdge(square, x[0], y[0], x[1], y[1], sign, a);
-	clipByEdge(a, x[1], y[1], x[2], y[2], sign, b);
-	clipByEdge(b, x[2], y[2], x[0], y[0], sign, c);
-	const double part = polygonArea(c, cx, cy);
+	Polygon clipped[3];
+	const Polygon* poly = &square;
+	const double edges[3][4] = {{x[0], y[0], x[1], y[1]}, {x[1], y[1], x[2], y[2]}, {x[2], y[2], x[0], y[0]}};
+	for (int e = 0; e < 3; e++)
+	{
+		if (!clipByEdge(*poly, edges[e][0], edges[e][1], edges[e][2], edges[e][3], sign, clipped[e]))
+			poly = &clipped[e];
+		if (!poly->m_n)
+		{
+			cx = cy = 0.0;
+			return 0.0;
+		}
+	}
+	double part;
+	if (poly == &square)
+	{
+		if (!whole.m_known)
+		{
+			whole.m_part = polygonArea(square, whole.m_cx, whole.m_cy);
+			whole.m_known = true;
+		}
+		part = whole.m_part;
+		cx = whole.m_cx;
+		cy = whole.m_cy;
+	}
+	else
+		part = polygonArea(*poly, cx, cy);
 	const double share = part / squareArea;
 	return share > 1.0 ? 1.0 : share;
 }
@@ -4053,6 +6511,30 @@ void moverRects(const std::vector<Instance*>& instances, const Camera& cam, int 
 	}
 }
 
+// An edge pixel's blend written to the frame: encoded once from linear light, or rounded from byte values.
+inline void writeBlend(unsigned char* pixel, const double colour[3], bool linear)
+{
+	for (int i = 0; i < 3; i++)
+	{
+		if (linear)
+		{
+			pixel[i] = swarmLinearToSrgb((float)colour[i]);
+			continue;
+		}
+		const int value = (int)(colour[i] + 0.5);
+		pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
+	}
+}
+
+// An edge pixel whose probe hit waits for the tile's batched shading: its blend so far and the share the probe fills.
+struct ProbeWait
+{
+	size_t m_offset;
+	double m_colour[3];
+	double m_rest;
+	unsigned char m_rgb[3];
+};
+
 // Second pass over one tile: the exact anti-aliasing a ray caster can afford. For every edge pixel
 // the triangles its own ray and its four neighbours' rays landed on are put back onto the frame and
 // the pixel square is clipped against each, front to back, so each surface gets exactly the share of
@@ -4076,12 +6558,24 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	const double halfY = 1.0 / (double)height;
 	const double squareArea = 4.0 * halfX * halfY;
 	const float tolerance = job.m_shading->m_edgeOutline ? kOutlineTolerance : kEdgeTolerance;
+	// The probes' shading waits for the tile, as the first pass's does, and their pixels are blended once it is done.
+	const bool defer = !job.m_shading->m_thermal;
+	ShadeWait shades[kTileSize * kTileSize];
+	unsigned char* shadeOut[kTileSize * kTileSize];
+	DaylightColour waiting[kTileSize * kTileSize];
+	unsigned char* waitingOut[kTileSize * kTileSize];
+	ProbeWait probes[kTileSize * kTileSize];
+	int numShades = 0, numWaiting = 0, numProbes = 0;
+	SurfaceMemo memo;
+	memo.clear();
 	for (int row = row0; row < row1; row++)
 	{
 		const double ndcY = pixelNdcY(row, height);
+		bool edge[kTileSize];
+		edgeRow(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col0, col1, tolerance, edge);
 		for (int col = col0; col < col1; col++)
 		{
-			if (!isEdge(ids, &scratch.m_inverseEyeDepth[0], width, height, row, col, tolerance))
+			if (!edge[col - col0])
 				continue;
 			const size_t offset = (size_t)row * width + col;
 			const double ndcX = pixelNdcX(col, width);
@@ -4092,6 +6586,8 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			square.m_x[1] = ndcX + halfX; square.m_y[1] = ndcY - halfY;
 			square.m_x[2] = ndcX + halfX; square.m_y[2] = ndcY + halfY;
 			square.m_x[3] = ndcX - halfX; square.m_y[3] = ndcY + halfY;
+			SquarePart whole;
+			whole.m_known = false;
 
 			// Candidates, each triangle once: bodies in front of this pixel's hit from the four neighbours,
 			// then the pixel's own triangle, then the neighbours on the same body (a crease or a facet).
@@ -4144,7 +6640,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				double cx, cy;
 				if (!projectCached(cache, job, cam, candidates[c].m_hit, x, y))
 					continue;
-				double share = coverage(square, squareArea, x, y, cx, cy);
+				double share = coverage(square, squareArea, x, y, cx, cy, whole);
 				if (share > 1.0 - covered)
 					share = 1.0 - covered;
 				if (share <= 0.0)
@@ -4170,6 +6666,7 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			{
 				const unsigned char* restColour = rgb1 + offset * 3;
 				Sample probe;
+				probe.m_shade = &shades[numShades];
 				unsigned char background[3];
 				if (hasOwn)
 				{
@@ -4180,7 +6677,24 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					px = px < square.m_x[0] ? square.m_x[0] : (px > square.m_x[1] ? square.m_x[1] : px);
 					py = py < square.m_y[0] ? square.m_y[0] : (py > square.m_y[2] ? square.m_y[2] : py);
 					const float reach = probeReach(&scratch.m_inverseEyeDepth[0], width, height, row, col);
-					if (traceRay(job, setup, px, py, args, shadowArgs, probe, reach) && probe.m_shaded)
+					const bool hit = traceRay(job, setup, px, py, args, shadowArgs, probe, reach, 0, 0, &memo, defer) && probe.m_shaded;
+					if (hit && (probe.m_shadeDeferred || probe.m_deferred))
+					{
+						ProbeWait& wait = probes[numProbes++];
+						wait.m_offset = offset;
+						for (int i = 0; i < 3; i++)
+							wait.m_colour[i] = colour[i];
+						wait.m_rest = rest;
+						if (probe.m_shadeDeferred)
+							shadeOut[numShades++] = wait.m_rgb;
+						else
+						{
+							waiting[numWaiting] = probe.m_colour;
+							waitingOut[numWaiting++] = wait.m_rgb;
+						}
+						continue;
+					}
+					if (hit)
 						restColour = probe.m_rgb;
 					else if (target.m_background)
 					{
@@ -4198,18 +6712,18 @@ void refineTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				for (int i = 0; i < 3; i++)
 					colour[i] /= covered;
 
-			unsigned char* pixel = target.m_rgb + offset * 3;
-			for (int i = 0; i < 3; i++)
-			{
-				if (linear)
-				{
-					pixel[i] = swarmLinearToSrgb((float)colour[i]);
-					continue;
-				}
-				const int value = (int)(colour[i] + 0.5);
-				pixel[i] = (unsigned char)(value < 0 ? 0 : (value > 255 ? 255 : value));
-			}
+			writeBlend(target.m_rgb + offset * 3, colour, linear);
 		}
+	}
+	if (!numProbes)
+		return;
+	finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
+	for (int n = 0; n < numProbes; n++)
+	{
+		ProbeWait& wait = probes[n];
+		for (int i = 0; i < 3; i++)
+			wait.m_colour[i] += wait.m_rest * (linear ? kSwarmSrgbToLinear[wait.m_rgb[i]] : (double)wait.m_rgb[i]);
+		writeBlend(target.m_rgb + wait.m_offset * 3, wait.m_colour, linear);
 	}
 }
 
@@ -4376,7 +6890,114 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		}
 	}
 
+	// ER_SWARM_RASTER: a camera that remembers its lens paints its frame. Here the chunks in view are listed, cut the first
+	// time they are painted; in the parallel region every thread paints its share before the first tile is traced.
+	const bool raster = memory != 0 && shading && shading->m_raster;
+	RasterView rasterView;
+	RasterFrame rasterFrame;
+	long long forestCells = 0;
+	job.m_raster = 0;
+	job.m_alphaCutout = alphaCutout;
+	if (raster)
+	{
+		setupRasterView(setups[0].m_cam, width, height, m_data->m_staticInstanceId, rasterView);
+		const size_t frameTiles = (size_t)rasterView.m_tilesX * (size_t)((height + kTileSize - 1) / kTileSize);
+		m_data->m_rasterLanes.resize((size_t)threads);
+		for (size_t i = 0; i < m_data->m_rasterLanes.size(); i++)
+		{
+			RasterLane& lane = m_data->m_rasterLanes[i];
+			lane.m_tris.clear();
+			lane.m_rects.clear();
+			lane.m_bins.resize(frameTiles);
+			for (size_t t = 0; t < frameTiles; t++)
+				lane.m_bins[t].clear();
+		}
+		std::vector<RasterJob>& jobs = m_data->m_rasterJobs;
+		std::vector<RasterSource>& sources = m_data->m_rasterSources;
+		jobs.clear();
+		sources.clear();
+		// Reserved whole, so the sources the jobs point at never move.
+		sources.reserve(m_data->m_members.size() + m_data->m_byGeomId.size());
+		for (size_t i = 0; i < m_data->m_members.size(); i++)
+		{
+			StaticMember* member = m_data->m_members[i];
+			if (member->m_retired || !member->m_visible)
+				continue;
+			if (member->m_chunks.empty())
+				buildRasterChunks(member->m_vertices, member->m_indices, member->m_chunks, member->m_chunksLo, member->m_chunksHi);
+			if (!boxVisible(rasterView, member->m_chunksLo, member->m_chunksHi))
+				continue;
+			const RasterSource* source = 0;
+			if (alphaCutout && member->m_hasAlpha)
+			{
+				RasterSource s;
+				s.m_model = member->m_obj->m_model;
+				s.m_vertices = &member->m_vertices[0];
+				s.m_uvs = member->m_uvs;
+				s.m_indices = &member->m_indices;
+				s.m_objectSpace = false;
+				sources.push_back(s);
+				source = &sources.back();
+			}
+			for (size_t c = 0; c < member->m_chunks.size(); c++)
+			{
+				const RasterJob unit = {&member->m_chunks[c], member, 0, source};
+				jobs.push_back(unit);
+			}
+		}
+		for (size_t i = 0; i < m_data->m_byGeomId.size(); i++)
+		{
+			const Instance* inst = m_data->m_byGeomId[i];
+			if (!inst || !inst->m_enabled || !inst->m_tree)
+				continue;
+			const float* m = inst->m_transform;
+			const double a[3][3] = {{m[0], m[4], m[8]}, {m[1], m[5], m[9]}, {m[2], m[6], m[10]}};
+			const double cof[3][3] = {{a[1][1] * a[2][2] - a[1][2] * a[2][1], a[0][2] * a[2][1] - a[0][1] * a[2][2], a[0][1] * a[1][2] - a[0][2] * a[1][1]},
+									  {a[1][2] * a[2][0] - a[1][0] * a[2][2], a[0][0] * a[2][2] - a[0][2] * a[2][0], a[0][2] * a[1][0] - a[0][0] * a[1][2]},
+									  {a[1][0] * a[2][1] - a[1][1] * a[2][0], a[0][1] * a[2][0] - a[0][0] * a[2][1], a[0][0] * a[1][1] - a[0][1] * a[1][0]}};
+			const double det = a[0][0] * cof[0][0] + a[0][1] * cof[1][0] + a[0][2] * cof[2][0];
+			// A flattened placement is disabled in the tree, so nothing of it is drawn.
+			if (!(det != 0.0))
+				continue;
+			MeshTree* tree = inst->m_tree;
+			if (tree->m_chunks.empty())
+				buildRasterChunks(tree->m_vertices, tree->m_indices, tree->m_chunks, tree->m_chunksLo, tree->m_chunksHi);
+			float lo[3], hi[3];
+			worldBox(m, tree->m_chunksLo, tree->m_chunksHi, lo, hi);
+			if (!boxVisible(rasterView, lo, hi))
+				continue;
+			const RasterSource* source = 0;
+			if (alphaCutout && inst->m_hasAlpha)
+			{
+				RasterSource s;
+				s.m_model = inst->m_obj->m_model;
+				s.m_vertices = &tree->m_vertices[0];
+				s.m_uvs = tree->m_uvs.data();
+				s.m_indices = &tree->m_indices;
+				s.m_objectSpace = true;
+				for (int r = 0; r < 3; r++)
+					for (int c = 0; c < 3; c++)
+						s.m_inverse[r * 3 + c] = (float)(cof[r][c] / det);
+				sources.push_back(s);
+				source = &sources.back();
+			}
+			for (size_t c = 0; c < tree->m_chunks.size(); c++)
+			{
+				const RasterJob unit = {&tree->m_chunks[c], 0, inst, source};
+				jobs.push_back(unit);
+			}
+		}
+		if (!m_data->m_forestGrid.m_built)
+			buildForestGrid(m_data->m_forestGrid, m_data->m_batches);
+		forestCells = (long long)m_data->m_forestGrid.m_cellStart.size() - 1;
+		rasterFrame.m_lanes = &m_data->m_rasterLanes;
+		rasterFrame.m_tilesX = rasterView.m_tilesX;
+		rasterFrame.m_spread = job.m_pixelSpread;
+		job.m_raster = &rasterFrame;
+	}
+
 	// The depth hint: the same lens's last hits, put onto this frame's pixels, tell each ray about how far to search.
+	// A painted frame needs none: the painting bounds every ray it still casts.
 	job.m_hintFar = 0;
 	job.m_hitPoints = 0;
 	float viewProj[4][4];
@@ -4385,7 +7006,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	if (memory)
 	{
 		const Camera& cam = setups[0].m_cam;
-		if (memory->m_points.size() == numPixels * 3)
+		if (memory->m_points.size() == numPixels * 3 && !raster)
 		{
 			for (int r = 0; r < 4; r++)
 				for (int c = 0; c < 4; c++)
@@ -4403,10 +7024,15 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			job.m_hintFar = &m_data->m_hintFar[0];
 		}
 		memory->m_points.resize(numPixels * 3);
-		job.m_hitPoints = &memory->m_points[0];
+		// Only an unpainted frame reads the points back as its hint, so a painted one does not write them; a hint, stale or
+		// not, changes only how long a ray takes.
+		job.m_hitPoints = raster ? 0 : &memory->m_points[0];
 	}
 
-	std::vector<EdgeScratch> scratch((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
+	// The edge pass's per-pixel ids, hits and depths are kept from picture to picture and every pixel's are written by its
+	// tile in the first pass, hit or miss, before the edge pass reads any; a camera without them this time has them emptied.
+	std::vector<EdgeScratch>& scratch = m_data->m_edgeScratch;
+	scratch.resize((shading && shading->m_edgeAntialias && !thermal) ? (size_t)numTargets : 0);
 	std::vector<float> radiance(thermal ? numPixels * (size_t)numTargets : 0);
 	std::vector<std::vector<MoverRect> > movers((size_t)numTargets);
 	for (size_t i = 0; i < scratch.size() && shading->m_creaseFill; i++)
@@ -4415,12 +7041,17 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	for (size_t i = 0; i < scratch.size(); i++)
 	{
 		if (!setups[i].m_valid || !targets[i].m_rgb || !targets[i].m_depth)
+		{
+			scratch[i].m_ids.clear();
+			scratch[i].m_hits.clear();
+			scratch[i].m_inverseEyeDepth.clear();
+			scratch[i].m_background.clear();
+			scratch[i].m_rgb1.clear();
 			continue;
-		HitId none;
-		none.m_inst = none.m_geom = none.m_prim = none.m_inst1 = none.m_instPrim1 = RTC_INVALID_GEOMETRY_ID;
-		scratch[i].m_ids.assign(numPixels, -1);
-		scratch[i].m_hits.assign(numPixels, none);
-		scratch[i].m_inverseEyeDepth.assign(numPixels, 0.0f);
+		}
+		scratch[i].m_ids.resize(numPixels);
+		scratch[i].m_hits.resize(numPixels);
+		scratch[i].m_inverseEyeDepth.resize(numPixels);
 		if (!targets[i].m_background)
 			scratch[i].m_background.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
 	}
@@ -4448,6 +7079,8 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
 		ctx.m_pixelSpread = job.m_pixelSpread;
 		ctx.m_farthest = 0.0f;
+		ctx.m_directBatch = 0;
+		ctx.m_directPlacement = 0;
 		RTCIntersectArguments args;
 		rtcInitIntersectArguments(&args);
 		args.context = &ctx.m_context;
@@ -4477,6 +7110,25 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
 				hintFrames[0][i] = far;
 			}
+		}
+
+		// Every thread paints the chunks and trees it takes into its own lane, going on to the trees as soon as the chunks
+		// run out; the trees' barrier then hands all the lanes to whichever thread traces a tile. Chunks cost very different amounts, so threads take them a few at a time as
+		// they finish; which lane holds what never changes a tile, since painting keeps the nearest hit and the lesser key.
+		if (job.m_raster)
+		{
+#ifdef _OPENMP
+			RasterLane& lane = m_data->m_rasterLanes[(size_t)omp_get_thread_num()];
+#else
+			RasterLane& lane = m_data->m_rasterLanes[0];
+#endif
+			const long long numJobs = (long long)m_data->m_rasterJobs.size();
+#pragma omp for schedule(dynamic, 4) nowait
+			for (long long i = 0; i < numJobs; i++)
+				paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
+#pragma omp for schedule(dynamic, 16)
+			for (long long i = 0; i < forestCells; i++)
+				paintForestCell(lane, rasterView, m_data->m_forestGrid, (size_t)i, m_data->m_batches);
 		}
 
 		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread

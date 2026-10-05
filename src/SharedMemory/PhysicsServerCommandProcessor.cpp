@@ -3904,6 +3904,12 @@ int PhysicsServerCommandProcessor::createBodyInfoStream(int bodyUniqueId, char* 
 		ser.finalizeChunk(chunk, structType, BT_MULTIBODY_CODE, mb);
 		streamSizeInBytes = ser.getCurrentBufferSize();
 	}
+	else if (bodyHandle->m_rigidBody && bodyHandle->m_rigidBodyJoints.size() == 0 && bufferSizeInBytes >= BT_HEADER_LENGTH)
+	{
+		// Without joints the stream below is the header alone: a registered name never reaches the buffer.
+		btDefaultSerializer::writeHeader((unsigned char*)bufferServerToClient);
+		streamSizeInBytes = BT_HEADER_LENGTH;
+	}
 	else if (bodyHandle->m_rigidBody)
 	{
 		btRigidBody* rb = bodyHandle->m_rigidBody;
@@ -4578,6 +4584,10 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 				if ((flags & ER_NO_SEGMENTATION_MASK) != 0)
 				{
 					segmentationMaskBuffer = 0;
+				}
+				if ((flags & ER_SWARM_NO_DEPTH) != 0 && !compactDepthStream)
+				{
+					depthBuffer = 0;
 				}
 
 				int camRelativeStart = (numBatchCameras > 1 && camPixels > 0) ? (startPixelIndex % camPixels) : startPixelIndex;

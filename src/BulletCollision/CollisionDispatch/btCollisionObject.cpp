@@ -32,6 +32,12 @@ btCollisionObject::btCollisionObject()
 	  m_companionId(-1),
 	  m_worldArrayIndex(-1),
 	  m_activationState1(1),
+	  m_staticAabbShape(0),
+	  m_staticAabbThreshold(0),
+	  m_staticAabbRevision(0),
+	  m_transformRevision(1),
+	  m_staticAabbTransformRevision(0),
+	  m_staticAabbHeld(false),
 	  m_deactivationTime(btScalar(0.)),
 	  m_friction(btScalar(0.5)),
 	  m_restitution(btScalar(0.)),
@@ -48,10 +54,7 @@ btCollisionObject::btCollisionObject()
 	  m_ccdSweptSphereRadius(btScalar(0.)),
 	  m_ccdMotionThreshold(btScalar(0.)),
 	  m_checkCollideWith(false),
-	  m_updateRevision(0),
-	  m_staticAabbShape(0),
-	  m_staticAabbThreshold(0),
-	  m_staticAabbRevision(0)
+	  m_updateRevision(0)
 {
 	m_worldTransform.setIdentity();
 	m_interpolationWorldTransform.setIdentity();

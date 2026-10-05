@@ -9333,6 +9333,248 @@ static PyObject* pybullet_getTetraMeshData(PyObject* self, PyObject* args, PyObj
 
 
 
+// Swarm video look. The 8-point DCT scaled by 2^16, rounded once to whole numbers, as the Python stream_look builds it.
+static const double kSwarmLookDct[8][8] = {
+	{23170, 23170, 23170, 23170, 23170, 23170, 23170, 23170},
+	{32138, 27246, 18205, 6393, -6393, -18205, -27246, -32138},
+	{30274, 12540, -12540, -30274, -30274, -12540, 12540, 30274},
+	{27246, -6393, -32138, -18205, 18205, 32138, 6393, -27246},
+	{23170, -23170, -23170, 23170, 23170, -23170, -23170, 23170},
+	{18205, -32138, 6393, 27246, -27246, -6393, 32138, -18205},
+	{12540, -30274, 30274, -12540, -12540, 30274, -30274, 12540},
+	{6393, -18205, 27246, -32138, 32138, -27246, 18205, -6393}};
+static const int kSwarmLookLuma[8][8] = {
+	{16, 11, 10, 16, 24, 40, 51, 61}, {12, 12, 14, 19, 26, 58, 60, 55}, {14, 13, 16, 24, 40, 57, 69, 56},
+	{14, 17, 22, 29, 51, 87, 80, 62}, {18, 22, 37, 56, 68, 109, 103, 77}, {24, 35, 55, 64, 81, 104, 113, 92},
+	{49, 64, 78, 87, 103, 121, 120, 101}, {72, 92, 95, 98, 112, 100, 103, 99}};
+static const int kSwarmLookChroma[8][8] = {
+	{17, 18, 24, 47, 99, 99, 99, 99}, {18, 21, 26, 66, 99, 99, 99, 99}, {24, 26, 56, 99, 99, 99, 99, 99},
+	{47, 66, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}};
+
+// The render threads' count, as b3GetSwarmRenderThreads reads it: SWARM_RENDER_THREADS, default 2, held to 1..16.
+static int swarmLookThreads(void)
+{
+	static int cached = 0;
+	if (cached <= 0)
+	{
+		const char* env = getenv("SWARM_RENDER_THREADS");
+		const int n = env && env[0] ? atoi(env) : 2;
+		cached = n < 1 ? 1 : (n > 16 ? 16 : n);
+	}
+	return cached;
+}
+
+// One plane of whole numbers through the 8 x 8 DCT, rounded to a JPEG table's steps at a quality and back, in place.
+// The plane's whole numbers are exact in float32; the transform runs in doubles.
+// Every product and sum is a whole number under 2^53, exact in a double in any order, and the one inexact step, the
+// scale to the table, is the same double multiply and round half to even the Python stream_look does, so both give
+// the same numbers. Every pass adds whole rows of 8, which the compiler runs in vector lanes.
+static void swarmLookQuantise(float* plane, int height, int width, const int table[8][8], int quality)
+{
+	const int scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
+	double steps[8][8], reciprocal[8][8], transposed[8][8];
+	int i, j, k, bi, bj;
+	for (i = 0; i < 8; i++)
+		for (j = 0; j < 8; j++)
+		{
+			int step = (table[i][j] * scale + 50) / 100;
+			step = step < 1 ? 1 : (step > 255 ? 255 : step);
+			steps[i][j] = (double)step;
+			reciprocal[i][j] = 1.0 / (4294967296.0 * (double)step);
+			transposed[i][j] = kSwarmLookDct[j][i];
+		}
+	for (bi = 0; bi < height; bi += 8)
+		for (bj = 0; bj < width; bj += 8)
+		{
+			float* block = plane + (size_t)bi * width + bj;
+			double rows[8][8], levels[8][8];
+			// Along each block row, then down the columns: levels = DCT x block x DCT transposed. The 8 rows of a pass
+			// add up side by side, so no sum waits on the one before it.
+			memset(rows, 0, sizeof(rows));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double value = block[(size_t)i * width + k];
+					for (j = 0; j < 8; j++)
+						rows[i][j] += value * transposed[k][j];
+				}
+			memset(levels, 0, sizeof(levels));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double weight = kSwarmLookDct[i][k];
+					for (j = 0; j < 8; j++)
+						levels[i][j] += weight * rows[k][j];
+				}
+			for (i = 0; i < 8; i++)
+				for (j = 0; j < 8; j++)
+					levels[i][j] = nearbyint(levels[i][j] * reciprocal[i][j]) * steps[i][j];
+			// And back: block = DCT transposed x levels x DCT.
+			memset(rows, 0, sizeof(rows));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double value = levels[i][k];
+					for (j = 0; j < 8; j++)
+						rows[i][j] += value * kSwarmLookDct[k][j];
+				}
+			memset(levels, 0, sizeof(levels));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double weight = transposed[i][k];
+					for (j = 0; j < 8; j++)
+						levels[i][j] += weight * rows[k][j];
+				}
+			for (i = 0; i < 8; i++)
+				for (j = 0; j < 8; j++)
+					block[(size_t)i * width + j] = (float)nearbyint(levels[i][j] * (1.0 / 4294967296.0));
+		}
+}
+
+// The video look of `height` rows (a multiple of 16) of a frame `width` wide, from `in` into `dst`, with the band's own
+// brightness, colour and shift planes. Every step reads only its band: the 2 x 2 colour squares and the 8 x 8 blocks of
+// both resolutions never cross a 16-row boundary, so bands drawn apart give the bytes the whole frame gives.
+static void swarmLookBand(const float* in, float* dst, float* luma, float* cb, float* cr, float* shift, int height, int width, int quality)
+{
+	const int halfWidth = width / 2;
+	int row, col, i;
+	// Colour as whole numbers, clipped and rounded half to even, then brightness and the two colour planes in fixed
+	// point, all in float32 as the Python one: every value a whole number under 2^24, so exact.
+	for (i = 0; i < height * width * 3; i++)
+	{
+		const float value = in[i];
+		const float low = value < 0.0f ? 0.0f : value;
+		dst[i] = low > 1.0f ? 1.0f : low;
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] = nearbyintf(dst[i] * 255.0f);
+	// Brightness is never negative, so its floor division by 2^16 is a whole-number shift.
+	for (i = 0; i < height * width; i++)
+	{
+		const float* rgb = dst + (size_t)i * 3;
+		luma[i] = (float)((int)(rgb[0] * 19595.0f + rgb[1] * 38470.0f + rgb[2] * 7471.0f + 32768.0f) >> 16) - 128.0f;
+	}
+	// Each 2 x 2 square averaged for the colour planes.
+	for (row = 0; row < height / 2; row++)
+		for (col = 0; col < halfWidth; col++)
+		{
+			const float* top = dst + ((size_t)(2 * row) * width + 2 * col) * 3;
+			const float* bottom = top + (size_t)width * 3;
+			float half[3];
+			int c;
+			for (c = 0; c < 3; c++)
+				half[c] = floorf((top[c] + bottom[c] + top[3 + c] + bottom[3 + c] + 2.0f) * 0.25f);
+			cb[(size_t)row * halfWidth + col] = floorf((half[0] * -11059.0f + half[1] * -21709.0f + half[2] * 32768.0f + 32768.0f) * (1.0f / 65536.0f));
+			cr[(size_t)row * halfWidth + col] = floorf((half[0] * 32768.0f + half[1] * -27439.0f + half[2] * -5329.0f + 32768.0f) * (1.0f / 65536.0f));
+		}
+	swarmLookQuantise(luma, height, width, kSwarmLookLuma, quality);
+	swarmLookQuantise(cb, height / 2, halfWidth, kSwarmLookChroma, quality);
+	swarmLookQuantise(cr, height / 2, halfWidth, kSwarmLookChroma, quality);
+	// The colour shift of each 2 x 2 square, in doubles as its products pass 2^24, then added to the brightness of
+	// its four dots, clipped, and all divided.
+	for (i = 0; i < (height / 2) * halfWidth; i++)
+	{
+		const double u = cb[i], v = cr[i];
+		shift[i * 3] = (float)floor((v * 91881.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 1] = (float)floor((u * -22554.0 + v * -46802.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 2] = (float)floor((u * 116130.0 + 32768.0) * (1.0 / 65536.0));
+	}
+	for (row = 0; row < height; row++)
+	{
+		const float* squares = shift + (size_t)(row / 2) * halfWidth * 3;
+		const float* brightness = luma + (size_t)row * width;
+		float* line = dst + (size_t)row * width * 3;
+		for (col = 0; col < halfWidth; col++)
+		{
+			int c;
+			for (c = 0; c < 6; c++)
+			{
+				const float value = squares[col * 3 + c % 3] + (brightness[2 * col + c / 3] + 128.0f);
+				const float low = value < 0.0f ? 0.0f : value;
+				line[col * 6 + c] = low > 255.0f ? 255.0f : low;
+			}
+		}
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] /= 255.0f;
+}
+
+// swarmStreamLook(frame, out, quality): the video look of a float32 colour frame (height x width x 3, both multiples of
+// 16, values 0 to 1) written into out, a writable float32 array of the same shape, byte for byte what the Python
+// stream_look returns: colour at half resolution, 8 x 8 blocks quantised at the JPEG quality.
+static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
+{
+	PyObject *frameObj, *outObj;
+	int quality;
+	Py_buffer frame, out;
+	int height, width, threads;
+	float *luma, *cb, *cr, *shift;
+	if (!PyArg_ParseTuple(args, "OOi", &frameObj, &outObj, &quality))
+		return NULL;
+	if (quality < 1 || quality > 100)
+	{
+		PyErr_SetString(SpamError, "swarmStreamLook: quality must be 1 to 100.");
+		return NULL;
+	}
+	if (PyObject_GetBuffer(frameObj, &frame, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
+		return NULL;
+	if (PyObject_GetBuffer(outObj, &out, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT | PyBUF_WRITABLE) != 0)
+	{
+		PyBuffer_Release(&frame);
+		return NULL;
+	}
+	height = frame.ndim == 3 ? (int)frame.shape[0] : 0;
+	width = frame.ndim == 3 ? (int)frame.shape[1] : 0;
+	if (frame.ndim != 3 || frame.shape[2] != 3 || frame.itemsize != 4 || !frame.format || strcmp(frame.format, "f") != 0 ||
+		out.ndim != 3 || out.itemsize != 4 || !out.format || strcmp(out.format, "f") != 0 || out.shape[0] != height ||
+		out.shape[1] != width || out.shape[2] != 3 || height <= 0 || width <= 0 || height % 16 != 0 || width % 16 != 0)
+	{
+		PyBuffer_Release(&frame);
+		PyBuffer_Release(&out);
+		PyErr_SetString(SpamError, "swarmStreamLook: frame and out must be float32 arrays of one shape, height x width x 3, both multiples of 16.");
+		return NULL;
+	}
+	luma = (float*)malloc(sizeof(float) * (size_t)height * width);
+	cb = (float*)malloc(sizeof(float) * (size_t)(height / 2) * (width / 2));
+	cr = (float*)malloc(sizeof(float) * (size_t)(height / 2) * (width / 2));
+	shift = (float*)malloc(sizeof(float) * 3 * (size_t)(height / 2) * (width / 2));
+	if (!luma || !cb || !cr || !shift)
+	{
+		free(luma);
+		free(cb);
+		free(cr);
+		free(shift);
+		PyBuffer_Release(&frame);
+		PyBuffer_Release(&out);
+		return PyErr_NoMemory();
+	}
+	threads = swarmLookThreads();
+	Py_BEGIN_ALLOW_THREADS
+	{
+		const float* in = (const float*)frame.buf;
+		float* dst = (float*)out.buf;
+		const int halfWidth = width / 2;
+		int band;
+		// The render threads take bands of 16 rows each, the whole look of each band on one thread.
+#pragma omp parallel for num_threads(threads) schedule(static)
+		for (band = 0; band < height / 16; band++)
+			swarmLookBand(in + (size_t)band * 16 * width * 3, dst + (size_t)band * 16 * width * 3, luma + (size_t)band * 16 * width,
+						  cb + (size_t)band * 8 * halfWidth, cr + (size_t)band * 8 * halfWidth, shift + (size_t)band * 8 * halfWidth * 3, 16,
+						  width, quality);
+	}
+	Py_END_ALLOW_THREADS
+	free(luma);
+	free(cb);
+	free(cr);
+	free(shift);
+	PyBuffer_Release(&frame);
+	PyBuffer_Release(&out);
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
 static PyObject* pybullet_resetMeshData(PyObject* self, PyObject* args, PyObject* keywds)
 {
 	int bodyUniqueId = -1;
@@ -10473,15 +10715,24 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				npy_intp dep_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				npy_intp seg_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				int depthOnly = (flags >= 0) && ((flags & ER_DEPTH_ONLY) != 0);
+				int noDepth = !depthOnly && (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0);
 
 				pyResultList = PyTuple_New(5);
 
 				PyTuple_SetItem(pyResultList, 0, PyInt_FromLong(imageData.m_pixelWidth));
 				PyTuple_SetItem(pyResultList, 1, PyInt_FromLong(imageData.m_pixelHeight));
 
-				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
-				memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
-					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				if (noDepth)
+				{
+					Py_INCREF(Py_None);
+					pyDep = Py_None;
+				}
+				else
+				{
+					pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
+					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				}
 
 				if (depthOnly)
 				{
@@ -10526,9 +10777,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				int bytesPerPixel = 4;  // Red, Green, Blue, and Alpha each 8 bit values
 				int num =
 					bytesPerPixel * imageData.m_pixelWidth * imageData.m_pixelHeight;
+				const int noDepth = (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0) && ((flags & ER_DEPTH_ONLY) == 0);
 				pylistRGB = PyTuple_New(num);
-				pylistDep =
-					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
+				pylistDep = noDepth ? 0 : PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				pylistSeg =
 					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				for (i = 0; i < imageData.m_pixelWidth; i++)
@@ -10537,6 +10788,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 					{
 						// TODO(hellojas): validate depth values make sense
 						int depIndex = i + j * imageData.m_pixelWidth;
+						if (pylistDep)
 						{
 							item = PyFloat_FromDouble(imageData.m_depthValues[depIndex]);
 							PyTuple_SetItem(pylistDep, depIndex, item);
@@ -10559,6 +10811,11 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 			}
 
 			PyTuple_SetItem(pyResultList, 2, pylistRGB);
+			if (!pylistDep)
+			{
+				Py_INCREF(Py_None);
+				pylistDep = Py_None;
+			}
 			PyTuple_SetItem(pyResultList, 3, pylistDep);
 			PyTuple_SetItem(pyResultList, 4, pylistSeg);
 			return pyResultList;
@@ -13066,6 +13323,9 @@ static PyMethodDef SpamMethods[] = {
 	{"resetMeshData", (PyCFunction)pybullet_resetMeshData, METH_VARARGS | METH_KEYWORDS,
 	 "Reset mesh data: a deformable body takes new simulation vertices, any other body takes new positions for the visual mesh of linkIndex, keeping its faces, uvs and texture."},
 
+	{"swarmStreamLook", (PyCFunction)pybullet_swarmStreamLook, METH_VARARGS,
+	 "swarmStreamLook(frame, out, quality): a float32 colour frame as a live video stream delivers it, written into out."},
+
 	{"createVisualShape", (PyCFunction)pybullet_createVisualShape, METH_VARARGS | METH_KEYWORDS,
 	 "Create a visual shape. Returns a non-negative (int) unique id, if successfull, negative otherwise."},
 
@@ -13756,6 +14016,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
 	PyModule_AddIntConstant(m, "ER_SWARM_FRAME_REUSE", ER_SWARM_FRAME_REUSE);
 	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
+	PyModule_AddIntConstant(m, "ER_SWARM_RASTER", ER_SWARM_RASTER);
+	PyModule_AddIntConstant(m, "ER_SWARM_NO_DEPTH", ER_SWARM_NO_DEPTH);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

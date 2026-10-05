@@ -475,6 +475,7 @@ public:
 	void translate(const btVector3& v)
 	{
 		m_worldTransform.getOrigin() += v;
+		worldTransformWritten();
 	}
 
 	void getAabb(btVector3& aabbMin, btVector3& aabbMax) const;
@@ -543,6 +544,7 @@ public:
 	void setNewBroadphaseProxy(btBroadphaseProxy* broadphaseProxy)
 	{
 		m_broadphaseHandle = broadphaseProxy;
+		m_staticAabbHeld = false;
 	}
 
 	//btMotionState allows to automatic synchronize the world transform for active objects
@@ -558,7 +560,10 @@ public:
 	{
 		m_optionalMotionState = motionState;
 		if (m_optionalMotionState)
+		{
 			motionState->getWorldTransform(m_worldTransform);
+			worldTransformWritten();
+		}
 	}
 
 	//for experimental overriding of friction/contact solver func

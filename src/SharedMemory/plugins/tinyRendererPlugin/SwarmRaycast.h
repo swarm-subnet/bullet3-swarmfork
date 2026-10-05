@@ -44,6 +44,9 @@ struct SwarmRaycastShading
 	bool m_edgeOutline;
 	// ER_SWARM_CREASE_FILL: with m_edgeAntialias, a crease fills its uncovered share from its neighbours, not a probe ray.
 	bool m_creaseFill;
+	// ER_SWARM_RASTER: a lone camera paints the triangles in view, keeping the nearest per pixel, and casts a ray only
+	// where a forest tree or a mesh too dense to paint may lie nearer than what was painted there.
+	bool m_raster;
 	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
 	// encoded bytes as TinyRenderer's shader does.
