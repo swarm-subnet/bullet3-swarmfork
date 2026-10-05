@@ -947,7 +947,7 @@ static inline void filterLevel8(SharedTexture* const tex[8], FilterInts level, F
 
 // sampleBilinear on each lane, from the level of its own texture `images` names. A texel's bytes come from one
 // four-byte read at the texel, or one byte earlier for the last texel of a three-byte image, so no read leaves it.
-static inline void bilinear8(const FilterLevel8& images, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4])
+static inline void bilinear8(const FilterLevel8& images, FilterLanes u, FilterLanes v, FilterInts bpp, FilterInts out[4], int channels)
 {
 	const FilterLongs baseLo = images.m_baseLo, baseHi = images.m_baseHi;
 	const FilterInts w = images.m_w, h = images.m_h;
@@ -983,8 +983,8 @@ static inline void bilinear8(const FilterLevel8& images, FilterLanes u, FilterLa
 		texel[q] = filterSelect(early, (FilterInts)((FilterUints)bytes >> 8), bytes);
 	}
 	// The four-weight sum, as two blends along x and one along y: t00 (256 - wx) + t10 wx is 256 t00 + (t10 - t00) wx in
-	// whole numbers, and so for the rows, so every sum is the same integer with fewer products.
-	for (int c = 0; c < 4; c++)
+	// whole numbers, and so for the rows, so every sum is the same integer with fewer products. Only the first `channels`.
+	for (int c = 0; c < channels; c++)
 	{
 		const int s = 8 * c;
 		const FilterInts t00 = (texel[0] >> s) & 255, t10 = (texel[1] >> s) & 255, t01 = (texel[2] >> s) & 255, t11 = (texel[3] >> s) & 255;
@@ -1046,6 +1046,11 @@ static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f
 	filterLevel8(tex, level, bpp, lone[0], fine);
 	if (blend)
 		filterLevel8(tex, coarser, bpp, lone[1], coarse);
+	// A fourth channel is written as 0 for a three-byte image, so with every lane's image three-byte it is not read at all.
+	bool allRgb = true;
+	for (int l = 0; l < 8; l++)
+		allRgb = allRgb && bpp[l] == 3;
+	const int channels = allRgb ? 3 : 4;
 	FilterInts sum[4] = {zero, zero, zero, zero};
 	for (int k = 0; k < most; k++)
 	{
@@ -1053,16 +1058,16 @@ static void filtered8(SharedTexture* const tex[8], const Vec2f* uvf, const Vec2f
 		const FilterInts many = taps > one;
 		const FilterLanes uk = filterSelect(many, wrapUnit8(u + along0 * f), u), vk = filterSelect(many, wrapUnit8(v + along1 * f), v);
 		FilterInts a[4], b[4];
-		bilinear8(fine, uk, vk, bpp, a);
+		bilinear8(fine, uk, vk, bpp, a, channels);
 		if (blend)
 		{
-			bilinear8(coarse, uk, vk, bpp, b);
-			for (int c = 0; c < 4; c++)
+			bilinear8(coarse, uk, vk, bpp, b, channels);
+			for (int c = 0; c < channels; c++)
 				// a (256 - w) + b w as 256 a + (b - a) w, the same integer; at w = 0 it is a itself.
 				a[c] = ((a[c] << 8) + (b[c] - a[c]) * weight + 128) >> 8;
 		}
 		const FilterInts active = (zero + k) < taps;
-		for (int c = 0; c < 4; c++)
+		for (int c = 0; c < channels; c++)
 			sum[c] += filterSelect(active, a[c], zero);
 	}
 	for (int c = 0; c < 4; c++)
