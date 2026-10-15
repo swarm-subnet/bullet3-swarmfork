@@ -1,6 +1,7 @@
 #include "LoadMeshFromObj.h"
 
 #include "../../OpenGLWindow/GLInstanceGraphicsShape.h"
+#include <ctype.h>
 #include <stdio.h>  //fopen
 #include "Bullet3Common/b3AlignedObjectArray.h"
 #include <string>
@@ -74,11 +75,19 @@ static bool objCacheKey(const char* filename, const char* mtl_basepath, CommonFi
 	{
 		const char* newline = (const char*)memchr(text + at, '\n', obj.size() - at);
 		const size_t end = newline ? (size_t)(newline - text) : obj.size();
-		if (end - at > 7 && memcmp(&obj[at], "mtllib", 6) == 0 && (obj[at + 6] == ' ' || obj[at + 6] == '\t'))
+		// The directive and its name as the parser reads them: after any indent, and only the first word after it.
+		size_t start = at;
+		while (start < end && (obj[start] == ' ' || obj[start] == '\t'))
+			start++;
+		if (end - start > 7 && memcmp(&obj[start], "mtllib", 6) == 0 && (obj[start + 6] == ' ' || obj[start + 6] == '\t'))
 		{
-			std::string name(&obj[at + 7], end - at - 7);
-			while (!name.empty() && (name[name.size() - 1] == '\r' || name[name.size() - 1] == ' ' || name[name.size() - 1] == '\t'))
-				name.erase(name.size() - 1);
+			size_t first = start + 7;
+			while (first < end && isspace((unsigned char)obj[first]))
+				first++;
+			size_t last = first;
+			while (last < end && !isspace((unsigned char)obj[last]))
+				last++;
+			std::string name(text + first, last - first);
 			std::vector<char> mtl;
 			if (!readWholeFile(fileIO, (std::string(mtl_basepath ? mtl_basepath : "") + name).c_str(), mtl))
 				return false;
@@ -156,6 +165,17 @@ static bool readObjCache(const std::vector<char>& bytes, std::string& msg, bt_ti
 		if (!in.block(shapes[i].mesh.indices))
 			return false;
 	}
+	// An index outside the attribute arrays makes the file a miss rather than an out-of-bounds read.
+	const long long numVertices = (long long)(attribute.vertices.size() / 3), numNormals = (long long)(attribute.normals.size() / 3);
+	const long long numTexcoords = (long long)(attribute.texcoords.size() / 2);
+	for (size_t i = 0; i < shapes.size(); i++)
+		for (size_t k = 0; k < shapes[i].mesh.indices.size(); k++)
+		{
+			const bt_tinyobj::index_t& index = shapes[i].mesh.indices[k];
+			if (index.vertex_index < 0 || index.vertex_index >= numVertices || index.normal_index < -1 || index.normal_index >= numNormals ||
+				index.texcoord_index < -1 || index.texcoord_index >= numTexcoords)
+				return false;
+		}
 	return in.m_at == in.m_end;
 }
 

@@ -41,9 +41,9 @@ inline bool b3DiskCachePath(unsigned long long key, const char* suffix, std::str
 	const char* dir = getenv("SWARM_BVH_CACHE_DIR");
 	if (!dir || !*dir)
 		return false;
-	char name[1200];
-	snprintf(name, sizeof(name), "%s/%016llx.%s", dir, key, suffix);
-	path = name;
+	char name[32];
+	snprintf(name, sizeof(name), "%016llx.", key);
+	path = std::string(dir) + "/" + name + suffix;
 	return true;
 }
 
@@ -68,15 +68,16 @@ inline bool b3DiskCacheRead(const std::string& path, std::vector<char>& out)
 // Writes `length` bytes to `path` through a file of this process's own, renamed into place when whole.
 inline void b3DiskCacheWrite(const std::string& path, const void* data, size_t length)
 {
-	char tmp[1300];
-	snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path.c_str(), (int)b3DiskCacheProcessId());
-	FILE* f = fopen(tmp, "wb");
+	char pid[32];
+	snprintf(pid, sizeof(pid), ".%d.tmp", (int)b3DiskCacheProcessId());
+	const std::string tmp = path + pid;
+	FILE* f = fopen(tmp.c_str(), "wb");
 	if (!f)
 		return;
 	bool ok = length == 0 || fwrite(data, 1, length, f) == length;
 	ok = (fclose(f) == 0) && ok;
-	if (!ok || rename(tmp, path.c_str()) != 0)
-		remove(tmp);
+	if (!ok || rename(tmp.c_str(), path.c_str()) != 0)
+		remove(tmp.c_str());
 }
 
 // Appends and reads back plain values and blocks in one byte buffer, for the cache files' simple layouts.
