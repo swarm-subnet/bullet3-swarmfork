@@ -10541,7 +10541,8 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		thermalSeedObj = 0;
 	airTemperature = airTemperatureObj ? (float)PyFloat_AsDouble(airTemperatureObj) : 0;
 	skyTemperature = skyTemperatureObj ? (float)PyFloat_AsDouble(skyTemperatureObj) : 0;
-	thermalSeed = thermalSeedObj ? (int)PyLong_AsLong(thermalSeedObj) : 0;
+	// any integer seeds the grain; its low 32 bits are what count, as for sensorSeed
+	thermalSeed = thermalSeedObj ? (int)(unsigned int)PyLong_AsUnsignedLongMask(thermalSeedObj) : 0;
 	if (PyErr_Occurred())
 	{
 		return NULL;
@@ -10553,6 +10554,11 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		return NULL;
 	}
 
+	// The request is built, drawn and copied out under one lock: a client keeps a single command and one set of frame
+	// buffers, so a second thread on the same client waits for the whole call.
+	Py_BEGIN_ALLOW_THREADS
+	PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
 	command = b3InitRequestCameraImage(sm);
 	b3RequestCameraImageSetPixelResolution(command, width, height);
 
@@ -10584,6 +10590,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		unsigned long seed = PyLong_AsUnsignedLongMask(skyCloudSeedObj);
 		if (PyErr_Occurred())
 		{
+			PyThread_release_lock(sCameraLock);
 			return NULL;
 		}
 		b3RequestCameraImageSetSkyCloudSeed(command, (int)(unsigned int)seed);
@@ -10660,6 +10667,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		unsigned long seed = PyLong_AsUnsignedLongMask(sensorSeedObj);
 		if (PyErr_Occurred())
 		{
+			PyThread_release_lock(sCameraLock);
 			return NULL;
 		}
 		b3RequestCameraImageSetSensorSeed(command, (int)(unsigned int)seed);
@@ -10690,9 +10698,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 
 		// the frame touches no Python object, so other threads run while it is drawn
 		Py_BEGIN_ALLOW_THREADS
-		PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
-		PyThread_release_lock(sCameraLock);
 		Py_END_ALLOW_THREADS
 		statusType = b3GetStatusType(statusHandle);
 		if (statusType == CMD_CAMERA_IMAGE_COMPLETED)
@@ -10818,12 +10824,15 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 			}
 			PyTuple_SetItem(pyResultList, 3, pylistDep);
 			PyTuple_SetItem(pyResultList, 4, pylistSeg);
+			PyThread_release_lock(sCameraLock);
 			return pyResultList;
 #endif  //PYBULLET_USE_NUMPY
 
+			PyThread_release_lock(sCameraLock);
 			return pyResultList;
 		}
 	}
+	PyThread_release_lock(sCameraLock);
 
 	Py_INCREF(Py_None);
 	return Py_None;
@@ -10936,6 +10945,10 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 			return NULL;
 		}
 
+		// The request is built, drawn and copied out under one lock, as getCameraImage's is.
+		Py_BEGIN_ALLOW_THREADS
+		PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+		Py_END_ALLOW_THREADS
 		command = b3InitRequestCameraImage(sm);
 		b3RequestCameraImageSetPixelResolution(command, width, height);
 		b3RequestCameraImageSetCameraMatrices(command, viewMatrix, projectionMatrix);
@@ -10959,9 +10972,7 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 			b3SharedMemoryStatusHandle statusHandle;
 			// a single camera falls back to the shared depth scratch, so these frames take turns with getCameraImage's
 			Py_BEGIN_ALLOW_THREADS
-			PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
 			statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
-			PyThread_release_lock(sCameraLock);
 			Py_END_ALLOW_THREADS
 			if (b3GetStatusType(statusHandle) == CMD_CAMERA_IMAGE_COMPLETED)
 			{
@@ -10974,14 +10985,17 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 					pyDep = PyArray_SimpleNew(3, dep_dims, NPY_FLOAT32);
 					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
 						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+					PyThread_release_lock(sCameraLock);
 					return pyDep;
 				}
 #else
+				PyThread_release_lock(sCameraLock);
 				PyErr_SetString(SpamError, "getDepthImagesBatch requires numpy support.");
 				return NULL;
 #endif
 			}
 		}
+		PyThread_release_lock(sCameraLock);
 	}
 	PyErr_SetString(SpamError, "getDepthImagesBatch failed.");
 	return NULL;

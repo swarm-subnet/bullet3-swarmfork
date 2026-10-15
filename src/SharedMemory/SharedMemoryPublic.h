@@ -912,10 +912,10 @@ enum EnumRendererAuxFlags
 	ER_SWARM_THERMAL = 32768,
 	// Ray-cast colour path: the finished frame goes through a camera in low light: white balance to the frame's light,
 	// auto exposure up to a gain cap, photon and read noise from the light each pixel collected, colour fading with it.
-	ER_SWARM_LOW_LIGHT = 65536,
+	ER_SWARM_LOW_LIGHT = 1048576,
 	// Ray-cast colour path under linear light: the IR-cut filter out, surfaces reflect by their near-infrared albedo
 	// and the frame is written in grey.
-	ER_SWARM_NEAR_INFRARED = 131072,
+	ER_SWARM_NEAR_INFRARED = 16777216,
 	// With ER_EDGE_ANTIALIAS: only outlines are smoothed (another body or a depth step), not creases inside one body.
 	ER_SWARM_EDGE_OUTLINE = 262144,
 	// Ray-cast path: a lone camera asked again for an unchanged frame gets it back untraced; the camera chain runs again.

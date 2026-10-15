@@ -566,6 +566,9 @@ bool PhysicsDirect::processCamera(const struct SharedMemoryCommand& orgCommand)
 			// A buffer this request's chunks write in full is resized without filling it first; the others fill as before.
 			m_data->m_cachedCameraPixelsRGBA.reserve(numPixels * numBytesPerPixel);
 			m_data->m_cachedCameraDepthBuffer.resizeNoInitialize(numTotalPixels);
+			// No chunk writes depth for ER_SWARM_NO_DEPTH, so a reader of the C API gets zeros, not unset memory.
+			if (noDepth && serverCmd.m_sendPixelDataArguments.m_startingPixelIndex == 0 && numTotalPixels > 0)
+				memset(&m_data->m_cachedCameraDepthBuffer[0], 0, numTotalPixels * sizeof(float));
 			if (!noSeg && !compactDepthStream)
 				m_data->m_cachedSegmentationMask.resizeNoInitialize(numTotalPixels);
 			else
