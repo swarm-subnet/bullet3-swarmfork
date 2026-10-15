@@ -133,7 +133,8 @@ float radiancePerKelvin(float level)
 float SwarmThermal::radiance(float celsius)
 {
 	float x = (celsius - kTableMinC) / kTableStepC;
-	x = x < 0.0f ? 0.0f : (x > (float)(kTableSize - 1) ? (float)(kTableSize - 1) : x);
+	// Written so a NaN fails the first test and reads the table's first entry.
+	x = !(x > 0.0f) ? 0.0f : (x > (float)(kTableSize - 1) ? (float)(kTableSize - 1) : x);
 	int i = (int)x;
 	i = i < kTableSize - 1 ? i : kTableSize - 2;
 	const float f = x - (float)i;

@@ -14750,6 +14750,13 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 	serverCmd.m_type = CMD_VISUAL_SHAPE_UPDATE_FAILED;
 	InternalTextureHandle* texHandle = 0;
 
+	// A heat map id no texture has fails the whole update, so a mistyped id cannot remove the map already there.
+	if ((clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_THERMAL) &&
+		(clientCmd.m_updateVisualShapeDataArguments.m_thermalFields & THERMAL_FIELD_HEAT_MAP) &&
+		clientCmd.m_updateVisualShapeDataArguments.m_heatTextureUniqueId >= 0 &&
+		!m_data->m_textureHandles.getHandle(clientCmd.m_updateVisualShapeDataArguments.m_heatTextureUniqueId))
+		return hasStatus;
+
 	if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_TEXTURE)
 	{
 		if (clientCmd.m_updateVisualShapeDataArguments.m_textureUniqueId >= 0)

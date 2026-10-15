@@ -191,7 +191,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 				greyRow(c0, c1, c2, width, lum + start);
 			// Electrons collected and the noise on them, the photons' own spread plus the read noise, in linear light.
 			int col = 0;
-#if defined(__AVX2__)
+#if defined(__AVX2__) && defined(__GNUC__)
 			for (; col + 8 <= width; col += 8)
 			{
 				SwarmLanes8 clean;
@@ -199,7 +199,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 				const SwarmLanes8 product = clean * photons;
 				const SwarmLanes8 electrons = clean > zero ? product : zero;
 				const SwarmLanes8 spread = (SwarmLanes8)_mm256_sqrt_ps((__m256)(electrons + readVariance));
-				const SwarmLanes8 snr2 = (electrons * electrons) / (spread * spread);
+				const SwarmLanes8 snr2 = electrons > zero ? (electrons * electrons) / (spread * spread) : zero;
 				const SwarmLanes8 noise = spread / photons, kept = snr2 / (snr2 + detailSnr2);
 				memcpy(sigma + start + col, &noise, sizeof(noise));
 				memcpy(detail + start + col, &kept, sizeof(kept));
@@ -212,7 +212,8 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 				const float clean = lum[i];
 				const float electrons = clean > 0.0f ? clean * photons : 0.0f;
 				const float spread = sqrtf(electrons + readVariance);
-				const float snr2 = (electrons * electrons) / (spread * spread);
+				// No electrons is no signal, also with no read noise, where the ratio would be 0 / 0.
+				const float snr2 = electrons > 0.0f ? (electrons * electrons) / (spread * spread) : 0.0f;
 				sigma[i] = spread / photons;
 				detail[i] = snr2 / (snr2 + detailSnr2);
 				line[col] = snr2;

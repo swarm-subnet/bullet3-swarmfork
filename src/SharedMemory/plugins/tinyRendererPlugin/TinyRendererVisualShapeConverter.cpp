@@ -3043,8 +3043,9 @@ void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkI
 				thermal.m_hasTemperature = temperature == temperature;
 				thermal.m_temperature = thermal.m_hasTemperature ? temperature : 0.f;
 			}
+			// Above 1 a surface would reflect a negative share of its surroundings; a negative value keeps the default.
 			if (fields & THERMAL_FIELD_EMISSIVITY)
-				thermal.m_emissivity = emissivity;
+				thermal.m_emissivity = emissivity > 1.0f ? 1.0f : emissivity;
 			if (fields & THERMAL_FIELD_HEAT_MAP)
 			{
 				thermal.m_heatTexels = heatTexels;

@@ -10,6 +10,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -856,10 +857,13 @@ const size_t kTreeCacheEntryWeight = 1000;
 TreeCache gTreeCache;
 IdleTrees gIdleTrees;
 size_t gIdleWeight = 0;
+// Renderers of every client in the process share the cache, and a body removed on one client can meet a frame on another.
+std::mutex gTreeCacheMutex;
 
 // The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
 CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices, bool robust)
 {
+	const std::lock_guard<std::mutex> guard(gTreeCacheMutex);
 	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
 	const std::pair<size_t, size_t> key(numVertices, numTriangles);
 	const std::pair<TreeCache::iterator, TreeCache::iterator> range = gTreeCache.equal_range(key);
@@ -919,6 +923,7 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 // A world stops drawing the tree; once idle it stays for a later world while the idle ones fit the bound.
 void releaseCachedTree(CachedTree* tree)
 {
+	const std::lock_guard<std::mutex> guard(gTreeCacheMutex);
 	if (--tree->m_users > 0)
 		return;
 	tree->m_idle = gIdleTrees.insert(gIdleTrees.end(), tree);
@@ -2812,7 +2817,8 @@ inline float spotIrradiance(const SwarmRaycastShading& shading, const float poin
 	if (!(facing > 0.0f) || !(axis > shading.m_spotCosOuter))
 		return 0.0f;
 	float cone = (axis - shading.m_spotCosOuter) / (shading.m_spotCosInner - shading.m_spotCosOuter);
-	cone = cone < 1.0f ? cone : 1.0f;
+	// Clamped both ways: a cone wider than a full turn puts the inner edge outside the outer one.
+	cone = cone > 0.0f ? (cone < 1.0f ? cone : 1.0f) : 0.0f;
 	cone = cone * cone * (3.0f - 2.0f * cone);
 	const float reach2 = reach * reach;
 	const float window = 1.0f - reach2 * reach2;
@@ -3995,6 +4001,8 @@ float heatAt(const TinyRenderThermal& thermal, const TinyRender::Vec2f& uv)
 	u = u < 0.0f ? u + 1.0f : u;
 	v = v < 0.0f ? v + 1.0f : v;
 	const int w = thermal.m_heatWidth, h = thermal.m_heatHeight;
+	if (w <= 0 || h <= 0)
+		return thermal.m_heatLow;
 	int x = (int)(u * w), y = (int)(v * h);
 	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
 	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
@@ -5872,7 +5880,7 @@ void shadeHitFinishMany(const SwarmRaycastShading& shading, const ShadeWait* sha
 			const Lanes axis = -((sd[0] * toLamp[0] + sd[1] * toLamp[1]) + sd[2] * toLamp[2]);
 			const Ints lights = (distance2 > zero) & (reach < one) & (towards > zero) & (axis > shading.m_spotCosOuter);
 			Lanes cone = (axis - shading.m_spotCosOuter) / (shading.m_spotCosInner - shading.m_spotCosOuter);
-			cone = cone < one ? cone : one;
+			cone = cone > zero ? (cone < one ? cone : one) : zero;
 			cone = cone * cone * (3.0f - 2.0f * cone);
 			const Lanes reach2 = reach * reach;
 			const Lanes window = 1.0f - reach2 * reach2;
