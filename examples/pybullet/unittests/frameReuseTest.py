@@ -1,16 +1,21 @@
 """ER_SWARM_FRAME_REUSE: a still camera gets its last frame back, and every frame it gets is the one it would have drawn:
 after a mover goes by out of sight and shade, after one comes into view or throws its shadow in, after a colour change,
-with new grain at night and in thermal, and with the same bytes at any thread count."""
+a new or removed body, a new texture or temperature, on a frame too small to keep, with new grain at night and in
+thermal, and with the same bytes at any thread count."""
 import hashlib
 import math
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
 import numpy as np
 import pybullet as p
+
+from daylightTest import write_png
 
 SIZE = 96
 REUSE = getattr(p, "ER_SWARM_FRAME_REUSE", 0)
@@ -165,13 +170,60 @@ class TestFrameReuse(unittest.TestCase):
       frames.append(reused)
     self.assertEqual(len(set(frames)), 3)
 
+  def changed(self, change, flags=PICTURE, **extra):
+    """After a kept frame, a change gives the frame drawn without reuse, which differs from the kept one."""
+    both(flags, **extra)
+    before, _ = both(flags, **extra)
+    change()
+    reused, plain = both(flags, **extra)
+    self.assertEqual(reused, plain)
+    self.assertNotEqual(reused, before)
+
+  def test_new_body_in_view_is_drawn(self):
+    """A body created in view shows in the next frame."""
+    box = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.2, 0.2, 0.2], rgbaColor=[1, 1, 0, 1])
+    self.changed(lambda: p.createMultiBody(baseMass=0, baseVisualShapeIndex=box, basePosition=[-0.8, 0.8, 0.2]), shadow=1)
+
+  def test_removed_body_is_gone(self):
+    """A body removed from view is gone from the next frame."""
+    box = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.2, 0.2, 0.2], rgbaColor=[1, 1, 0, 1])
+    body = p.createMultiBody(baseMass=0, baseVisualShapeIndex=box, basePosition=[-0.8, 0.8, 0.2])
+    self.changed(lambda: p.removeBody(body), shadow=1)
+
+  def test_new_texture_is_drawn(self):
+    """A texture put on a body in view shows in the next frame."""
+    folder = tempfile.mkdtemp()
+    try:
+      rgba = np.zeros((8, 8, 4), dtype=np.uint8)
+      rgba[..., 1], rgba[..., 3] = 255, 255
+      path = os.path.join(folder, "green.png")
+      write_png(path, rgba)
+      texture = p.loadTexture(path)
+      move(self.body, IN_VIEW)
+      self.changed(lambda: p.changeVisualShape(self.body, -1, textureUniqueId=texture), shadow=1)
+    finally:
+      shutil.rmtree(folder)
+
+  @unittest.skipUnless(getattr(p, "ER_SWARM_THERMAL", 0), "wheel built without thermal")
+  def test_new_temperature_is_drawn(self):
+    """A temperature set on a body in view changes the next thermal frame."""
+    move(self.body, IN_VIEW)
+    self.changed(lambda: p.changeVisualShape(self.body, -1, temperature=60.0), THERMAL, airTemperature=15.0,
+                 skyTemperature=-20.0, thermalSeed=1)
+
+  def test_small_frame_is_always_drawn(self):
+    """A frame under 64 x 64 pixels keeps nothing, so it is the frame drawn without reuse before and after a change."""
+    move(self.body, IN_VIEW)
+    self.changed(lambda: p.changeVisualShape(self.body, -1, rgbaColor=[0, 1, 0, 1]), shadow=1, size=32)
+
   def test_kept_frame_skips_the_tracing(self):
-    """A large frame asked again costs a fraction of drawing it: the frame really is handed back."""
+    """A large frame asked again costs a fraction of drawing it: the frame really is handed back. Timed in this
+    process's CPU seconds, which other work on the machine does not stretch."""
     def spent(eye):
-      """Seconds one request from eye takes."""
-      start = time.perf_counter()
+      """CPU seconds one request from eye takes, the render threads' included."""
+      start = time.process_time()
       render(PICTURE | REUSE, size=320, eye=eye, shadow=1)
-      return time.perf_counter() - start
+      return time.process_time() - start
     fresh = min(spent([0.001 * k, 0.0, 4.0]) for k in range(1, 6))
     spent(EYE)
     spent(EYE)

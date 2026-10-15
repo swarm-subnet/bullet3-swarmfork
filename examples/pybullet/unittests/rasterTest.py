@@ -59,12 +59,13 @@ def render(flags, size=SIZE, eye=EYE, target=TARGET):
 
 
 def assert_same_frame(case, searched, painted):
-  """Object maps agree but for seam samples, depth agrees where they do, and colour barely moves."""
+  """Object maps agree but for seam samples, depth agrees where they do, and colour is byte-equal but for at most half
+  a percent of pixels, the seams where two triangles meet, so no shade can drift across the frame."""
   agree = searched[2] == painted[2]
   case.assertGreaterEqual(agree.mean(), 0.998)
   case.assertLess(np.abs(searched[1] - painted[1])[agree].max(), 1e-4)
   steps = np.abs(searched[0].astype(int) - painted[0].astype(int)).max(axis=2)
-  case.assertLessEqual((steps > 16).mean(), 0.005)
+  case.assertLessEqual((steps > 0).mean(), 0.005)
 
 
 def bodies(seg):

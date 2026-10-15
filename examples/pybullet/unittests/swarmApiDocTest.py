@@ -14,13 +14,19 @@ EMBREE_SCRIPT = ROOT / "examples" / "ThirdPartyLibs" / "embree" / "build_embree.
 # The enums whose every value the document lists, upstream rows included, so a taken bit is visible.
 ENUMS = ("EnumRendererAuxFlags", "eEnumUpdateVisualShapeFlags", "eURDF_Flags", "eUrdfCollisionFlags")
 # The calls whose keyword lists the document describes.
-CALLS = ("pybullet_getCameraImage", "pybullet_getDepthImagesBatch")
+CALLS = ("pybullet_getCameraImage", "pybullet_getDepthImagesBatch", "pybullet_changeVisualShape")
 
 
 def enum_values(name):
   """Name to value of every member of one enum in the public header, as written there."""
   body = re.search(r"enum\s+" + name + r"\s*\{(.*?)\};", HEADER.read_text(), re.S).group(1)
   return dict(re.findall(r"^\s*(\w+)\s*=\s*([^,/]+?)\s*(?:,|$)", body, re.M))
+
+
+def number(text):
+  """The integer a header value spells, a plain number or a (1 << n) shift."""
+  shift = re.fullmatch(r"\(\s*1\s*<<\s*(\d+)\s*\)", text)
+  return 1 << int(shift.group(1)) if shift else int(text)
 
 
 def keyword_list(function):
@@ -62,10 +68,16 @@ class TestSwarmApiDoc(unittest.TestCase):
     stated = set(re.findall(r"next free (?:value|bit)[^0-9]*?(\d+)", self.doc))
     self.assertEqual(stated, {str(highest * 2)}, "next free render flag bit is %d" % (highest * 2))
 
-  def test_every_camera_keyword_has_a_row(self):
-    """Each keyword of getCameraImage and getDepthImagesBatch appears in the document."""
+  def test_no_render_flag_is_a_renderer_id(self):
+    """No render flag has the value of a renderer id, so a flag passed as the renderer is never taken for one."""
+    renderers = {number(v) for v in enum_values("EnumRenderer").values()}
+    clashes = sorted(n for n, v in enum_values("EnumRendererAuxFlags").items() if number(v) in renderers)
+    self.assertEqual(clashes, [], "render flags that equal a renderer id: %s" % clashes)
+
+  def test_every_keyword_has_a_row(self):
+    """Each keyword of getCameraImage, getDepthImagesBatch and changeVisualShape appears in the document."""
     missing = [k for c in CALLS for k in keyword_list(c) if k not in self.names]
-    self.assertEqual(missing, [], "camera keywords without a row: %s" % missing)
+    self.assertEqual(missing, [], "keywords without a row: %s" % missing)
 
   def test_every_environment_switch_has_a_row(self):
     """Each SWARM_ variable read by the engine, setup.py or the Embree script appears in the document."""

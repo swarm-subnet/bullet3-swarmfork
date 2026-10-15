@@ -14,6 +14,8 @@ import pybullet as p
 from daylightTest import write_obj
 from instancedStaticTest import CUTOUT, DAY, INSTANCED, MAP, RAY, frame
 
+BINARY_ROWS = unittest.skipUnless(getattr(p, "FOREST_FILE_BINARY", 0), "wheel that reads text forest rows only")
+
 # (mesh index, position, yaw in radians, scale) of each placement, with turns and uneven scales on purpose.
 PLACEMENTS = [(0, (-2.0, -1.0, 0.4), 0.0, (1.0, 1.0, 1.0)), (0, (1.5, -1.5, 0.2), 0.7, (0.6, 1.3, 1.0)),
               (1, (0.0, 1.5, 0.5), 2.1, (1.0, 1.0, 1.8)), (1, (2.0, 1.0, 0.1), -1.2, (0.8, 0.8, 0.8)),
@@ -121,6 +123,7 @@ class TestForestBatch(unittest.TestCase):
       apart = frame(flags=flags, eye=(0, -6, 6))
       self.assertPixelsEqual(together, apart)
 
+  @BINARY_ROWS
   def test_binary_rows_draw_the_text_rows_bytes(self):
     """Rows given as doubles draw the same colour, depth and mask as the same rows given as text."""
     forest_world(self.folder)
@@ -130,9 +133,9 @@ class TestForestBatch(unittest.TestCase):
     for left, right in zip(text, binary):
       self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
 
+  @BINARY_ROWS
   def test_a_damaged_binary_file_draws_nothing_and_fails_nothing(self):
     """A row count past the end of the file refuses it, and rows whose mesh index is NaN or out of range are skipped."""
-    self.assertTrue(p.FOREST_FILE_BINARY)
     meshes = write_meshes(self.folder)
     rows = np.array([[0, 0, 0, 0.5, 0, 0, 0, 1, 1, 1, 1]] * 3, dtype="<f8")
     rows[1, 0], rows[2, 0] = np.nan, 7.0

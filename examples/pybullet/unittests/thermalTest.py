@@ -55,11 +55,11 @@ class Scene(object):
     p.changeVisualShape(body, -1, thermalTextureUniqueId=p.loadTexture(png), temperatureRange=[low, high])
     return body
 
-  def render(self, flags=FRAME, eye=DOWN, sun=NIGHT, seed=1, renderer=p.ER_TINY_RENDERER):
+  def render(self, flags=FRAME, eye=DOWN, sun=NIGHT, seed=1, renderer=p.ER_TINY_RENDERER, air=AIR, sky=SKY):
     """Returns (grey or rgb, depth, seg, view) of one frame; thermal arguments are passed whatever the flags."""
     view = p.computeViewMatrix(list(eye[0]), list(eye[1]), [0, 1, 0] if eye == DOWN else [0, 0, 1])
     _, _, rgb, depth, seg = p.getCameraImage(SIZE, SIZE, view, self.proj, lightDirection=sun, renderer=renderer,
-                                             flags=flags, airTemperature=AIR, skyTemperature=SKY, thermalSeed=seed)
+                                             flags=flags, airTemperature=air, skyTemperature=sky, thermalSeed=seed)
     rgb = np.asarray(rgb, dtype=np.uint8).reshape(SIZE, SIZE, 4)[:, :, :3]
     return rgb, np.asarray(depth, dtype=np.float32).reshape(SIZE, SIZE), np.asarray(seg).reshape(SIZE, SIZE), view
 
@@ -73,9 +73,10 @@ class Scene(object):
     return clip[..., :3] / clip[..., 3:4]
 
 
-def full_scene():
-  """Every thermal term at once: a sheltering roof, a warm box, a glass slab and a heat map; returns the scene."""
-  scene = Scene()
+def full_scene(scene=None):
+  """Every thermal term at once: a sheltering roof, a warm box, a glass slab and a heat map, added to the given scene or
+  a new one; returns the scene."""
+  scene = scene or Scene()
   scene.box((0, 0, 3), (0.5, 0.5, 0.02))
   p.changeVisualShape(scene.box((3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=33.0)
   scene.box((-3, 3, 1), (0.8, 0.8, 0.02), flags=p.VISUAL_SHAPE_GLASS)
@@ -176,6 +177,78 @@ class TestThermal(unittest.TestCase):
     again, _, _, _ = self.scene.render()
     self.assertTrue(np.array_equal(never, again))
 
+  def test_lower_emissivity_reflects_more_cold_sky(self):
+    """Of two boxes at 33 C under the night sky, the one with emissivity 0.3 is darker than the default one."""
+    plain = self.scene.box((-2, 0, 0.5), (0.5, 0.5, 0.5))
+    shiny = self.scene.box((2, 0, 0.5), (0.5, 0.5, 0.5))
+    p.changeVisualShape(plain, -1, temperature=33.0)
+    p.changeVisualShape(shiny, -1, temperature=33.0, emissivity=0.3)
+    rgb, depth, seg, view = self.scene.render()
+    self.assertLess(self.region(rgb[..., 0], depth, seg, view, shiny), self.region(rgb[..., 0], depth, seg, view, plain) - 20)
+
+  def test_emissivity_above_one_is_one(self):
+    """An emissivity of 5 draws the bytes of an emissivity of 1."""
+    box = self.scene.box((0, 0, 0.5), (0.5, 0.5, 0.5))
+    p.changeVisualShape(box, -1, temperature=33.0, emissivity=1.0)
+    one, _, _, _ = self.scene.render()
+    p.changeVisualShape(box, -1, emissivity=5.0)
+    five, _, _, _ = self.scene.render()
+    self.assertTrue(np.array_equal(one, five))
+
+  def test_air_temperature_warms_passive_ground(self):
+    """Passive ground is darker than a 25 C box in 10 C air and lighter than it in 40 C air."""
+    box = self.scene.box((2, 0, 0.5), (0.5, 0.5, 0.5))
+    p.changeVisualShape(box, -1, temperature=25.0)
+    for air, warmer in ((10.0, False), (40.0, True)):
+      rgb, depth, seg, view = self.scene.render(air=air)
+      ground = self.region(rgb[..., 0], depth, seg, view, self.scene.ground, x=(-4.0, -1.0))
+      fixed = self.region(rgb[..., 0], depth, seg, view, box)
+      if warmer:
+        self.assertGreater(ground, fixed + 10)
+      else:
+        self.assertLess(ground, fixed - 10)
+
+  def test_sky_temperature_cools_open_ground(self):
+    """In 20 C air, open ground is darker than a 17 C box under a -40 C sky and lighter than it under a 10 C sky."""
+    box = self.scene.box((2, 0, 0.5), (0.5, 0.5, 0.5))
+    p.changeVisualShape(box, -1, temperature=17.0)
+    for sky, warmer in ((-40.0, False), (10.0, True)):
+      rgb, depth, seg, view = self.scene.render(air=20.0, sky=sky)
+      ground = self.region(rgb[..., 0], depth, seg, view, self.scene.ground, x=(-4.0, -1.0))
+      fixed = self.region(rgb[..., 0], depth, seg, view, box)
+      if warmer:
+        self.assertGreater(ground, fixed + 10)
+      else:
+        self.assertLess(ground, fixed - 10)
+
+  def test_nan_temperatures_draw_a_frame(self):
+    """NaN air, sky and heat map range give a grey frame instead of reading outside the camera's table."""
+    p.changeVisualShape(self.scene.box((0, 0, 0.5), (0.5, 0.5, 0.5)), -1, temperature=33.0)
+    quad = self.scene.heat_quad((3, -3, 0.5), 20.0, 40.0)
+    rgb, _, _, _ = self.scene.render(air=float("nan"), sky=float("nan"))
+    self.assertEqual(rgb.shape, (SIZE, SIZE, 3))
+    self.assertTrue(np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 0], rgb[..., 2]))
+    texture = p.loadTexture(os.path.join(self.scene.folder, "heat.png"))
+    p.changeVisualShape(quad, -1, thermalTextureUniqueId=texture, temperatureRange=[float("nan"), float("nan")])
+    rgb, _, _, _ = self.scene.render()
+    self.assertEqual(rgb.shape, (SIZE, SIZE, 3))
+
+  def test_unknown_heat_map_fails_and_keeps_the_map(self):
+    """A heat map id no texture has raises, and the shape keeps the map it had."""
+    quad = self.scene.heat_quad((0, 0, 0.5), 20.0, 40.0)
+    before, _, _, _ = self.scene.render()
+    with self.assertRaises(p.error):
+      p.changeVisualShape(quad, -1, thermalTextureUniqueId=987654, temperatureRange=[0.0, 1.0])
+    after, _, _, _ = self.scene.render()
+    self.assertTrue(np.array_equal(before, after))
+
+  def test_seed_keeps_its_low_32_bits(self):
+    """A seed past 64 bits draws the grain of its low 32 bits."""
+    p.changeVisualShape(self.scene.box((0, 0, 0.5), (0.5, 0.5, 0.5)), -1, temperature=33.0)
+    small, _, _, _ = self.scene.render(seed=7)
+    large, _, _, _ = self.scene.render(seed=(1 << 70) + 7)
+    self.assertTrue(np.array_equal(small, large))
+
   def test_sun_heats_and_shade_cools_by_day(self):
     """With the sun up, open ground is lighter than the ground in a roof's shadow."""
     self.scene.box((0, 0, 3), (0.5, 0.5, 0.02))
@@ -186,7 +259,7 @@ class TestThermal(unittest.TestCase):
 
   def test_depth_and_mask_match_the_colour_frame(self):
     """The thermal frame's depth and segmentation are byte-identical to the ray-cast colour frame's."""
-    full_scene()
+    full_scene(self.scene)
     _, depth, seg, _ = self.scene.render()
     _, colour_depth, colour_seg, _ = self.scene.render(flags=COLOUR)
     self.assertTrue(np.array_equal(depth, colour_depth))

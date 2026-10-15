@@ -1,10 +1,10 @@
 """getCameraImage lets go of the GIL while the frame is drawn: another Python thread keeps running through the call, and
 the frame's bytes are those of the same call with no other thread about; two clients drawn from two threads still get
-their own frames, since frames take turns."""
+their own frames, since frames take turns, and so do two threads asking one client."""
 import os
+import sys
 import tempfile
 import threading
-import time
 import unittest
 import numpy as np
 import pybullet as p
@@ -42,33 +42,31 @@ class TestReleaseGil(unittest.TestCase):
     os.rmdir(self.tmp)
 
   def test_another_thread_runs_while_the_frame_is_drawn(self):
-    """The counting thread's longest pause during each call is a small part of the call, and the bytes match."""
+    """With the interpreter told never to hand the GIL over on its own, a thread woken as the call starts still runs
+    before the call returns, so only the call can have let go of it; the bytes match the frame drawn alone."""
     alone = frame()
-    state = {"last": time.perf_counter(), "gap": 0.0}
-    stop = threading.Event()
+    state = {"inside": False, "seen": None}
+    go = threading.Event()
 
-    def count():
-      """Notes the longest time between two of its own turns until told to stop."""
-      while not stop.is_set():
-        now = time.perf_counter()
-        state["gap"] = max(state["gap"], now - state["last"])
-        state["last"] = now
+    def note():
+      """Waits for the call to start, then notes whether it is still running."""
+      go.wait()
+      state["seen"] = state["inside"]
 
-    worker = threading.Thread(target=count)
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1000.0)
+    worker = threading.Thread(target=note)
     worker.start()
     try:
-      for _ in range(3):
-        time.sleep(0.02)
-        state["gap"] = 0.0
-        start = time.perf_counter()
-        drawn = frame()
-        spent = time.perf_counter() - start
-        self.assertEqual(drawn, alone)
-        self.assertGreater(spent, 0.04)
-        self.assertLess(state["gap"], 0.5 * spent)
+      state["inside"] = True
+      go.set()
+      drawn = frame()
+      state["inside"] = False
     finally:
-      stop.set()
+      sys.setswitchinterval(interval)
       worker.join()
+    self.assertIs(state["seen"], True)
+    self.assertEqual(drawn, alone)
 
 
 def boxes(cid, shift):
@@ -116,6 +114,49 @@ class TestTwoClients(unittest.TestCase):
       wrong.append(sum(depth(cid) != alone[cid] for _ in range(300)))
 
     workers = [threading.Thread(target=draw, args=(cid,)) for cid in self.clients]
+    for t in workers:
+      t.start()
+    for t in workers:
+      t.join()
+    self.assertEqual(wrong, [0, 0])
+
+
+def shot(cid, size):
+  """The size and the colour, depth and mask bytes of one square rasterised frame of the client's scene."""
+  view = p.computeViewMatrix([2.5, -3.0, 2.0], [0, 0, 0.3], [0, 0, 1])
+  proj = p.computeProjectionMatrixFOV(70, 1.0, 0.1, 30.0)
+  result = p.getCameraImage(size, size, view, proj, renderer=p.ER_TINY_RENDERER, physicsClientId=cid)
+  if result is None:
+    return None
+  width, height, rgb, dep, seg = result
+  return width, height, np.asarray(rgb).tobytes(), np.asarray(dep).tobytes(), np.asarray(seg).tobytes()
+
+
+@NEEDS_RELEASE
+class TestOneClientTwoThreads(unittest.TestCase):
+  """Two threads asking one client for frames of different sizes at the same time."""
+
+  def setUp(self):
+    """Connects one client and builds its scene."""
+    self.cid = p.connect(p.DIRECT)
+    boxes(self.cid, 0.0)
+
+  def tearDown(self):
+    """Disconnects the client."""
+    p.disconnect(physicsClientId=self.cid)
+
+  def test_each_camera_call_gets_its_own_frame(self):
+    """A large and a small frame asked of one client from two threads each come back at their own size, with the bytes
+    each has when drawn alone."""
+    sizes = (256, 48)
+    alone = {size: shot(self.cid, size) for size in sizes}
+    wrong = []
+
+    def draw(size):
+      """Draws the frame 100 times, counting the ones that differ from the frame drawn alone."""
+      wrong.append(sum(shot(self.cid, size) != alone[size] for _ in range(100)))
+
+    workers = [threading.Thread(target=draw, args=(size,)) for size in sizes]
     for t in workers:
       t.start()
     for t in workers:

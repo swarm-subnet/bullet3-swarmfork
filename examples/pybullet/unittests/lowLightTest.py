@@ -130,6 +130,13 @@ class TestLowLight(unittest.TestCase):
     noisy, _ = self.scene.render(ambient=0.02, diffuse=0.0, sensorPhotons=2000.0, sensorReadNoise=10.0, sensorGainCap=1000.0)
     self.assertGreater(self.grain(noisy), self.grain(clean) * 1.5)
 
+  def test_black_pixels_without_read_noise_take_their_neighbourhood(self):
+    """With no read noise a black box's pixels are developed as with a trace of it, not left as holes."""
+    self.scene.box((0, 0, 0.5), (2, 2, 0.5), (0, 0, 0, 1))
+    none, _ = self.scene.render(ambient=0.02, diffuse=0.0, sensorPhotons=2000.0, sensorReadNoise=0.0, sensorGainCap=1000.0)
+    trace, _ = self.scene.render(ambient=0.02, diffuse=0.0, sensorPhotons=2000.0, sensorReadNoise=1e-3, sensorGainCap=1000.0)
+    self.assertLessEqual(int(np.abs(none.astype(int) - trace.astype(int)).max()), 2)
+
   def test_no_photons_is_a_noiseless_sensor(self):
     """With sensorPhotons 0 the flat ground is one value."""
     rgb, _ = self.scene.render(ambient=0.05, diffuse=0.0, sensorPhotons=0.0, sensorGainCap=1000.0)
@@ -188,6 +195,12 @@ class TestLowLight(unittest.TestCase):
     edge = float(np.mean([light[SIZE // 2, SIZE // 2 + radius], light[SIZE // 2, SIZE // 2 - radius]]))
     expected = float(light[SIZE // 2, SIZE // 2]) * 0.5 * np.cos(np.radians(20.0)) ** 3
     self.assertAlmostEqual(edge / expected, 1.0, delta=0.15)
+
+  def test_spot_cone_past_a_full_turn_adds_no_light(self):
+    """A cone angle past a full turn, whose inner edge falls outside its outer one, adds no light instead of a wrong one."""
+    never, _ = self.scene.render(flags=LINEAR)
+    wide, _ = self.scene.render(flags=LINEAR, spotLight=spot_down(angle=720.0))
+    self.assertTrue(np.array_equal(never, wide))
 
   def test_spot_light_ends_at_its_range(self):
     """Ground 10 m below is dark for a 9 m spot and lit for a 20 m one."""

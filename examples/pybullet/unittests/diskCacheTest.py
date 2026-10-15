@@ -11,13 +11,16 @@ import numpy as np
 import pybullet as p
 import pybullet_data
 
+from daylightTest import write_png
+
 RAY = getattr(p, "ER_SWARM_RAYCAST", 0)
+DUCK = os.path.join(pybullet_data.getDataPath(), "duck.obj")
 
 
-def frame_hash():
-  """Hash of a ray-cast and a TinyRenderer frame of the textured duck, loaded from its .obj and .mtl."""
+def frame_hash(model):
+  """Hash of a ray-cast and a TinyRenderer frame of a textured model, loaded from its .obj and .mtl."""
   p.connect(p.DIRECT)
-  shape = p.createVisualShape(p.GEOM_MESH, fileName=os.path.join(pybullet_data.getDataPath(), "duck.obj"), meshScale=[2, 2, 2])
+  shape = p.createVisualShape(p.GEOM_MESH, fileName=model, meshScale=[2, 2, 2])
   p.createMultiBody(baseMass=0, baseVisualShapeIndex=shape)
   view = p.computeViewMatrix([0.4, -0.5, 0.4], [0, 0, 0], [0, 0, 1])
   proj = p.computeProjectionMatrixFOV(60, 1.0, 0.01, 10.0)
@@ -30,13 +33,29 @@ def frame_hash():
   return digest.hexdigest()
 
 
-def child(cache_dir):
+def child(cache_dir, model=DUCK):
   """The frame hash from a fresh process, with the cache folder set when given."""
   env = dict(os.environ)
   env.pop("SWARM_BVH_CACHE_DIR", None)
   if cache_dir:
     env["SWARM_BVH_CACHE_DIR"] = cache_dir
-  return subprocess.check_output([sys.executable, __file__, "--hash"], env=env, text=True).strip().splitlines()[-1]
+  return subprocess.check_output([sys.executable, __file__, "--hash", model], env=env, text=True).strip().splitlines()[-1]
+
+
+def write_quad(folder, texture):
+  """A textured square whose material library is named on an indented line, its material taking the given texture."""
+  for name, colour in (("red.png", (255, 0, 0)), ("blue.png", (0, 0, 255))):
+    rgba = np.zeros((8, 8, 4), dtype=np.uint8)
+    rgba[..., :3], rgba[..., 3] = colour, 255
+    write_png(os.path.join(folder, name), rgba)
+  with open(os.path.join(folder, "quad.mtl"), "w") as handle:
+    handle.write("newmtl skin\nKd 1 1 1\nmap_Kd %s\n" % texture)
+  lines = ["  mtllib quad.mtl", "v -0.2 -0.2 0", "v 0.2 -0.2 0", "v 0.2 0.2 0", "v -0.2 0.2 0", "vt 0 0", "vt 1 0", "vt 1 1",
+           "vt 0 1", "vn 0 0 1", "usemtl skin", "f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"]
+  path = os.path.join(folder, "quad.obj")
+  with open(path, "w") as handle:
+    handle.write("\n".join(lines) + "\n")
+  return path
 
 
 class TestDiskCache(unittest.TestCase):
@@ -76,9 +95,36 @@ class TestDiskCache(unittest.TestCase):
         handle.write(data[:len(data) // 2])
     self.assertEqual(child(self.folder), plain)
 
+  def test_indices_outside_the_model_are_parsed_afresh(self):
+    """A model file whose last face points far past its vertices is ignored, and the frame is the one drawn without it."""
+    plain = child(None)
+    child(self.folder)
+    damaged = [name for name in os.listdir(self.folder) if name.endswith(".objc")]
+    self.assertTrue(damaged)
+    for name in damaged:
+      with open(os.path.join(self.folder, name), "r+b") as handle:
+        handle.seek(-12, os.SEEK_END)
+        handle.write(b"\xff\xff\xff\x7f" * 3)
+    self.assertEqual(child(self.folder), plain)
+
+  def test_an_indented_material_library_is_part_of_the_key(self):
+    """Editing a material library named on an indented line misses the kept parse, so the new texture is drawn."""
+    models = tempfile.mkdtemp()
+    try:
+      model = write_quad(models, "red.png")
+      red = child(self.folder, model)
+      model = write_quad(models, "blue.png")
+      blue = child(None, model)
+      self.assertNotEqual(red, blue)
+      self.assertEqual(child(self.folder, model), blue)
+    finally:
+      for name in os.listdir(models):
+        os.remove(os.path.join(models, name))
+      os.rmdir(models)
+
 
 if __name__ == '__main__':
   if "--hash" in sys.argv:
-    print(frame_hash())
+    print(frame_hash(sys.argv[sys.argv.index("--hash") + 1]))
   else:
     unittest.main()
