@@ -168,12 +168,8 @@ _SWARM_TIER_FLAGS = _TIER_FLAGS[_SWARM_TIER] if _IS_LINUX else ''
 print("swarm-bullet3: cpu tier = %s (%s)" % (_SWARM_TIER, _SWARM_TIER_FLAGS.strip()))
 
 _PGO_DIR = os.path.join(_SOURCE_ROOT, 'pgo_data')
-_PGO_MODE = os.environ.get('SWARM_BULLET3_PGO', '').strip().lower()
-if not _PGO_MODE and _IS_LINUX:
-  if os.path.isdir(_PGO_DIR) and any(f.endswith('.gcda') for f in os.listdir(_PGO_DIR)):
-    _PGO_MODE = 'use'
-if not _PGO_MODE:
-  _PGO_MODE = 'off'
+# Profiles only on request: a profile trained on other source fails the build of a changed function.
+_PGO_MODE = os.environ.get('SWARM_BULLET3_PGO', 'off').strip().lower() or 'off'
 
 _PGO_FLAGS = ''
 if _IS_LINUX and _PGO_MODE in ('generate', 'use'):
