@@ -166,6 +166,7 @@ SET(BulletExampleBrowser_SRCS
 	../../src/SharedMemory/plugins/pdControlPlugin/pdControlPlugin.h
 	../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
 	../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+	../../src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.cpp
 	../../src/SharedMemory/IKTrajectoryHelper.cpp
 	../../src/SharedMemory/IKTrajectoryHelper.h
 	../../src/SharedMemory/PhysicsServer.cpp

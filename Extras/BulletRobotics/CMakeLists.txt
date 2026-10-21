@@ -40,6 +40,7 @@ SET(BulletRobotics_INCLUDES
   ../../src/SharedMemory/IKTrajectoryHelper.h
   ../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.h
   ../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.h
+  ../../src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.h
   ../../src/SharedMemory/InProcessMemory.h
   ../../src/SharedMemory/PhysicsServer.h
   ../../src/SharedMemory/PhysicsClient.h
@@ -127,6 +128,7 @@ SET(BulletRobotics_SRCS ${BulletRobotics_INCLUDES}
 	../../src/SharedMemory/IKTrajectoryHelper.cpp
 	../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
 	../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+	../../src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.cpp
 	../../src/SharedMemory/InProcessMemory.cpp
 	../../src/SharedMemory/PhysicsClient.cpp
 	../../src/SharedMemory/PhysicsServer.cpp

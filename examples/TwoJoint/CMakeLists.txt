@@ -20,6 +20,7 @@ SET(RobotSimulator_SRCS
 		../../examples/ExampleBrowser/InProcessExampleBrowser.cpp
 		../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
 		../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+		../../src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.cpp
 		../../src/TinyRenderer/geometry.cpp
 		../../src/TinyRenderer/model.cpp
 		../../src/TinyRenderer/tgaimage.cpp

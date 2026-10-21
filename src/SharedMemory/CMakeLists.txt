@@ -51,6 +51,7 @@ SET(SharedMemory_SRCS
 	PhysicsServerCommandProcessor.h
 	plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
 	plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+	plugins/tinyRendererPlugin/SwarmSky.cpp
 SharedMemoryCommands.h
 	SharedMemoryPublic.h
 	b3PluginManager.cpp
