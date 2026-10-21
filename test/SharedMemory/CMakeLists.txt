@@ -73,6 +73,7 @@ ENDIF()
 		../../examples/Utils/RobotLoggingUtil.h
 		../../src/SharedMemory/plugins/tinyRendererPlugin/tinyRendererPlugin.cpp
 		../../src/SharedMemory/plugins/tinyRendererPlugin/TinyRendererVisualShapeConverter.cpp
+		../../src/SharedMemory/plugins/tinyRendererPlugin/SwarmSky.cpp
 		../../examples/OpenGLWindow/SimpleCamera.cpp
 		../../examples/OpenGLWindow/SimpleCamera.h
 		../../src/TinyRenderer/geometry.cpp
