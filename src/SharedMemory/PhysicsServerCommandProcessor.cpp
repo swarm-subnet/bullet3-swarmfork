@@ -3904,6 +3904,12 @@ int PhysicsServerCommandProcessor::createBodyInfoStream(int bodyUniqueId, char* 
 		ser.finalizeChunk(chunk, structType, BT_MULTIBODY_CODE, mb);
 		streamSizeInBytes = ser.getCurrentBufferSize();
 	}
+	else if (bodyHandle->m_rigidBody && bodyHandle->m_rigidBodyJoints.size() == 0 && bufferSizeInBytes >= BT_HEADER_LENGTH)
+	{
+		// Without joints the stream below is the header alone: a registered name never reaches the buffer.
+		btDefaultSerializer::writeHeader((unsigned char*)bufferServerToClient);
+		streamSizeInBytes = BT_HEADER_LENGTH;
+	}
 	else if (bodyHandle->m_rigidBody)
 	{
 		btRigidBody* rb = bodyHandle->m_rigidBody;
@@ -4417,6 +4423,22 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 							m_data->m_pluginManager.getRenderInterface()->setHazeDistance(clientCmd.m_requestPixelDataArguments.m_hazeDistance);
 						if ((fields & REQUEST_PIXEL_DAYLIGHT_SHADOW_CORE) != 0)
 							m_data->m_pluginManager.getRenderInterface()->setShadowCoreRadius(clientCmd.m_requestPixelDataArguments.m_shadowCoreRadius);
+						if ((fields & REQUEST_PIXEL_THERMAL_AIR) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setAirTemperature(clientCmd.m_requestPixelDataArguments.m_airTemperature);
+						if ((fields & REQUEST_PIXEL_THERMAL_SKY) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSkyTemperature(clientCmd.m_requestPixelDataArguments.m_skyTemperature);
+						if ((fields & REQUEST_PIXEL_THERMAL_SEED) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setThermalSeed(clientCmd.m_requestPixelDataArguments.m_thermalSeed);
+						if ((fields & REQUEST_PIXEL_SENSOR_PHOTONS) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorPhotons(clientCmd.m_requestPixelDataArguments.m_sensorPhotons);
+						if ((fields & REQUEST_PIXEL_SENSOR_READ_NOISE) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorReadNoise(clientCmd.m_requestPixelDataArguments.m_sensorReadNoise);
+						if ((fields & REQUEST_PIXEL_SENSOR_GAIN_CAP) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorGainCap(clientCmd.m_requestPixelDataArguments.m_sensorGainCap);
+						if ((fields & REQUEST_PIXEL_SENSOR_SEED) != 0)
+							m_data->m_pluginManager.getRenderInterface()->setSensorSeed(clientCmd.m_requestPixelDataArguments.m_sensorSeed);
+						// The spot light is per request, so a lamp never outlives the frame that asked for it.
+						m_data->m_pluginManager.getRenderInterface()->setSpotLight((fields & REQUEST_PIXEL_SPOT_LIGHT) != 0, clientCmd.m_requestPixelDataArguments.m_spotLight);
 						m_data->m_pluginManager.getRenderInterface()->setSkyPhoto((fields & REQUEST_PIXEL_DAYLIGHT_SKY_PHOTO) != 0, clientCmd.m_requestPixelDataArguments.m_skyTextureId, clientCmd.m_requestPixelDataArguments.m_skyYaw);
 					}
 
@@ -4562,6 +4584,10 @@ bool PhysicsServerCommandProcessor::processRequestCameraImageCommand(const struc
 				if ((flags & ER_NO_SEGMENTATION_MASK) != 0)
 				{
 					segmentationMaskBuffer = 0;
+				}
+				if ((flags & ER_SWARM_NO_DEPTH) != 0 && !compactDepthStream)
+				{
+					depthBuffer = 0;
 				}
 
 				int camRelativeStart = (numBatchCameras > 1 && camPixels > 0) ? (startPixelIndex % camPixels) : startPixelIndex;
@@ -5245,6 +5271,7 @@ bool PhysicsServerCommandProcessor::processCreateCollisionShapeCommand(const str
 							{
 								heightfieldDest[i] = datafl[i];
 							}
+							m_data->m_dynamicsWorld->invalidateStaticAabbs();
 							//update graphics
 
 							btAlignedObjectArray<GLInstanceVertex> gfxVertices;
@@ -6159,7 +6186,7 @@ bool PhysicsServerCommandProcessor::processCreateVisualShapeCommand(const struct
 		visualShape.m_linkLocalFrame.setIdentity();
 		visualShape.m_geometry.m_hasLocalMaterial = false;
 		// createVisualShape flags arrive in m_collisionFlags; only the multibody double-sided bit is a visual flag
-		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL | eVISUAL_SHAPE_RENDER_TREE_CACHE | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_RENDER_INSTANCED);
+		visualShape.m_flags = visShape.m_collisionFlags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_MATERIALS_FROM_MTL | eVISUAL_SHAPE_RENDER_TREE_CACHE | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED | eVISUAL_SHAPE_RENDER_INSTANCED);
 
 		bool hasRGBA = (clientCmd.m_createUserShapeArgs.m_shapes[userShapeIndex].m_visualFlags & GEOM_VISUAL_HAS_RGBA_COLOR) != 0;
 		;
@@ -11079,6 +11106,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 							compound->getChildShape(s)->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
 						}
 					}
+					m_data->m_dynamicsWorld->invalidateStaticAabbs();
 				}
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_DYNAMIC_TYPE)
 				{
@@ -11205,6 +11233,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 						if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_COLLISION_MARGIN)
 						{
 							mb->getLinkCollider(linkIndex)->getCollisionShape()->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
+							m_data->m_dynamicsWorld->invalidateStaticAabbs();
 						}
 					}
 
@@ -11374,6 +11403,7 @@ bool PhysicsServerCommandProcessor::processChangeDynamicsInfoCommand(const struc
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_COLLISION_MARGIN)
 				{
 					rb->getCollisionShape()->setMargin(clientCmd.m_changeDynamicsInfoArgs.m_collisionMargin);
+					m_data->m_dynamicsWorld->invalidateStaticAabbs();
 				}
 				if (clientCmd.m_updateFlags & CHANGE_DYNAMICS_INFO_SET_DYNAMIC_TYPE)
 				{
@@ -12006,6 +12036,7 @@ bool PhysicsServerCommandProcessor::processInitPoseCommand(const struct SharedMe
 			btVector3 scaling(clientCmd.m_initPoseArgs.m_scaling[0], clientCmd.m_initPoseArgs.m_scaling[1], clientCmd.m_initPoseArgs.m_scaling[2]);
 
 			mb->getBaseCollider()->getCollisionShape()->setLocalScaling(scaling);
+			m_data->m_dynamicsWorld->invalidateStaticAabbs();
 			//refresh broadphase
 			m_data->m_dynamicsWorld->getBroadphase()->getOverlappingPairCache()->cleanProxyFromPairs(
 				mb->getBaseCollider()->getBroadphaseHandle(),
@@ -14719,6 +14750,13 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 	serverCmd.m_type = CMD_VISUAL_SHAPE_UPDATE_FAILED;
 	InternalTextureHandle* texHandle = 0;
 
+	// A heat map id no texture has fails the whole update, so a mistyped id cannot remove the map already there.
+	if ((clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_THERMAL) &&
+		(clientCmd.m_updateVisualShapeDataArguments.m_thermalFields & THERMAL_FIELD_HEAT_MAP) &&
+		clientCmd.m_updateVisualShapeDataArguments.m_heatTextureUniqueId >= 0 &&
+		!m_data->m_textureHandles.getHandle(clientCmd.m_updateVisualShapeDataArguments.m_heatTextureUniqueId))
+		return hasStatus;
+
 	if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_TEXTURE)
 	{
 		if (clientCmd.m_updateVisualShapeDataArguments.m_textureUniqueId >= 0)
@@ -14745,6 +14783,21 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 				clientCmd.m_updateVisualShapeDataArguments.m_shapeIndex,-1);
 			}
 		}
+	}
+
+	// Temperatures only reach the software renderer, whatever kind of body carries the shape.
+	if ((clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_THERMAL) && m_data->m_pluginManager.getRenderInterface())
+	{
+		const UpdateVisualShapeDataArgs& thermal = clientCmd.m_updateVisualShapeDataArguments;
+		int heatTexture = -1;
+		if ((thermal.m_thermalFields & THERMAL_FIELD_HEAT_MAP) && thermal.m_heatTextureUniqueId >= 0)
+		{
+			InternalTextureHandle* heatHandle = m_data->m_textureHandles.getHandle(thermal.m_heatTextureUniqueId);
+			heatTexture = heatHandle ? heatHandle->m_tinyRendererTextureId : -1;
+		}
+		m_data->m_pluginManager.getRenderInterface()->changeThermal(thermal.m_bodyUniqueId, thermal.m_jointIndex, thermal.m_shapeIndex,
+																	 thermal.m_thermalFields, (float)thermal.m_temperature, (float)thermal.m_emissivity,
+																	 heatTexture, (float)thermal.m_heatRange[0], (float)thermal.m_heatRange[1]);
 	}
 
 	{
@@ -14795,7 +14848,7 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 						if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
 						{
 							// multibodies honour only their own bit, so the soft-body flag keeps ignoring them
-							int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS);
+							int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED);
 							if (m_data->m_pluginManager.getRenderInterface())
 							{
 								m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,
@@ -14844,7 +14897,7 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 							}
 							if (clientCmd.m_updateFlags & CMD_UPDATE_VISUAL_SHAPE_FLAGS)
 							{
-								int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS);
+								int flags = clientCmd.m_updateVisualShapeDataArguments.m_flags & (eVISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY | eVISUAL_SHAPE_GLASS | eVISUAL_SHAPE_GLASS_BACKED);
 								if (m_data->m_pluginManager.getRenderInterface())
 								{
 									m_data->m_pluginManager.getRenderInterface()->changeInstanceFlags(bodyUniqueId, linkIndex,
@@ -16317,6 +16370,11 @@ b3Notification createSoftBodyChangedNotification(int bodyUniqueId, int linkIndex
 
 void PhysicsServerCommandProcessor::addBodyChangedNotifications()
 {
+	// Without a plugin that reads notifications every one is dropped, so the walk over all bodies is skipped.
+	if (!m_data->m_pluginManager.hasNotificationPlugins())
+	{
+		return;
+	}
 	b3Notification notification;
 	notification.m_notificationType = SIMULATION_STEPPED;
 	m_data->m_pluginManager.addNotification(notification);

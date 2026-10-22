@@ -10,6 +10,7 @@
 #include "stb_image/stb_image.h"
 #include "../ImportObjDemo/LoadMeshFromObj.h"
 #include "Bullet3Common/b3HashMap.h"
+#include "Bullet3Common/b3DiskCache.h"
 #include "../../CommonInterfaces/CommonFileIOInterface.h"
 
 struct CachedTextureResult
@@ -44,13 +45,6 @@ void b3ImportMeshUtility::releaseCachedTexture(const char* textureName)
 	texture->m_pixels = 0;
 	texture->m_alpha = 0;
 	texture->m_handedOver = true;
-}
-
-void b3ImportMeshUtility::forgetCachedTexture(const char* textureName)
-{
-	CachedTextureResult* texture = textureName ? gCachedTextureResults[textureName] : 0;
-	if (texture)
-		texture->m_handedOver = false;
 }
 
 struct CachedTextureManager
@@ -94,6 +88,45 @@ unsigned char* b3ImportMeshUtility::loadTextureAlpha(const unsigned char* bytes,
 		return alpha;
 	free(alpha);
 	return 0;
+}
+
+// The decoded texels of an image file as another process of this machine saved them: the colour, and the alpha plane
+// when the image has one that is not all opaque. Both malloc'ed like the decoder's own; false when there is no such file.
+static bool readTextureCache(const std::string& path, int& width, int& height, unsigned char*& image, unsigned char*& alpha)
+{
+	std::vector<char> bytes;
+	if (!b3DiskCacheRead(path, bytes))
+		return false;
+	b3DiskCacheReader in(bytes);
+	int w = 0, h = 0, hasAlpha = 0;
+	if (!in.value(w) || !in.value(h) || !in.value(hasAlpha) || w <= 0 || h <= 0)
+		return false;
+	const size_t texels = (size_t)w * h;
+	if ((size_t)(in.m_end - in.m_at) != texels * (hasAlpha ? 4 : 3))
+		return false;
+	image = (unsigned char*)malloc(texels * 3);
+	alpha = hasAlpha ? (unsigned char*)malloc(texels) : 0;
+	in.take(image, texels * 3);
+	if (alpha)
+		in.take(alpha, texels);
+	width = w;
+	height = h;
+	return true;
+}
+
+// Saves what readTextureCache reads back.
+static void writeTextureCache(const std::string& path, int width, int height, const unsigned char* image, const unsigned char* alpha)
+{
+	b3DiskCacheWriter out;
+	const int hasAlpha = alpha ? 1 : 0;
+	out.value(width);
+	out.value(height);
+	out.value(hasAlpha);
+	const size_t texels = (size_t)width * height;
+	out.put(image, texels * 3);
+	if (alpha)
+		out.put(alpha, texels);
+	b3DiskCacheWrite(path, &out.m_bytes[0], out.m_bytes.size());
 }
 
 //loads the diffuse texture named in a material, trying the mesh folder and the data folders; returns 0 when none loads
@@ -155,7 +188,11 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 					fileIO->fileClose(fileId);
 				}
 
-				if (buffer.size())
+				// Texels another process of this machine decoded from the same bytes are read back instead of decoded again.
+				std::string diskPath;
+				const bool onDisk = buffer.size() && b3DiskCachePath(b3DiskCacheHash(&buffer[0], buffer.size(), b3DiskCacheHash("SWTEX1", 6)), "texc", diskPath);
+				const bool fromDisk = onDisk && readTextureCache(diskPath, width, height, image, alpha);
+				if (buffer.size() && !fromDisk)
 				{
 					image = stbi_load_from_memory((const unsigned char*)&buffer[0], buffer.size(), &width, &height, &n, 3);
 				}
@@ -163,7 +200,12 @@ static unsigned char* loadDiffuseTexture(const char* filename, const char* pathP
 
 				if (image)
 				{
-					alpha = b3ImportMeshUtility::loadTextureAlpha((const unsigned char*)&buffer[0], buffer.size(), width, height);
+					if (!fromDisk)
+					{
+						alpha = b3ImportMeshUtility::loadTextureAlpha((const unsigned char*)&buffer[0], buffer.size(), width, height);
+						if (onDisk)
+							writeTextureCache(diskPath, width, height, image, alpha);
+					}
 					textureName = relativeFileName;
 					if (b3IsFileCachingEnabled())
 					{
