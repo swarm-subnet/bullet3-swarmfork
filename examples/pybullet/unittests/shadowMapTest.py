@@ -102,6 +102,17 @@ class TestShadowMap(unittest.TestCase):
     again, _ = render(MAP, 1)
     self.assertEqual(again.tobytes(), shown.tobytes())
 
+  def test_cells_cast_late_match_a_fresh_map(self):
+    """A map first read through a narrow view, then recast under a hidden box, draws a wide view as a fresh map does."""
+    render(MAP, 1, eye=(1.5, -1.5, 0.8), target=(1.5, -1.5, 0.0))
+    p.changeVisualShape(BOX, -1, rgbaColor=[1, 0, 0, 0])
+    late, _ = render(MAP, 1)
+    p.resetSimulation()
+    build_world(self.tex_path)
+    p.changeVisualShape(BOX, -1, rgbaColor=[1, 0, 0, 0])
+    fresh, _ = render(MAP, 1)
+    self.assertEqual(late.tobytes(), fresh.tobytes())
+
   def test_flag_alone_changes_nothing(self):
     """Without shadow=1 the flag is inert, and the rasterised path ignores it."""
     self.assertEqual(render(MAP, 0)[0].tobytes(), render(RAY, 0)[0].tobytes())

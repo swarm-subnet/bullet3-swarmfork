@@ -99,6 +99,9 @@ protected:
 	///it is true by default, because it is error-prone (setting the position of static objects wouldn't update their AABB)
 	bool m_forceUpdateAllAabbs;
 
+	///raised by invalidateStaticAabbs; a static object's kept bounds are only used under the revision they were made in
+	int m_staticAabbRevision;
+
 	void serializeCollisionObjects(btSerializer* serializer);
 
 	void serializeContactManifolds(btSerializer* serializer);
@@ -142,6 +145,12 @@ public:
 	void updateSingleAabb(btCollisionObject* colObj);
 
 	virtual void updateAabbs();
+
+	///call after changing a collision shape in place (margin, scaling, heights), so static objects ask their shapes again
+	void invalidateStaticAabbs()
+	{
+		m_staticAabbRevision++;
+	}
 
 	///the computeOverlappingPairs is usually already called by performDiscreteCollisionDetection (or stepSimulation)
 	///it can be useful to use if you perform ray tests without collision detection/simulation

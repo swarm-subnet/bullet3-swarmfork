@@ -95,6 +95,11 @@ public:
 	TGAColor diffuse(Vec2f uv);
 	// Trilinear read at the pixel footprint; maxTaps above one keeps a grazing surface sharp with reads along the long side.
 	TGAColor diffuseFiltered(Vec2f uv, Vec2f duvdx, Vec2f duvdy, int maxTaps = 1);
+	// diffuseFiltered for count reads, each with its own model: the bytes diffuseFiltered gives each, eight reads at a
+	// time in vector lanes where the build has AVX2.
+	static void diffuseFilteredMany(Model* const* models, const Vec2f* uv, const Vec2f* duvdx, const Vec2f* duvdy, int count, int maxTaps, TGAColor* out);
+	// The texture's mean, its last mip level, read as diffuseFiltered reads it for a footprint wider than the texture.
+	TGAColor diffuseMean(Vec2f uv);
 	bool hasAlpha() const;
 	// Alpha of the texel diffuse(uv) reads, 255 when the texture carries no alpha plane.
 	unsigned char alpha(Vec2f uv) const;

@@ -70,6 +70,7 @@ void btRigidBody::setupRigidBody(const btRigidBody::btRigidBodyConstructionInfo&
 	{
 		m_worldTransform = constructionInfo.m_startWorldTransform;
 	}
+	worldTransformWritten();
 
 	m_interpolationWorldTransform = m_worldTransform;
 	m_interpolationLinearVelocity.setValue(0, 0, 0);
@@ -109,7 +110,10 @@ void btRigidBody::saveKinematicState(btScalar timeStep)
 	{
 		//if we use motionstate to synchronize world transforms, get the new kinematic/animated world transform
 		if (getMotionState())
+		{
 			getMotionState()->getWorldTransform(m_worldTransform);
+			worldTransformWritten();
+		}
 		btVector3 linVel, angVel;
 
 		btTransformUtil::calculateVelocity(m_interpolationWorldTransform, m_worldTransform, timeStep, m_linearVelocity, m_angularVelocity);
@@ -409,6 +413,7 @@ void btRigidBody::setCenterOfMassTransform(const btTransform& xform)
 	m_interpolationLinearVelocity = getLinearVelocity();
 	m_interpolationAngularVelocity = getAngularVelocity();
 	m_worldTransform = xform;
+	worldTransformWritten();
 	updateInertiaTensor();
 }
 

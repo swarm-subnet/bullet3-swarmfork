@@ -63,6 +63,8 @@
 #endif
 
 static PyObject* SpamError;
+// The renderer keeps process-wide scratch and lazy caches, so frames drawn without the GIL still take turns.
+static PyThread_type_lock sCameraLock = 0;
 #define B3_MAX_NUM_END_EFFECTORS 128
 #define MAX_PHYSICS_CLIENTS 1024
 static b3PhysicsClientHandle sPhysicsClients1[MAX_PHYSICS_CLIENTS] = {0};
@@ -6398,13 +6400,58 @@ static PyObject* pybullet_addUserDebugLine(PyObject* self, PyObject* args, PyObj
 	}
 }
 
+// A C-contiguous N x 3 array of native float64 or float32 is read from its memory in one pass, with the same
+// doubles the sequence path would produce; returns -1 for anything else, so the caller reads it as a sequence.
+static int extractVertexArray(PyObject* verticesObj, double* vertices, int maxNumVertices)
+{
+	Py_buffer view;
+	const char* format;
+	int numVertices = -1;
+	int i;
+
+	if (!PyObject_CheckBuffer(verticesObj))
+		return -1;
+	if (PyObject_GetBuffer(verticesObj, &view, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
+	{
+		PyErr_Clear();
+		return -1;
+	}
+	format = view.format ? view.format : "B";
+	if (format[0] == '@' || format[0] == '=')
+		format++;
+	if (view.ndim == 2 && view.shape[1] == 3 && format[1] == 0 &&
+		((format[0] == 'd' && view.itemsize == sizeof(double)) || (format[0] == 'f' && view.itemsize == sizeof(float))))
+	{
+		if (view.shape[0] > maxNumVertices)
+		{
+			PyErr_SetString(SpamError, "Number of vertices exceeds the maximum.");
+			numVertices = 0;
+		}
+		else
+		{
+			numVertices = (int)view.shape[0];
+			if (vertices && format[0] == 'd')
+				memcpy(vertices, view.buf, (size_t)numVertices * 3 * sizeof(double));
+			else if (vertices)
+				for (i = 0; i < numVertices * 3; i++)
+					vertices[i] = ((const float*)view.buf)[i];
+		}
+	}
+	PyBuffer_Release(&view);
+	return numVertices;
+}
+
 static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVertices)
 {
 	int numVerticesOut = 0;
 
 	if (verticesObj)
 	{
-		PyObject* seqVerticesObj = PySequence_Fast(verticesObj, "expected a sequence of vertex positions");
+		PyObject* seqVerticesObj;
+		const int numFromArray = extractVertexArray(verticesObj, vertices, maxNumVertices);
+		if (numFromArray >= 0)
+			return numFromArray;
+		seqVerticesObj = PySequence_Fast(verticesObj, "expected a sequence of vertex positions");
 		if (seqVerticesObj)
 		{
 			int numVerticesSrc = PySequence_Size(seqVerticesObj);
@@ -6419,7 +6466,7 @@ static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVe
 				}
 				for (i = 0; i < numVerticesSrc; i++)
 				{
-					PyObject* vertexObj = PySequence_GetItem(seqVerticesObj, i);
+					PyObject* vertexObj = PySequence_Fast_GET_ITEM(seqVerticesObj, i);
 					double vertex[3];
 					if (pybullet_internalSetVectord(vertexObj, vertex))
 					{
@@ -6433,6 +6480,7 @@ static int extractVertices(PyObject* verticesObj, double* vertices, int maxNumVe
 					}
 				}
 			}
+			Py_DECREF(seqVerticesObj);
 		}
 	}
 	return numVerticesOut;
@@ -7935,9 +7983,32 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 	PyObject* rgbaColorObj = 0;
 	PyObject* specularColorObj = 0;
 	int flags = -1;
+	// ER_SWARM_THERMAL: a temperature (NaN makes the surface passive again), an emissivity, and a heat map texture with
+	// the range its red byte spans (-1 removes it)
+	PyObject* temperatureObj = 0;
+	PyObject* emissivityObj = 0;
+	int thermalTextureUniqueId = -2;
+	PyObject* temperatureRangeObj = 0;
+	double temperatureRange[2] = {0, 0};
+	int hasTemperature, hasEmissivity;
+	double temperature, emissivity;
 	b3PhysicsClientHandle sm = 0;
-	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOii", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags , &physicsClientId))
+	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", "temperature", "emissivity", "thermalTextureUniqueId", "temperatureRange", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOiiOOiO", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags, &physicsClientId,
+									 &temperatureObj, &emissivityObj, &thermalTextureUniqueId, &temperatureRangeObj))
+	{
+		return NULL;
+	}
+	if (thermalTextureUniqueId >= 0 && !pybullet_internalSetVector2d(temperatureRangeObj, temperatureRange))
+	{
+		PyErr_SetString(SpamError, "thermalTextureUniqueId needs temperatureRange=[low, high] in degrees Celsius.");
+		return NULL;
+	}
+	hasTemperature = temperatureObj && temperatureObj != Py_None;
+	hasEmissivity = emissivityObj && emissivityObj != Py_None;
+	temperature = hasTemperature ? PyFloat_AsDouble(temperatureObj) : 0;
+	emissivity = hasEmissivity ? PyFloat_AsDouble(emissivityObj) : 0;
+	if (PyErr_Occurred())
 	{
 		return NULL;
 	}
@@ -7972,6 +8043,18 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 		if (flags >= 0)
 		{
 			b3UpdateVisualShapeFlags(commandHandle, flags);
+		}
+		if (hasTemperature)
+		{
+			b3UpdateVisualShapeTemperature(commandHandle, temperature);
+		}
+		if (hasEmissivity)
+		{
+			b3UpdateVisualShapeEmissivity(commandHandle, emissivity);
+		}
+		if (thermalTextureUniqueId >= -1)
+		{
+			b3UpdateVisualShapeHeatMap(commandHandle, thermalTextureUniqueId, temperatureRange[0], temperatureRange[1]);
 		}
 
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, commandHandle);
@@ -8653,7 +8736,7 @@ static int extractUVs(PyObject* uvsObj, double* uvs, int maxNumVertices)
 				}
 				for (i = 0; i < numVerticesSrc; i++)
 				{
-					PyObject* vertexObj = PySequence_GetItem(seqVerticesObj, i);
+					PyObject* vertexObj = PySequence_Fast_GET_ITEM(seqVerticesObj, i);
 					double uv[2];
 					if (pybullet_internalSetVector2d(vertexObj, uv))
 					{
@@ -8666,6 +8749,7 @@ static int extractUVs(PyObject* uvsObj, double* uvs, int maxNumVertices)
 					}
 				}
 			}
+			Py_DECREF(seqVerticesObj);
 		}
 	}
 	return numUVOut;
@@ -8699,6 +8783,7 @@ static int extractIndices(PyObject* indicesObj, int* indices, int maxNumIndices)
 					numIndicesOut++;
 				}
 			}
+			Py_DECREF(seqIndicesObj);
 		}
 	}
 	return numIndicesOut;
@@ -9247,6 +9332,248 @@ static PyObject* pybullet_getTetraMeshData(PyObject* self, PyObject* args, PyObj
 }
 
 
+
+// Swarm video look. The 8-point DCT scaled by 2^16, rounded once to whole numbers, as the Python stream_look builds it.
+static const double kSwarmLookDct[8][8] = {
+	{23170, 23170, 23170, 23170, 23170, 23170, 23170, 23170},
+	{32138, 27246, 18205, 6393, -6393, -18205, -27246, -32138},
+	{30274, 12540, -12540, -30274, -30274, -12540, 12540, 30274},
+	{27246, -6393, -32138, -18205, 18205, 32138, 6393, -27246},
+	{23170, -23170, -23170, 23170, 23170, -23170, -23170, 23170},
+	{18205, -32138, 6393, 27246, -27246, -6393, 32138, -18205},
+	{12540, -30274, 30274, -12540, -12540, 30274, -30274, 12540},
+	{6393, -18205, 27246, -32138, 32138, -27246, 18205, -6393}};
+static const int kSwarmLookLuma[8][8] = {
+	{16, 11, 10, 16, 24, 40, 51, 61}, {12, 12, 14, 19, 26, 58, 60, 55}, {14, 13, 16, 24, 40, 57, 69, 56},
+	{14, 17, 22, 29, 51, 87, 80, 62}, {18, 22, 37, 56, 68, 109, 103, 77}, {24, 35, 55, 64, 81, 104, 113, 92},
+	{49, 64, 78, 87, 103, 121, 120, 101}, {72, 92, 95, 98, 112, 100, 103, 99}};
+static const int kSwarmLookChroma[8][8] = {
+	{17, 18, 24, 47, 99, 99, 99, 99}, {18, 21, 26, 66, 99, 99, 99, 99}, {24, 26, 56, 99, 99, 99, 99, 99},
+	{47, 66, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99}, {99, 99, 99, 99, 99, 99, 99, 99}};
+
+// The render threads' count, as b3GetSwarmRenderThreads reads it: SWARM_RENDER_THREADS, default 2, held to 1..16.
+static int swarmLookThreads(void)
+{
+	static int cached = 0;
+	if (cached <= 0)
+	{
+		const char* env = getenv("SWARM_RENDER_THREADS");
+		const int n = env && env[0] ? atoi(env) : 2;
+		cached = n < 1 ? 1 : (n > 16 ? 16 : n);
+	}
+	return cached;
+}
+
+// One plane of whole numbers through the 8 x 8 DCT, rounded to a JPEG table's steps at a quality and back, in place.
+// The plane's whole numbers are exact in float32; the transform runs in doubles.
+// Every product and sum is a whole number under 2^53, exact in a double in any order, and the one inexact step, the
+// scale to the table, is the same double multiply and round half to even the Python stream_look does, so both give
+// the same numbers. Every pass adds whole rows of 8, which the compiler runs in vector lanes.
+static void swarmLookQuantise(float* plane, int height, int width, const int table[8][8], int quality)
+{
+	const int scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
+	double steps[8][8], reciprocal[8][8], transposed[8][8];
+	int i, j, k, bi, bj;
+	for (i = 0; i < 8; i++)
+		for (j = 0; j < 8; j++)
+		{
+			int step = (table[i][j] * scale + 50) / 100;
+			step = step < 1 ? 1 : (step > 255 ? 255 : step);
+			steps[i][j] = (double)step;
+			reciprocal[i][j] = 1.0 / (4294967296.0 * (double)step);
+			transposed[i][j] = kSwarmLookDct[j][i];
+		}
+	for (bi = 0; bi < height; bi += 8)
+		for (bj = 0; bj < width; bj += 8)
+		{
+			float* block = plane + (size_t)bi * width + bj;
+			double rows[8][8], levels[8][8];
+			// Along each block row, then down the columns: levels = DCT x block x DCT transposed. The 8 rows of a pass
+			// add up side by side, so no sum waits on the one before it.
+			memset(rows, 0, sizeof(rows));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double value = block[(size_t)i * width + k];
+					for (j = 0; j < 8; j++)
+						rows[i][j] += value * transposed[k][j];
+				}
+			memset(levels, 0, sizeof(levels));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double weight = kSwarmLookDct[i][k];
+					for (j = 0; j < 8; j++)
+						levels[i][j] += weight * rows[k][j];
+				}
+			for (i = 0; i < 8; i++)
+				for (j = 0; j < 8; j++)
+					levels[i][j] = nearbyint(levels[i][j] * reciprocal[i][j]) * steps[i][j];
+			// And back: block = DCT transposed x levels x DCT.
+			memset(rows, 0, sizeof(rows));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double value = levels[i][k];
+					for (j = 0; j < 8; j++)
+						rows[i][j] += value * kSwarmLookDct[k][j];
+				}
+			memset(levels, 0, sizeof(levels));
+			for (k = 0; k < 8; k++)
+				for (i = 0; i < 8; i++)
+				{
+					const double weight = transposed[i][k];
+					for (j = 0; j < 8; j++)
+						levels[i][j] += weight * rows[k][j];
+				}
+			for (i = 0; i < 8; i++)
+				for (j = 0; j < 8; j++)
+					block[(size_t)i * width + j] = (float)nearbyint(levels[i][j] * (1.0 / 4294967296.0));
+		}
+}
+
+// The video look of `height` rows (a multiple of 16) of a frame `width` wide, from `in` into `dst`, with the band's own
+// brightness, colour and shift planes. Every step reads only its band: the 2 x 2 colour squares and the 8 x 8 blocks of
+// both resolutions never cross a 16-row boundary, so bands drawn apart give the bytes the whole frame gives.
+static void swarmLookBand(const float* in, float* dst, float* luma, float* cb, float* cr, float* shift, int height, int width, int quality)
+{
+	const int halfWidth = width / 2;
+	int row, col, i;
+	// Colour as whole numbers, clipped and rounded half to even, then brightness and the two colour planes in fixed
+	// point, all in float32 as the Python one: every value a whole number under 2^24, so exact.
+	for (i = 0; i < height * width * 3; i++)
+	{
+		const float value = in[i];
+		const float low = value < 0.0f ? 0.0f : value;
+		dst[i] = low > 1.0f ? 1.0f : low;
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] = nearbyintf(dst[i] * 255.0f);
+	// Brightness is never negative, so its floor division by 2^16 is a whole-number shift.
+	for (i = 0; i < height * width; i++)
+	{
+		const float* rgb = dst + (size_t)i * 3;
+		luma[i] = (float)((int)(rgb[0] * 19595.0f + rgb[1] * 38470.0f + rgb[2] * 7471.0f + 32768.0f) >> 16) - 128.0f;
+	}
+	// Each 2 x 2 square averaged for the colour planes.
+	for (row = 0; row < height / 2; row++)
+		for (col = 0; col < halfWidth; col++)
+		{
+			const float* top = dst + ((size_t)(2 * row) * width + 2 * col) * 3;
+			const float* bottom = top + (size_t)width * 3;
+			float half[3];
+			int c;
+			for (c = 0; c < 3; c++)
+				half[c] = floorf((top[c] + bottom[c] + top[3 + c] + bottom[3 + c] + 2.0f) * 0.25f);
+			cb[(size_t)row * halfWidth + col] = floorf((half[0] * -11059.0f + half[1] * -21709.0f + half[2] * 32768.0f + 32768.0f) * (1.0f / 65536.0f));
+			cr[(size_t)row * halfWidth + col] = floorf((half[0] * 32768.0f + half[1] * -27439.0f + half[2] * -5329.0f + 32768.0f) * (1.0f / 65536.0f));
+		}
+	swarmLookQuantise(luma, height, width, kSwarmLookLuma, quality);
+	swarmLookQuantise(cb, height / 2, halfWidth, kSwarmLookChroma, quality);
+	swarmLookQuantise(cr, height / 2, halfWidth, kSwarmLookChroma, quality);
+	// The colour shift of each 2 x 2 square, in doubles as its products pass 2^24, then added to the brightness of
+	// its four dots, clipped, and all divided.
+	for (i = 0; i < (height / 2) * halfWidth; i++)
+	{
+		const double u = cb[i], v = cr[i];
+		shift[i * 3] = (float)floor((v * 91881.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 1] = (float)floor((u * -22554.0 + v * -46802.0 + 32768.0) * (1.0 / 65536.0));
+		shift[i * 3 + 2] = (float)floor((u * 116130.0 + 32768.0) * (1.0 / 65536.0));
+	}
+	for (row = 0; row < height; row++)
+	{
+		const float* squares = shift + (size_t)(row / 2) * halfWidth * 3;
+		const float* brightness = luma + (size_t)row * width;
+		float* line = dst + (size_t)row * width * 3;
+		for (col = 0; col < halfWidth; col++)
+		{
+			int c;
+			for (c = 0; c < 6; c++)
+			{
+				const float value = squares[col * 3 + c % 3] + (brightness[2 * col + c / 3] + 128.0f);
+				const float low = value < 0.0f ? 0.0f : value;
+				line[col * 6 + c] = low > 255.0f ? 255.0f : low;
+			}
+		}
+	}
+	for (i = 0; i < height * width * 3; i++)
+		dst[i] /= 255.0f;
+}
+
+// swarmStreamLook(frame, out, quality): the video look of a float32 colour frame (height x width x 3, both multiples of
+// 16, values 0 to 1) written into out, a writable float32 array of the same shape, byte for byte what the Python
+// stream_look returns: colour at half resolution, 8 x 8 blocks quantised at the JPEG quality.
+static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
+{
+	PyObject *frameObj, *outObj;
+	int quality;
+	Py_buffer frame, out;
+	int height, width, threads;
+	float *luma, *cb, *cr, *shift;
+	if (!PyArg_ParseTuple(args, "OOi", &frameObj, &outObj, &quality))
+		return NULL;
+	if (quality < 1 || quality > 100)
+	{
+		PyErr_SetString(SpamError, "swarmStreamLook: quality must be 1 to 100.");
+		return NULL;
+	}
+	if (PyObject_GetBuffer(frameObj, &frame, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
+		return NULL;
+	if (PyObject_GetBuffer(outObj, &out, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT | PyBUF_WRITABLE) != 0)
+	{
+		PyBuffer_Release(&frame);
+		return NULL;
+	}
+	height = frame.ndim == 3 ? (int)frame.shape[0] : 0;
+	width = frame.ndim == 3 ? (int)frame.shape[1] : 0;
+	if (frame.ndim != 3 || frame.shape[2] != 3 || frame.itemsize != 4 || !frame.format || strcmp(frame.format, "f") != 0 ||
+		out.ndim != 3 || out.itemsize != 4 || !out.format || strcmp(out.format, "f") != 0 || out.shape[0] != height ||
+		out.shape[1] != width || out.shape[2] != 3 || height <= 0 || width <= 0 || height % 16 != 0 || width % 16 != 0)
+	{
+		PyBuffer_Release(&frame);
+		PyBuffer_Release(&out);
+		PyErr_SetString(SpamError, "swarmStreamLook: frame and out must be float32 arrays of one shape, height x width x 3, both multiples of 16.");
+		return NULL;
+	}
+	luma = (float*)malloc(sizeof(float) * (size_t)height * width);
+	cb = (float*)malloc(sizeof(float) * (size_t)(height / 2) * (width / 2));
+	cr = (float*)malloc(sizeof(float) * (size_t)(height / 2) * (width / 2));
+	shift = (float*)malloc(sizeof(float) * 3 * (size_t)(height / 2) * (width / 2));
+	if (!luma || !cb || !cr || !shift)
+	{
+		free(luma);
+		free(cb);
+		free(cr);
+		free(shift);
+		PyBuffer_Release(&frame);
+		PyBuffer_Release(&out);
+		return PyErr_NoMemory();
+	}
+	threads = swarmLookThreads();
+	Py_BEGIN_ALLOW_THREADS
+	{
+		const float* in = (const float*)frame.buf;
+		float* dst = (float*)out.buf;
+		const int halfWidth = width / 2;
+		int band;
+		// The render threads take bands of 16 rows each, the whole look of each band on one thread.
+#pragma omp parallel for num_threads(threads) schedule(static)
+		for (band = 0; band < height / 16; band++)
+			swarmLookBand(in + (size_t)band * 16 * width * 3, dst + (size_t)band * 16 * width * 3, luma + (size_t)band * 16 * width,
+						  cb + (size_t)band * 8 * halfWidth, cr + (size_t)band * 8 * halfWidth, shift + (size_t)band * 8 * halfWidth * 3, 16,
+						  width, quality);
+	}
+	Py_END_ALLOW_THREADS
+	free(luma);
+	free(cb);
+	free(cr);
+	free(shift);
+	PyBuffer_Release(&frame);
+	PyBuffer_Release(&out);
+	Py_INCREF(Py_None);
+	return Py_None;
+}
 
 static PyObject* pybullet_resetMeshData(PyObject* self, PyObject* args, PyObject* keywds)
 {
@@ -10159,6 +10486,20 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int skyTextureId = -1;
 	float skyYaw = 0;
 	float shadowCoreRadius = -1;
+	// ER_SWARM_THERMAL arguments; absent leaves the last setting in place
+	PyObject* airTemperatureObj = 0;
+	PyObject* skyTemperatureObj = 0;
+	PyObject* thermalSeedObj = 0;
+	float airTemperature, skyTemperature;
+	int thermalSeed;
+	// ER_SWARM_LOW_LIGHT arguments; a negative value, or no seed, leaves the last setting in place
+	float sensorPhotons = -1;
+	float sensorReadNoise = -1;
+	float sensorGainCap = -1;
+	PyObject* sensorSeedObj = 0;
+	// a spot light for this request only: [x, y, z, dx, dy, dz, angleDegrees, range, intensity]
+	PyObject* spotLightObj = 0;
+	float spotLight[9];
 	int flags = -1;
 	int renderer = -1;
 	// inialize cmd
@@ -10166,9 +10507,43 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	int physicsClientId = 0;
 	b3PhysicsClientHandle sm = 0;
 	// set camera resolution, optionally view, projection matrix, light direction, light color, light distance, shadow
-	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", NULL};
+	static char* kwlist[] = {"width", "height", "viewMatrix", "projectionMatrix", "lightDirection", "lightColor", "lightDistance", "shadow", "lightAmbientCoeff", "lightDiffuseCoeff", "lightSpecularCoeff", "renderer", "flags", "projectiveTextureView", "projectiveTextureProj", "physicsClientId", "skyHorizonColor", "skyZenithColor", "skyCloudSeed", "shadowLightCoeff", "exposure", "hazeDistance", "skyTextureId", "skyYaw", "shadowCoreRadius", "airTemperature", "skyTemperature", "thermalSeed", "sensorPhotons", "sensorReadNoise", "sensorGainCap", "sensorSeed", "spotLight", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiff", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius))
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|OOOOfifffiiOOiOOOfffiffOOOfffOO", kwlist, &width, &height, &objViewMat, &objProjMat, &lightDirObj, &lightColorObj, &lightDist, &hasShadow, &lightAmbientCoeff, &lightDiffuseCoeff, &lightSpecularCoeff, &renderer, &flags, &objProjectiveTextureView, &objProjectiveTextureProj, &physicsClientId, &skyHorizonObj, &skyZenithObj, &skyCloudSeedObj, &shadowLightCoeff, &exposure, &hazeDistance, &skyTextureId, &skyYaw, &shadowCoreRadius, &airTemperatureObj, &skyTemperatureObj, &thermalSeedObj, &sensorPhotons, &sensorReadNoise, &sensorGainCap, &sensorSeedObj, &spotLightObj))
+	{
+		return NULL;
+	}
+	if (spotLightObj == Py_None)
+		spotLightObj = 0;
+	if (spotLightObj)
+	{
+		PyObject* seq = PySequence_Fast(spotLightObj, "spotLight must be a sequence of 9 numbers");
+		int i;
+		if (!seq)
+			return NULL;
+		if (PySequence_Fast_GET_SIZE(seq) != 9)
+		{
+			Py_DECREF(seq);
+			PyErr_SetString(SpamError, "spotLight takes [x, y, z, dx, dy, dz, angleDegrees, range, intensity].");
+			return NULL;
+		}
+		for (i = 0; i < 9; i++)
+			spotLight[i] = (float)PyFloat_AsDouble(PySequence_Fast_GET_ITEM(seq, i));
+		Py_DECREF(seq);
+		if (PyErr_Occurred())
+			return NULL;
+	}
+	if (airTemperatureObj == Py_None)
+		airTemperatureObj = 0;
+	if (skyTemperatureObj == Py_None)
+		skyTemperatureObj = 0;
+	if (thermalSeedObj == Py_None)
+		thermalSeedObj = 0;
+	airTemperature = airTemperatureObj ? (float)PyFloat_AsDouble(airTemperatureObj) : 0;
+	skyTemperature = skyTemperatureObj ? (float)PyFloat_AsDouble(skyTemperatureObj) : 0;
+	// any integer seeds the grain; its low 32 bits are what count, as for sensorSeed
+	thermalSeed = thermalSeedObj ? (int)(unsigned int)PyLong_AsUnsignedLongMask(thermalSeedObj) : 0;
+	if (PyErr_Occurred())
 	{
 		return NULL;
 	}
@@ -10179,6 +10554,11 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		return NULL;
 	}
 
+	// The request is built, drawn and copied out under one lock: a client keeps a single command and one set of frame
+	// buffers, so a second thread on the same client waits for the whole call.
+	Py_BEGIN_ALLOW_THREADS
+	PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+	Py_END_ALLOW_THREADS
 	command = b3InitRequestCameraImage(sm);
 	b3RequestCameraImageSetPixelResolution(command, width, height);
 
@@ -10210,6 +10590,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		unsigned long seed = PyLong_AsUnsignedLongMask(skyCloudSeedObj);
 		if (PyErr_Occurred())
 		{
+			PyThread_release_lock(sCameraLock);
 			return NULL;
 		}
 		b3RequestCameraImageSetSkyCloudSeed(command, (int)(unsigned int)seed);
@@ -10256,6 +10637,45 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 	{
 		b3RequestCameraImageSetShadowCoreRadius(command, shadowCoreRadius);
 	}
+	if (airTemperatureObj)
+	{
+		b3RequestCameraImageSetAirTemperature(command, airTemperature);
+	}
+	if (skyTemperatureObj)
+	{
+		b3RequestCameraImageSetSkyTemperature(command, skyTemperature);
+	}
+	if (thermalSeedObj)
+	{
+		b3RequestCameraImageSetThermalSeed(command, thermalSeed);
+	}
+	if (sensorPhotons >= 0)
+	{
+		b3RequestCameraImageSetSensorPhotons(command, sensorPhotons);
+	}
+	if (sensorReadNoise >= 0)
+	{
+		b3RequestCameraImageSetSensorReadNoise(command, sensorReadNoise);
+	}
+	if (sensorGainCap >= 0)
+	{
+		b3RequestCameraImageSetSensorGainCap(command, sensorGainCap);
+	}
+	// any integer seeds the grain; its low 32 bits are what count
+	if (sensorSeedObj && sensorSeedObj != Py_None)
+	{
+		unsigned long seed = PyLong_AsUnsignedLongMask(sensorSeedObj);
+		if (PyErr_Occurred())
+		{
+			PyThread_release_lock(sCameraLock);
+			return NULL;
+		}
+		b3RequestCameraImageSetSensorSeed(command, (int)(unsigned int)seed);
+	}
+	if (spotLightObj)
+	{
+		b3RequestCameraImageSetSpotLight(command, spotLight, spotLight + 3, spotLight[6], spotLight[7], spotLight[8]);
+	}
 
 	if (flags >= 0)
 	{
@@ -10276,7 +10696,10 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 		b3SharedMemoryStatusHandle statusHandle;
 		int statusType;
 
+		// the frame touches no Python object, so other threads run while it is drawn
+		Py_BEGIN_ALLOW_THREADS
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+		Py_END_ALLOW_THREADS
 		statusType = b3GetStatusType(statusHandle);
 		if (statusType == CMD_CAMERA_IMAGE_COMPLETED)
 		{
@@ -10298,15 +10721,24 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				npy_intp dep_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				npy_intp seg_dims[2] = {imageData.m_pixelHeight, imageData.m_pixelWidth};
 				int depthOnly = (flags >= 0) && ((flags & ER_DEPTH_ONLY) != 0);
+				int noDepth = !depthOnly && (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0);
 
 				pyResultList = PyTuple_New(5);
 
 				PyTuple_SetItem(pyResultList, 0, PyInt_FromLong(imageData.m_pixelWidth));
 				PyTuple_SetItem(pyResultList, 1, PyInt_FromLong(imageData.m_pixelHeight));
 
-				pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
-				memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
-					   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				if (noDepth)
+				{
+					Py_INCREF(Py_None);
+					pyDep = Py_None;
+				}
+				else
+				{
+					pyDep = PyArray_SimpleNew(2, dep_dims, NPY_FLOAT32);
+					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
+						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+				}
 
 				if (depthOnly)
 				{
@@ -10351,9 +10783,9 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 				int bytesPerPixel = 4;  // Red, Green, Blue, and Alpha each 8 bit values
 				int num =
 					bytesPerPixel * imageData.m_pixelWidth * imageData.m_pixelHeight;
+				const int noDepth = (flags >= 0) && ((flags & ER_SWARM_NO_DEPTH) != 0) && ((flags & ER_DEPTH_ONLY) == 0);
 				pylistRGB = PyTuple_New(num);
-				pylistDep =
-					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
+				pylistDep = noDepth ? 0 : PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				pylistSeg =
 					PyTuple_New(imageData.m_pixelWidth * imageData.m_pixelHeight);
 				for (i = 0; i < imageData.m_pixelWidth; i++)
@@ -10362,6 +10794,7 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 					{
 						// TODO(hellojas): validate depth values make sense
 						int depIndex = i + j * imageData.m_pixelWidth;
+						if (pylistDep)
 						{
 							item = PyFloat_FromDouble(imageData.m_depthValues[depIndex]);
 							PyTuple_SetItem(pylistDep, depIndex, item);
@@ -10384,14 +10817,22 @@ static PyObject* pybullet_getCameraImage(PyObject* self, PyObject* args, PyObjec
 			}
 
 			PyTuple_SetItem(pyResultList, 2, pylistRGB);
+			if (!pylistDep)
+			{
+				Py_INCREF(Py_None);
+				pylistDep = Py_None;
+			}
 			PyTuple_SetItem(pyResultList, 3, pylistDep);
 			PyTuple_SetItem(pyResultList, 4, pylistSeg);
+			PyThread_release_lock(sCameraLock);
 			return pyResultList;
 #endif  //PYBULLET_USE_NUMPY
 
+			PyThread_release_lock(sCameraLock);
 			return pyResultList;
 		}
 	}
+	PyThread_release_lock(sCameraLock);
 
 	Py_INCREF(Py_None);
 	return Py_None;
@@ -10504,6 +10945,10 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 			return NULL;
 		}
 
+		// The request is built, drawn and copied out under one lock, as getCameraImage's is.
+		Py_BEGIN_ALLOW_THREADS
+		PyThread_acquire_lock(sCameraLock, WAIT_LOCK);
+		Py_END_ALLOW_THREADS
 		command = b3InitRequestCameraImage(sm);
 		b3RequestCameraImageSetPixelResolution(command, width, height);
 		b3RequestCameraImageSetCameraMatrices(command, viewMatrix, projectionMatrix);
@@ -10524,7 +10969,11 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 
 		if (b3CanSubmitCommand(sm))
 		{
-			b3SharedMemoryStatusHandle statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			b3SharedMemoryStatusHandle statusHandle;
+			// a single camera falls back to the shared depth scratch, so these frames take turns with getCameraImage's
+			Py_BEGIN_ALLOW_THREADS
+			statusHandle = b3SubmitClientCommandAndWaitStatus(sm, command);
+			Py_END_ALLOW_THREADS
 			if (b3GetStatusType(statusHandle) == CMD_CAMERA_IMAGE_COMPLETED)
 			{
 #ifdef PYBULLET_USE_NUMPY
@@ -10536,14 +10985,17 @@ static PyObject* pybullet_getDepthImagesBatch(PyObject* self, PyObject* args, Py
 					pyDep = PyArray_SimpleNew(3, dep_dims, NPY_FLOAT32);
 					memcpy(PyArray_DATA((PyArrayObject*)pyDep), imageData.m_depthValues,
 						   imageData.m_pixelHeight * imageData.m_pixelWidth * sizeof(float));
+					PyThread_release_lock(sCameraLock);
 					return pyDep;
 				}
 #else
+				PyThread_release_lock(sCameraLock);
 				PyErr_SetString(SpamError, "getDepthImagesBatch requires numpy support.");
 				return NULL;
 #endif
 			}
 		}
+		PyThread_release_lock(sCameraLock);
 	}
 	PyErr_SetString(SpamError, "getDepthImagesBatch failed.");
 	return NULL;
@@ -12885,6 +13337,9 @@ static PyMethodDef SpamMethods[] = {
 	{"resetMeshData", (PyCFunction)pybullet_resetMeshData, METH_VARARGS | METH_KEYWORDS,
 	 "Reset mesh data: a deformable body takes new simulation vertices, any other body takes new positions for the visual mesh of linkIndex, keeping its faces, uvs and texture."},
 
+	{"swarmStreamLook", (PyCFunction)pybullet_swarmStreamLook, METH_VARARGS,
+	 "swarmStreamLook(frame, out, quality): a float32 colour frame as a live video stream delivers it, written into out."},
+
 	{"createVisualShape", (PyCFunction)pybullet_createVisualShape, METH_VARARGS | METH_KEYWORDS,
 	 "Create a visual shape. Returns a non-negative (int) unique id, if successfull, negative otherwise."},
 
@@ -13102,7 +13557,9 @@ static PyMethodDef SpamMethods[] = {
 	 ", projectionMatrix, lightDirection, lightColor, lightDistance, shadow, lightAmbientCoeff, lightDiffuseCoeff, lightSpecularCoeff, renderer, "
 	 "and skyHorizonColor, skyZenithColor for a sky where nothing is drawn, skyCloudSeed for clouds in the ER_SWARM_SKY_SUN sky, "
 	 "shadowLightCoeff for the share of the direct light a shadowed surface keeps on the ray-cast path, and under "
-	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius), and return the "
+	 "ER_SWARM_DAYLIGHT exposure, hazeDistance, skyTextureId with skyYaw for a photographed sky, shadowCoreRadius, and under "
+	 "ER_SWARM_THERMAL airTemperature, skyTemperature and thermalSeed, under ER_SWARM_LOW_LIGHT sensorPhotons, "
+	 "sensorReadNoise, sensorGainCap and sensorSeed, and spotLight for a lamp in this frame only), and return the "
 	 "8-8-8bit RGB pixel data and floating point depth values"
 #ifdef PYBULLET_USE_NUMPY
 	 " as NumPy arrays"
@@ -13197,7 +13654,8 @@ static PyMethodDef SpamMethods[] = {
 	 "Return the collision shape information for one object."},
 
 	{"changeVisualShape", (PyCFunction)pybullet_changeVisualShape, METH_VARARGS | METH_KEYWORDS,
-	 "Change part of the visual shape information for one object."},
+	 "Change part of the visual shape information for one object; under ER_SWARM_THERMAL also its temperature, emissivity, "
+	 "and a heat map thermalTextureUniqueId with the temperatureRange its red byte spans."},
 
 	{"resetVisualShapeData", (PyCFunction)pybullet_changeVisualShape, METH_VARARGS | METH_KEYWORDS,
 	 "Obsolete method, kept for backward compatibility, use changeVisualShapeData instead."},
@@ -13566,6 +14024,14 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_LINEAR_LIGHT", ER_SWARM_LINEAR_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_LEAF_NO_SHADOW", ER_SWARM_LEAF_NO_SHADOW);
+	PyModule_AddIntConstant(m, "ER_SWARM_THERMAL", ER_SWARM_THERMAL);
+	PyModule_AddIntConstant(m, "ER_SWARM_LOW_LIGHT", ER_SWARM_LOW_LIGHT);
+	PyModule_AddIntConstant(m, "ER_SWARM_NEAR_INFRARED", ER_SWARM_NEAR_INFRARED);
+	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
+	PyModule_AddIntConstant(m, "ER_SWARM_FRAME_REUSE", ER_SWARM_FRAME_REUSE);
+	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
+	PyModule_AddIntConstant(m, "ER_SWARM_RASTER", ER_SWARM_RASTER);
+	PyModule_AddIntConstant(m, "ER_SWARM_NO_DEPTH", ER_SWARM_NO_DEPTH);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);
@@ -13612,6 +14078,11 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_TREE_CACHE", eVISUAL_SHAPE_RENDER_TREE_CACHE);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_RENDER_INSTANCED", eVISUAL_SHAPE_RENDER_INSTANCED);
 	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS", eVISUAL_SHAPE_GLASS);
+	PyModule_AddIntConstant(m, "VISUAL_SHAPE_GLASS_BACKED", eVISUAL_SHAPE_GLASS_BACKED);
+	// Present when a .fst forest file may carry its rows as binary doubles after a "binary <rows>" line.
+	PyModule_AddIntConstant(m, "FOREST_FILE_BINARY", 1);
+	// Present when getCameraImage lets go of the GIL while the frame is drawn; frames still never overlap each other.
+	PyModule_AddIntConstant(m, "CAMERA_RELEASES_GIL", 1);
 
 	PyModule_AddIntConstant(m, "MAX_RAY_INTERSECTION_BATCH_SIZE", MAX_RAY_INTERSECTION_BATCH_SIZE_STREAMING);
 
@@ -13673,6 +14144,17 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ZipFileIO", eZipFileIO);
 	PyModule_AddIntConstant(m, "CNSFileIO", eCNSFileIO);
 
+	sCameraLock = PyThread_allocate_lock();
+	if (!sCameraLock)
+	{
+		PyErr_SetString(PyExc_ImportError, "pybullet could not allocate its render lock");
+#if PY_MAJOR_VERSION >= 3
+		Py_DECREF(m);
+		return NULL;
+#else
+		return;
+#endif
+	}
 	SpamError = PyErr_NewException("pybullet.error", NULL, NULL);
 	Py_INCREF(SpamError);
 	PyModule_AddObject(m, "error", SpamError);

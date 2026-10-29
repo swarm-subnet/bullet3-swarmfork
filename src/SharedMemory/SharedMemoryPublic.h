@@ -907,6 +907,35 @@ enum EnumRendererAuxFlags
 	// Ray-cast shadows: a double-sided cut-out surface, a leaf or grass card, casts none, so a crown of
 	// cards is lit as one crown and not as a stack of blinds; it still receives every other shadow.
 	ER_SWARM_LEAF_NO_SHADOW = 16384,
+	// Ray-cast path: an 8-bit White Hot frame from surface temperatures, through a long-wave camera's lens, grain and
+	// per-frame contrast, written as R = G = B; the colour terms are not read.
+	ER_SWARM_THERMAL = 32768,
+	// Ray-cast colour path: the finished frame goes through a camera in low light: white balance to the frame's light,
+	// auto exposure up to a gain cap, photon and read noise from the light each pixel collected, colour fading with it.
+	ER_SWARM_LOW_LIGHT = 1048576,
+	// Ray-cast colour path under linear light: the IR-cut filter out, surfaces reflect by their near-infrared albedo
+	// and the frame is written in grey.
+	ER_SWARM_NEAR_INFRARED = 16777216,
+	// With ER_EDGE_ANTIALIAS: only outlines are smoothed (another body or a depth step), not creases inside one body.
+	ER_SWARM_EDGE_OUTLINE = 262144,
+	// Ray-cast path: a lone camera asked again for an unchanged frame gets it back untraced; the camera chain runs again.
+	ER_SWARM_FRAME_REUSE = 524288,
+	// With ER_EDGE_ANTIALIAS: a crease inside one body fills its uncovered share from its neighbours, not a probe ray.
+	ER_SWARM_CREASE_FILL = 2097152,
+	// Ray-cast path: a lone camera paints the triangles in view to find what each pixel sees, and casts a ray only
+	// where a forest tree or a mesh too dense to paint may lie nearer.
+	ER_SWARM_RASTER = 4194304,
+	// The depth buffer is neither converted nor sent: the picture call hands back None for it, for a caller that reads
+	// only colour and mask.
+	ER_SWARM_NO_DEPTH = 8388608,
+};
+
+// The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.
+enum eThermalFields
+{
+	THERMAL_FIELD_TEMPERATURE = 1,
+	THERMAL_FIELD_EMISSIVITY = 2,
+	THERMAL_FIELD_HEAT_MAP = 4,
 };
 
 ///flags to pick the IK solver and other options
@@ -1153,6 +1182,7 @@ enum eEnumUpdateVisualShapeFlags
 	eVISUAL_SHAPE_RENDER_TREE_CACHE = 32,//ray-cast tree of a static body saved under SWARM_BVH_CACHE_DIR and loaded when present
 	eVISUAL_SHAPE_GLASS = 64,//thin glass under ER_SWARM_DAYLIGHT: the sky by Fresnel plus the view through, tinted by the colour
 	eVISUAL_SHAPE_RENDER_INSTANCED = 128,//share one local ray-cast mesh tree across poses and scales
+	eVISUAL_SHAPE_GLASS_BACKED = 256,//with VISUAL_SHAPE_GLASS: a solar module, its cells over a white backsheet, no ray behind it
 };
 
 //limits for vertices/indices in PyBullet::createCollisionShape

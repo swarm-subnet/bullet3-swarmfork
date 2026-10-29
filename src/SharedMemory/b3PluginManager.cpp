@@ -196,6 +196,11 @@ void b3PluginManager::addNotification(const struct b3Notification& notification)
 	}
 }
 
+bool b3PluginManager::hasNotificationPlugins() const
+{
+	return m_data->m_numNotificationPlugins > 0;
+}
+
 int b3PluginManager::loadPlugin(const char* pluginPath, const char* postFixStr)
 {
 	int pluginUniqueId = -1;
