@@ -69,11 +69,12 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	{
 		DYNAMIC_SET = 0, /* Dynamic set index	*/
 		FIXED_SET = 1,   /* Fixed set index		*/
-		STAGECOUNT = 2   /* Number of stages		*/
+		STAGECOUNT = 2,  /* Number of stages		*/
+		PINNED = 3       /* Pinned list index	*/
 	};
 	/* Fields		*/
 	btDbvt m_sets[2];                           // Dbvt sets
-	btDbvtProxy* m_stageRoots[STAGECOUNT + 1];  // Stages list
+	btDbvtProxy* m_stageRoots[PINNED + 1];      // Stages list, then the pinned proxies
 	btOverlappingPairCache* m_paircache;        // Pair cache
 	btScalar m_prediction;                      // Velocity prediction
 	int m_stageCurrent;                         // Current stage
@@ -112,7 +113,8 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	/* btBroadphaseInterface Implementation	*/
 	btBroadphaseProxy* createProxy(const btVector3& aabbMin, const btVector3& aabbMax, int shapeType, void* userPtr, int collisionFilterGroup, int collisionFilterMask, btDispatcher* dispatcher);
 	virtual void destroyProxy(btBroadphaseProxy* proxy, btDispatcher* dispatcher);
-	virtual bool setAabbUnchanged(btBroadphaseProxy* proxy);
+	virtual bool setAabbUnchanged(btBroadphaseProxy* proxy, bool pin = false);
+	virtual void unpin(btBroadphaseProxy* proxy);
 	virtual void setAabb(btBroadphaseProxy* proxy, const btVector3& aabbMin, const btVector3& aabbMax, btDispatcher* dispatcher);
 	virtual void rayTest(const btVector3& rayFrom, const btVector3& rayTo, btBroadphaseRayCallback& rayCallback, const btVector3& aabbMin = btVector3(0, 0, 0), const btVector3& aabbMax = btVector3(0, 0, 0));
 	virtual void aabbTest(const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback);

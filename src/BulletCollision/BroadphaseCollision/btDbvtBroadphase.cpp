@@ -156,7 +156,7 @@ btDbvtBroadphase::btDbvtBroadphase(btOverlappingPairCache* paircache)
 	m_gid = 0;
 	m_pid = 0;
 	m_cid = 0;
-	for (int i = 0; i <= STAGECOUNT; ++i)
+	for (int i = 0; i <= PINNED; ++i)
 	{
 		m_stageRoots[i] = 0;
 	}
@@ -318,17 +318,33 @@ void btDbvtBroadphase::aabbTest(const btVector3& aabbMin, const btVector3& aabbM
 }
 
 //
-bool btDbvtBroadphase::setAabbUnchanged(btBroadphaseProxy* absproxy)
+bool btDbvtBroadphase::setAabbUnchanged(btBroadphaseProxy* absproxy, bool pin)
 {
 	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	// A proxy restaged every step never goes stale, so a pinned one waits out of the stage lists collide() empties; only
+	// the order of the others in those lists decides which leaves move to the fixed set, and in what order.
+	if (pin && proxy->stage == PINNED)
+		return true;
 	// The same-bounds branch of setAabb below, without comparing the bounds.
 	if (proxy->stage == STAGECOUNT || !proxy->settled)
 		return false;
 	++m_updates_call;
 	listremove(proxy, m_stageRoots[proxy->stage]);
-	proxy->stage = m_stageCurrent;
-	listappend(proxy, m_stageRoots[m_stageCurrent]);
+	proxy->stage = pin ? PINNED : m_stageCurrent;
+	listappend(proxy, m_stageRoots[proxy->stage]);
 	return true;
+}
+
+//
+void btDbvtBroadphase::unpin(btBroadphaseProxy* absproxy)
+{
+	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	if (!proxy || proxy->stage != PINNED)
+		return;
+	// Pinned through the last step, it was last staged before collide() moved the current stage on.
+	listremove(proxy, m_stageRoots[PINNED]);
+	proxy->stage = (m_stageCurrent + STAGECOUNT - 1) % STAGECOUNT;
+	listappend(proxy, m_stageRoots[proxy->stage]);
 }
 
 //
@@ -722,7 +738,7 @@ void btDbvtBroadphase::resetPool(btDispatcher* dispatcher)
 		m_gid = 0;
 		m_pid = 0;
 		m_cid = 0;
-		for (int i = 0; i <= STAGECOUNT; ++i)
+		for (int i = 0; i <= PINNED; ++i)
 		{
 			m_stageRoots[i] = 0;
 		}
