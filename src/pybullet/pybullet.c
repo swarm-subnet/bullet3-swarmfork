@@ -9435,21 +9435,34 @@ static void swarmLookQuantise(float* plane, int height, int width, const int tab
 
 // The video look of `height` rows (a multiple of 16) of a frame `width` wide, from `in` into `dst`, with the band's own
 // brightness, colour and shift planes. Every step reads only its band: the 2 x 2 colour squares and the 8 x 8 blocks of
-// both resolutions never cross a 16-row boundary, so bands drawn apart give the bytes the whole frame gives.
-static void swarmLookBand(const float* in, float* dst, float* luma, float* cb, float* cr, float* shift, int height, int width, int quality)
+// both resolutions never cross a 16-row boundary, so bands drawn apart give the bytes the whole frame gives. With
+// `bytes`, the band's colour comes from `channels` bytes a dot instead of `in`.
+static void swarmLookBand(const float* in, const unsigned char* bytes, int channels, float* dst, float* luma, float* cb, float* cr,
+						  float* shift, int height, int width, int quality)
 {
 	const int halfWidth = width / 2;
 	int row, col, i;
 	// Colour as whole numbers, clipped and rounded half to even, then brightness and the two colour planes in fixed
-	// point, all in float32 as the Python one: every value a whole number under 2^24, so exact.
-	for (i = 0; i < height * width * 3; i++)
+	// point, all in float32 as the Python one: every value a whole number under 2^24, so exact. A byte b is that whole
+	// number already: b / 255 in float32, times 255 and rounded, gives b back for all 256 of them.
+	if (bytes)
+		for (i = 0; i < height * width; i++)
+		{
+			dst[i * 3] = bytes[i * channels];
+			dst[i * 3 + 1] = bytes[i * channels + 1];
+			dst[i * 3 + 2] = bytes[i * channels + 2];
+		}
+	else
 	{
-		const float value = in[i];
-		const float low = value < 0.0f ? 0.0f : value;
-		dst[i] = low > 1.0f ? 1.0f : low;
+		for (i = 0; i < height * width * 3; i++)
+		{
+			const float value = in[i];
+			const float low = value < 0.0f ? 0.0f : value;
+			dst[i] = low > 1.0f ? 1.0f : low;
+		}
+		for (i = 0; i < height * width * 3; i++)
+			dst[i] = nearbyintf(dst[i] * 255.0f);
 	}
-	for (i = 0; i < height * width * 3; i++)
-		dst[i] = nearbyintf(dst[i] * 255.0f);
 	// Brightness is never negative, so its floor division by 2^16 is a whole-number shift.
 	for (i = 0; i < height * width; i++)
 	{
@@ -9503,8 +9516,9 @@ static void swarmLookBand(const float* in, float* dst, float* luma, float* cb, f
 
 // swarmStreamLook(frame, out, quality): the video look of a float32 colour frame (height x width x 3, both multiples of
 // 16, values 0 to 1) written into out, a writable float32 array of the same shape, byte for byte what the Python
-// stream_look returns: colour at half resolution, 8 x 8 blocks quantised at the JPEG quality.
-static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
+// stream_look returns: colour at half resolution, 8 x 8 blocks quantised at the JPEG quality. With byteFrame, the frame
+// is uint8 RGB or RGBA instead, its alpha unread, and the look the same as of that frame divided by 255 in float32.
+static PyObject* swarmStreamLook(PyObject* args, int byteFrame)
 {
 	PyObject *frameObj, *outObj;
 	int quality;
@@ -9515,7 +9529,7 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 		return NULL;
 	if (quality < 1 || quality > 100)
 	{
-		PyErr_SetString(SpamError, "swarmStreamLook: quality must be 1 to 100.");
+		PyErr_SetString(SpamError, byteFrame ? "swarmStreamLookBytes: quality must be 1 to 100." : "swarmStreamLook: quality must be 1 to 100.");
 		return NULL;
 	}
 	if (PyObject_GetBuffer(frameObj, &frame, PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) != 0)
@@ -9527,13 +9541,16 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 	}
 	height = frame.ndim == 3 ? (int)frame.shape[0] : 0;
 	width = frame.ndim == 3 ? (int)frame.shape[1] : 0;
-	if (frame.ndim != 3 || frame.shape[2] != 3 || frame.itemsize != 4 || !frame.format || strcmp(frame.format, "f") != 0 ||
+	if (frame.ndim != 3 || !frame.format ||
+		(byteFrame ? (frame.shape[2] != 3 && frame.shape[2] != 4) || frame.itemsize != 1 || strcmp(frame.format, "B") != 0
+				   : frame.shape[2] != 3 || frame.itemsize != 4 || strcmp(frame.format, "f") != 0) ||
 		out.ndim != 3 || out.itemsize != 4 || !out.format || strcmp(out.format, "f") != 0 || out.shape[0] != height ||
 		out.shape[1] != width || out.shape[2] != 3 || height <= 0 || width <= 0 || height % 16 != 0 || width % 16 != 0)
 	{
 		PyBuffer_Release(&frame);
 		PyBuffer_Release(&out);
-		PyErr_SetString(SpamError, "swarmStreamLook: frame and out must be float32 arrays of one shape, height x width x 3, both multiples of 16.");
+		PyErr_SetString(SpamError, byteFrame ? "swarmStreamLookBytes: frame must be uint8, height x width x 3 or 4, and out float32, height x width x 3, both multiples of 16."
+											 : "swarmStreamLook: frame and out must be float32 arrays of one shape, height x width x 3, both multiples of 16.");
 		return NULL;
 	}
 	luma = (float*)malloc(sizeof(float) * (size_t)height * width);
@@ -9553,16 +9570,18 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 	threads = swarmLookThreads();
 	Py_BEGIN_ALLOW_THREADS
 	{
-		const float* in = (const float*)frame.buf;
+		const float* in = byteFrame ? 0 : (const float*)frame.buf;
+		const unsigned char* bytes = byteFrame ? (const unsigned char*)frame.buf : 0;
+		const int channels = (int)frame.shape[2];
 		float* dst = (float*)out.buf;
 		const int halfWidth = width / 2;
 		int band;
 		// The render threads take bands of 16 rows each, the whole look of each band on one thread.
 #pragma omp parallel for num_threads(threads) schedule(static)
 		for (band = 0; band < height / 16; band++)
-			swarmLookBand(in + (size_t)band * 16 * width * 3, dst + (size_t)band * 16 * width * 3, luma + (size_t)band * 16 * width,
-						  cb + (size_t)band * 8 * halfWidth, cr + (size_t)band * 8 * halfWidth, shift + (size_t)band * 8 * halfWidth * 3, 16,
-						  width, quality);
+			swarmLookBand(in ? in + (size_t)band * 16 * width * 3 : 0, bytes ? bytes + (size_t)band * 16 * width * channels : 0, channels,
+						  dst + (size_t)band * 16 * width * 3, luma + (size_t)band * 16 * width, cb + (size_t)band * 8 * halfWidth,
+						  cr + (size_t)band * 8 * halfWidth, shift + (size_t)band * 8 * halfWidth * 3, 16, width, quality);
 	}
 	Py_END_ALLOW_THREADS
 	free(luma);
@@ -9573,6 +9592,18 @@ static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
 	PyBuffer_Release(&out);
 	Py_INCREF(Py_None);
 	return Py_None;
+}
+
+// swarmStreamLook(frame, out, quality) on a float32 frame.
+static PyObject* pybullet_swarmStreamLook(PyObject* self, PyObject* args)
+{
+	return swarmStreamLook(args, 0);
+}
+
+// swarmStreamLookBytes(frame, out, quality): the same look of a uint8 RGB or RGBA frame, without the float round trip.
+static PyObject* pybullet_swarmStreamLookBytes(PyObject* self, PyObject* args)
+{
+	return swarmStreamLook(args, 1);
 }
 
 static PyObject* pybullet_resetMeshData(PyObject* self, PyObject* args, PyObject* keywds)
@@ -13337,6 +13368,8 @@ static PyMethodDef SpamMethods[] = {
 	{"resetMeshData", (PyCFunction)pybullet_resetMeshData, METH_VARARGS | METH_KEYWORDS,
 	 "Reset mesh data: a deformable body takes new simulation vertices, any other body takes new positions for the visual mesh of linkIndex, keeping its faces, uvs and texture."},
 
+	{"swarmStreamLookBytes", (PyCFunction)pybullet_swarmStreamLookBytes, METH_VARARGS,
+	 "swarmStreamLookBytes(frame, out, quality): a uint8 RGB or RGBA frame as the same float32 video look, written into out."},
 	{"swarmStreamLook", (PyCFunction)pybullet_swarmStreamLook, METH_VARARGS,
 	 "swarmStreamLook(frame, out, quality): a float32 colour frame as a live video stream delivers it, written into out."},
 

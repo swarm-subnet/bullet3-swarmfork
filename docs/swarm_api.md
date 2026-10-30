@@ -245,6 +245,8 @@ The rest of PyBullet is upstream and documented in the PyBullet Quickstart Guide
 
 One call is the fork's own: `swarmStreamLook(frame, out, quality)` writes into `out` a float32 colour frame (height x width x 3, both multiples of 16, values 0 to 1) as a live video stream delivers it, colour at half resolution and 8 x 8 blocks quantised on the JPEG quality scale, in whole-number arithmetic, byte for byte what the Swarm Sentinel family's numpy version gives: 5.9 ms to 2.3 ms a 640 x 480 frame. The render threads take 16-row bands, each band's whole look on one thread, since no step crosses a 16-row boundary: 2.2 / 1.1 / 0.6 ms at 1 / 2 / 4 threads (`streamLookTest.py` holds 1, 2 and 4 threads to the same bytes).
 
+`swarmStreamLookBytes(frame, out, quality)` takes contiguous uint8 RGB or RGBA directly and writes the same float32 RGB look into `out`; height and width must be positive multiples of 16 and quality 1..100. Alpha is ignored. The existing float entry remains available. For every byte 0..255, float32 division by 255 followed by clipped multiplication and rounding recovers the byte exactly; `byteStreamLookTest.py` checks all 256 values and compares both entries at every quality.
+
 ## 9. Adding a switch
 
 1. Take the next free bit of the enum it belongs to (render flags: 33554432) and export the constant in `pybullet.c`.
