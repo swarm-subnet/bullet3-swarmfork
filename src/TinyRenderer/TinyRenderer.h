@@ -155,6 +155,8 @@ struct TinyRenderObjectData
 	std::vector<float> m_placements;
 	// One placement as a full matrix, for the raster path that draws a batch once per placement.
 	TinyRender::Matrix placementMatrix(size_t index) const;
+	// The converter's record of how a forest batch's mesh was made, until the model's arrays are released; 0 otherwise.
+	void* m_meshSource = 0;
 	bool m_renderTreeCache;  // VISUAL_SHAPE_RENDER_TREE_CACHE: the ray-cast tree of this static body is kept on disk
 	bool m_glass;  // VISUAL_SHAPE_GLASS: a thin pane on the daylight path, sky by Fresnel plus the tinted view through
 	bool m_glassBacked;  // VISUAL_SHAPE_GLASS_BACKED: the pane is a module over a white backsheet, nothing seen through

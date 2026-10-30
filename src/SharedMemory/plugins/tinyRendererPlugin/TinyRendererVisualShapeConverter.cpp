@@ -111,6 +111,13 @@ struct InstancedPrototype
 {
 	std::vector<TinyRender::Model*> m_models;
 	b3VisualShapeData m_shape;
+	// What the models were converted from, so a model whose mesh arrays were released can be converted again.
+	UrdfShape m_canonical;
+	std::string m_pathPrefix;
+	bool m_hasPathPrefix;
+	int m_flags;
+	bool m_materialsFromMtl;
+	CommonFileIOInterface* m_fileIO;
 };
 
 struct TinyRendererVisualShapeConverterInternalData
@@ -256,6 +263,9 @@ struct TinyRendererVisualShapeConverterInternalData
 	}
 
 #ifdef SWARM_RAYCAST
+	// A forest batch's tree holds its own copy of the mesh, so the render models drop theirs while nothing else holds them.
+	static void releaseBatchMesh(TinyRenderObjectData* renderObj);
+
 	// Syncs the render objects changed since the last call, in full-sync order; the mover tree only for mover shadows.
 	SwarmRaycast& syncRaycast(bool moverShadows)
 	{
@@ -269,7 +279,12 @@ struct TinyRendererVisualShapeConverterInternalData
 			TinyRendererObjectArray* visualArray = *visualArrayPtr;
 			visualArray->m_raycastDirty = false;
 			for (int v = 0; v < visualArray->m_renderObjects.size(); v++)
-				m_raycast->syncObject(visualArray->m_renderObjects[v], visualArray->m_worldTransform, visualArray->m_localScaling);
+			{
+				TinyRenderObjectData* renderObj = visualArray->m_renderObjects[v];
+				m_raycast->syncObject(renderObj, visualArray->m_worldTransform, visualArray->m_localScaling);
+				if (renderObj->m_meshSource && m_raycast->batchBuilt(renderObj))
+					releaseBatchMesh(renderObj);
+			}
 		}
 		m_raycastSyncAll = false;
 		m_raycast->commit(moverShadows);
@@ -1069,6 +1084,78 @@ static void drawPlacements(TinyRenderObjectData& obj, void (*draw)(TinyRenderObj
 	obj.m_modelMatrix = base;
 }
 
+// One material group's vertex range and its indices rebased to the range's first vertex, as the group's render model takes them.
+static int groupSlice(const btAlignedObjectArray<int>& indices, const b3ImportMeshMaterialGroup& group, btAlignedObjectArray<int>& groupIndices, int& firstVertex)
+{
+	firstVertex = indices[group.m_indexStart];
+	int lastVertex = firstVertex;
+	for (int i = 1; i < group.m_indexCount; i++)
+	{
+		firstVertex = btMin(firstVertex, indices[group.m_indexStart + i]);
+		lastVertex = btMax(lastVertex, indices[group.m_indexStart + i]);
+	}
+	groupIndices.resize(group.m_indexCount);
+	for (int i = 0; i < group.m_indexCount; i++)
+		groupIndices[i] = indices[group.m_indexStart + i] - firstVertex;
+	return lastVertex - firstVertex + 1;
+}
+
+// Converts a prototype again and refills every model of it whose mesh arrays were released; the conversion's textures,
+// already held by the models, are dropped.
+static void restorePrototypeMeshes(void* context)
+{
+	InstancedPrototype& prototype = *(InstancedPrototype*)context;
+	b3VisualShapeData shape;
+	memset(&shape, 0, sizeof(shape));
+	btAlignedObjectArray<MyTexture2> textures;
+	btAlignedObjectArray<GLInstanceVertex> vertices;
+	btAlignedObjectArray<int> indices;
+	btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
+	btTransform identity;
+	identity.setIdentity();
+	convertURDFToVisualShape(&prototype.m_canonical, prototype.m_hasPathPrefix ? prototype.m_pathPrefix.c_str() : 0, identity, vertices, indices,
+							 textures, shape, prototype.m_fileIO, prototype.m_flags, prototype.m_materialsFromMtl ? &materialGroups : 0);
+	if (vertices.size() && indices.size() && materialGroups.size())
+	{
+		for (int g = 0; g < materialGroups.size() && g < (int)prototype.m_models.size(); g++)
+		{
+			btAlignedObjectArray<int> groupIndices;
+			int firstVertex = 0;
+			const int numVertices = groupSlice(indices, materialGroups[g], groupIndices, firstVertex);
+			prototype.m_models[g]->restoreMeshArrays(&vertices[firstVertex].xyzw[0], numVertices, &groupIndices[0], groupIndices.size());
+		}
+	}
+	else if (vertices.size() && indices.size() && prototype.m_models.size())
+		prototype.m_models[0]->restoreMeshArrays(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size());
+	// Texels the loader did not keep in its cache belong to this call; one image can be both a group's and the mesh's.
+	std::set<unsigned char*> owned;
+	for (int g = 0; g < materialGroups.size(); g++)
+		if (!materialGroups[g].m_isCached)
+		{
+			owned.insert(materialGroups[g].m_textureImage);
+			owned.insert(materialGroups[g].m_textureAlpha);
+		}
+	for (int i = 0; i < textures.size(); i++)
+		if (!textures[i].m_isCached)
+		{
+			owned.insert(textures[i].textureData1);
+			owned.insert(textures[i].m_alpha);
+		}
+	for (std::set<unsigned char*>::iterator it = owned.begin(); it != owned.end(); ++it)
+		free(*it);
+}
+
+#ifdef SWARM_RAYCAST
+void TinyRendererVisualShapeConverterInternalData::releaseBatchMesh(TinyRenderObjectData* renderObj)
+{
+	InstancedPrototype* prototype = (InstancedPrototype*)renderObj->m_meshSource;
+	renderObj->m_meshSource = 0;
+	// Held by the prototype and this batch alone, so any later reader of the arrays is one the prototype outlives.
+	if (renderObj->m_model->meshOwners() == 2)
+		renderObj->m_model->releaseMeshArrays(restorePrototypeMeshes, prototype);
+}
+#endif
+
 // The render models of one instanced mesh, converted once: every body and forest placement that draws it
 // borrows them. The models are built exactly as a plain body's would be, so a borrowed copy draws the same.
 static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConverterInternalData* data, const std::string& key,
@@ -1079,6 +1166,12 @@ static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConve
 	if (found != data->m_instancedPrototypes.end())
 		return found->second;
 	InstancedPrototype& prototype = data->m_instancedPrototypes[key];
+	prototype.m_canonical = canonical;
+	prototype.m_hasPathPrefix = pathPrefix != 0;
+	prototype.m_pathPrefix = pathPrefix ? pathPrefix : "";
+	prototype.m_flags = data->m_flags;
+	prototype.m_materialsFromMtl = materialsFromMtl;
+	prototype.m_fileIO = fileIO;
 	b3VisualShapeData& shape = prototype.m_shape;
 	memset(&shape, 0, sizeof(shape));
 	for (int i = 0; i < 4; i++)
@@ -1100,23 +1193,15 @@ static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConve
 		for (int g = 0; g < materialGroups.size(); g++)
 		{
 			const b3ImportMeshMaterialGroup& group = materialGroups[g];
-			int firstVertex = indices[group.m_indexStart];
-			int lastVertex = firstVertex;
-			for (int i = 1; i < group.m_indexCount; i++)
-			{
-				firstVertex = btMin(firstVertex, indices[group.m_indexStart + i]);
-				lastVertex = btMax(lastVertex, indices[group.m_indexStart + i]);
-			}
 			btAlignedObjectArray<int> groupIndices;
-			groupIndices.resize(group.m_indexCount);
-			for (int i = 0; i < group.m_indexCount; i++)
-				groupIndices[i] = indices[group.m_indexStart + i] - firstVertex;
+			int firstVertex = 0;
+			const int numVertices = groupSlice(indices, group, groupIndices, firstVertex);
 			const float groupColor[4] = {(float)group.m_rgbaColor[0], (float)group.m_rgbaColor[1], (float)group.m_rgbaColor[2], (float)group.m_rgbaColor[3]};
 			TinyRender::Model* model = new TinyRender::Model();
 			model->setColorRGBA(groupColor);
 			if (group.m_textureImage || !group.m_textureName.empty())
 				model->setDiffuseTextureFromData(group.m_textureImage, group.m_textureWidth, group.m_textureHeight, group.m_textureAlpha, group.m_textureName.c_str());
-			model->setMeshFromArrays(&vertices[firstVertex].xyzw[0], lastVertex - firstVertex + 1, &groupIndices[0], groupIndices.size());
+			model->setMeshFromArrays(&vertices[firstVertex].xyzw[0], numVertices, &groupIndices[0], groupIndices.size());
 			const float groupSpecular[3] = {(float)group.m_specularColor[0], (float)group.m_specularColor[1], (float)group.m_specularColor[2]};
 			model->setSpecularColor(groupSpecular);
 			prototype.m_models.push_back(model);
@@ -1436,6 +1521,8 @@ int  TinyRendererVisualShapeConverter::convertVisualShapes(
 						tinyObj->m_placements = forest.m_placements[mesh];
 						tinyObj->m_model = new TinyRender::Model();
 						tinyObj->m_model->shareFrom(*prototype.m_models[m]);
+						if (isForest)
+							tinyObj->m_meshSource = (void*)&prototype;
 						tinyObj->computeLocalAABB();
 						visuals->m_renderObjects.push_back(tinyObj);
 					}

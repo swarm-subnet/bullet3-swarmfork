@@ -6,6 +6,8 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <atomic>
+#include <mutex>
 #include "Bullet3Common/b3Logging.h"
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -28,9 +30,23 @@ struct SharedMesh
 	int uvByVertex_;
 	Vec3f aabbMin_;
 	Vec3f aabbMax_;
+	// Set once anything wrote the arrays after setMeshFromArrays, such as a normal normalised in place; never released then.
+	bool written_;
+	// Set while the arrays are released: the counts stand for their sizes and restore_ refills them on the next read.
+	std::atomic<bool> released_;
+	bool wasRegistered_;
+	int numVerts_;
+	int numNorms_;
+	int numCorners_;
+	void (*restore_)(void*);
+	void* restoreContext_;
 
-	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false), uvByVertex_(-1) {}
+	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false), uvByVertex_(-1), written_(false), released_(false),
+				   wasRegistered_(false), numVerts_(0), numNorms_(0), numCorners_(0), restore_(0), restoreContext_(0) {}
 };
+
+// Serialises refills, which may be asked for by any thread that reads a released mesh.
+static std::mutex gRestoreMutex;
 
 struct SharedTexture
 {
@@ -88,6 +104,20 @@ static unsigned long long fnv1a(const void* data, size_t numWords, unsigned long
 }
 
 static const unsigned long long FNV_SEED = 14695981039346656037ULL;
+
+// The content hash setMeshFromArrays keys a mesh by: the counts, then each vertex's position, normal and uv, then the indices.
+static unsigned long long arraysHash(const float* vertices, int numVertices, const int* indices, int numIndices)
+{
+	unsigned long long hash = fnv1a(&numVertices, 1, FNV_SEED);
+	hash = fnv1a(&numIndices, 1, hash);
+	for (int i = 0; i < numVertices; i++)
+	{
+		const float* v = vertices + i * 9;
+		hash = fnv1a(v, 3, hash);
+		hash = fnv1a(v + 4, 5, hash);
+	}
+	return fnv1a(indices, (size_t)numIndices, hash);
+}
 
 static void releaseMesh(SharedMesh* mesh)
 {
@@ -322,15 +352,7 @@ void Model::loadDiffuseTexture(const char *relativeFileName)
 
 void Model::setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices)
 {
-	unsigned long long hash = fnv1a(&numVertices, 1, FNV_SEED);
-	hash = fnv1a(&numIndices, 1, hash);
-	for (int i = 0; i < numVertices; i++)
-	{
-		const float* v = vertices + i * 9;
-		hash = fnv1a(v, 3, hash);
-		hash = fnv1a(v + 4, 5, hash);
-	}
-	hash = fnv1a(indices, (size_t)numIndices, hash);
+	const unsigned long long hash = arraysHash(vertices, numVertices, indices, numIndices);
 
 	if (sharingEnabled())
 	{
@@ -375,6 +397,8 @@ void Model::setMeshFromArrays(const float* vertices, int numVertices, const int*
 		}
 	}
 	m_mesh->hash_ = hash;
+	// The pushes above went through detachMesh, yet the block holds exactly the arrays given.
+	m_mesh->written_ = false;
 	if (sharingEnabled())
 	{
 		m_mesh->registered_ = true;
@@ -385,6 +409,7 @@ void Model::setMeshFromArrays(const float* vertices, int numVertices, const int*
 // Any write goes to a private block: clone when shared, unregister when this is the only owner.
 void Model::detachMesh()
 {
+	needArrays();
 	m_mesh->hasAABB_ = false;
 	m_mesh->uvByVertex_ = -1;
 	if (m_mesh->refs_ > 1)
@@ -410,6 +435,8 @@ void Model::detachMesh()
 		}
 		m_mesh->registered_ = false;
 	}
+	// The block is about to be written, so it no longer holds what setMeshFromArrays was given.
+	m_mesh->written_ = true;
 }
 
 void Model::reserveMemory(int numVertices, int numIndices)
@@ -441,10 +468,11 @@ void Model::addTriangle(int vertexposIndex0, int normalIndex0, int uvIndex0,
 
 bool Model::getLocalAABB(Vec3f& aabbMin, Vec3f& aabbMax)
 {
-	if (m_mesh->verts_.empty())
+	if (nverts() == 0)
 		return false;
 	if (!m_mesh->hasAABB_)
 	{
+		needArrays();
 		Vec3f mn = m_mesh->verts_[0];
 		Vec3f mx = mn;
 		for (size_t i = 1; i < m_mesh->verts_.size(); i++)
@@ -488,23 +516,24 @@ void Model::shareFrom(const Model& other)
 
 int Model::nverts()
 {
-	return (int)m_mesh->verts_.size();
+	return m_mesh->released_ ? m_mesh->numVerts_ : (int)m_mesh->verts_.size();
 }
 
 int Model::nnormals()
 {
-	return (int)m_mesh->norms_.size();
+	return m_mesh->released_ ? m_mesh->numNorms_ : (int)m_mesh->norms_.size();
 }
 
 int Model::nfaces()
 {
-	return (int)m_mesh->faces_.size() / 3;
+	return (m_mesh->released_ ? m_mesh->numCorners_ : (int)m_mesh->faces_.size()) / 3;
 }
 
 bool Model::uvIndexedByVertex() const
 {
 	if (m_mesh->uvByVertex_ < 0)
 	{
+		needArrays();
 		int same = 1;
 		for (size_t i = 0; same && i < m_mesh->faces_.size(); i++)
 			same = m_mesh->faces_[i][1] == m_mesh->faces_[i][0];
@@ -515,6 +544,7 @@ bool Model::uvIndexedByVertex() const
 
 const float* Model::uvArray() const
 {
+	needArrays();
 	return m_mesh->uv_.empty() ? 0 : &m_mesh->uv_[0][0];
 }
 
@@ -523,8 +553,97 @@ unsigned long long Model::meshHash() const
 	return m_mesh->hash_;
 }
 
+int Model::meshOwners() const
+{
+	return m_mesh->refs_;
+}
+
+void Model::needArrays() const
+{
+	if (!m_mesh->released_.load(std::memory_order_acquire))
+		return;
+	const std::lock_guard<std::mutex> guard(gRestoreMutex);
+	if (m_mesh->released_.load(std::memory_order_acquire))
+		m_mesh->restore_(m_mesh->restoreContext_);
+	if (m_mesh->released_.load(std::memory_order_acquire))
+		b3Warning("TinyRender::Model: released mesh arrays were not restored\n");
+}
+
+bool Model::releaseMeshArrays(void (*restore)(void*), void* context)
+{
+	SharedMesh* mesh = m_mesh;
+	if (mesh->released_ || mesh->written_ || mesh->verts_.empty() || !restore)
+		return false;
+	// The box and the uv layout are kept answered, so reading them needs no refill.
+	Vec3f aabbMin, aabbMax;
+	getLocalAABB(aabbMin, aabbMax);
+	uvIndexedByVertex();
+	mesh->numVerts_ = (int)mesh->verts_.size();
+	mesh->numNorms_ = (int)mesh->norms_.size();
+	mesh->numCorners_ = (int)mesh->faces_.size();
+	// Out of the registry, so no new mesh is ever compared against the empty arrays.
+	mesh->wasRegistered_ = mesh->registered_;
+	if (mesh->registered_)
+	{
+		for (size_t i = 0; i < gSharedMeshes.size(); i++)
+		{
+			if (gSharedMeshes[i] == mesh)
+			{
+				gSharedMeshes[i] = gSharedMeshes.back();
+				gSharedMeshes.pop_back();
+				break;
+			}
+		}
+		mesh->registered_ = false;
+	}
+	std::vector<Vec3f>().swap(mesh->verts_);
+	std::vector<Vec3i>().swap(mesh->faces_);
+	std::vector<Vec3f>().swap(mesh->norms_);
+	std::vector<Vec2f>().swap(mesh->uv_);
+	mesh->restore_ = restore;
+	mesh->restoreContext_ = context;
+	mesh->released_.store(true, std::memory_order_release);
+	return true;
+}
+
+void Model::restoreMeshArrays(const float* vertices, int numVertices, const int* indices, int numIndices)
+{
+	SharedMesh* mesh = m_mesh;
+	if (!mesh->released_)
+		return;
+	if (numVertices != mesh->numVerts_ || numIndices != mesh->numCorners_ || arraysHash(vertices, numVertices, indices, numIndices) != mesh->hash_)
+	{
+		b3Warning("TinyRender::Model: a released mesh converted again to different arrays\n");
+		return;
+	}
+	// The same reservations and pushes setMeshFromArrays makes through reserveMemory, addVertex and addTriangle.
+	mesh->verts_.reserve(numVertices);
+	mesh->norms_.reserve(numVertices);
+	mesh->uv_.reserve(numVertices);
+	mesh->faces_.reserve(numIndices);
+	for (int i = 0; i < numVertices; i++)
+	{
+		const float* v = vertices + i * 9;
+		mesh->verts_.push_back(Vec3f(v[0], v[1], v[2]));
+		mesh->norms_.push_back(Vec3f(v[4], v[5], v[6]));
+		mesh->uv_.push_back(Vec2f(v[7], v[8]));
+	}
+	for (int i = 0; i < numIndices; i += 3)
+		for (int k = 0; k < 3; k++)
+			mesh->faces_.push_back(Vec3i(indices[i + k], indices[i + k], indices[i + k]));
+	if (mesh->wasRegistered_)
+	{
+		mesh->registered_ = true;
+		gSharedMeshes.push_back(mesh);
+	}
+	mesh->restore_ = 0;
+	mesh->restoreContext_ = 0;
+	mesh->released_.store(false, std::memory_order_release);
+}
+
 std::vector<int> Model::face(int idx)
 {
+	needArrays();
 	std::vector<int> face;
 	face.reserve(3);
 	for (int i = 0; i < 3; i++)
@@ -534,17 +653,20 @@ std::vector<int> Model::face(int idx)
 
 void Model::faceVertices(int idx, int out[3]) const
 {
+	needArrays();
 	for (int i = 0; i < 3; i++)
 		out[i] = m_mesh->faces_[(size_t)idx * 3 + i][0];
 }
 
 Vec3f Model::vert(int i)
 {
+	needArrays();
 	return m_mesh->verts_[i];
 }
 
 Vec3f Model::vert(int iface, int nthvert)
 {
+	needArrays();
 	return m_mesh->verts_[m_mesh->faces_[(size_t)iface * 3 + nthvert][0]];
 }
 
@@ -1151,6 +1273,7 @@ void Model::buildMipmaps()
 
 Vec3f Model::storedNormal(int iface, int nthvert) const
 {
+	needArrays();
 	return m_mesh->norms_[m_mesh->faces_[(size_t)iface * 3 + nthvert][2]];
 }
 
@@ -1166,6 +1289,7 @@ Vec3f Model::normal(Vec2f uvf)
 
 Vec2f Model::uv(int iface, int nthvert)
 {
+	needArrays();
 	return m_mesh->uv_[m_mesh->faces_[(size_t)iface * 3 + nthvert][1]];
 }
 
@@ -1181,6 +1305,9 @@ float Model::specular(Vec2f uvf)
 
 Vec3f Model::normal(int iface, int nthvert)
 {
+	needArrays();
+	// The stored normal is normalised in place below, so the block no longer holds what setMeshFromArrays wrote.
+	m_mesh->written_ = true;
 	int idx = m_mesh->faces_[(size_t)iface * 3 + nthvert][2];
 	return m_mesh->norms_[idx].normalize();
 }

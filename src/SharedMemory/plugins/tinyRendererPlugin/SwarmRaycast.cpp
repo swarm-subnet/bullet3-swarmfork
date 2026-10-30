@@ -2578,6 +2578,12 @@ bool SwarmRaycast::meshChanged(TinyRenderObjectData* renderObj)
 	return found->second.m_instance->m_tree->m_refs > 1;
 }
 
+bool SwarmRaycast::batchBuilt(TinyRenderObjectData* renderObj) const
+{
+	std::map<TinyRenderObjectData*, ObjectState>::const_iterator found = m_data->m_objects.find(renderObj);
+	return found != m_data->m_objects.end() && found->second.m_batch && found->second.m_batch->m_tree;
+}
+
 void SwarmRaycast::removeObject(TinyRenderObjectData* renderObj)
 {
 	m_data->m_sceneRevision++;

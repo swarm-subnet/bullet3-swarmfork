@@ -163,6 +163,29 @@ class TestForestBatch(unittest.TestCase):
     separate_world(self.folder)
     self.assertPixelsEqual(together, frame(flags=0, shadow=0, eye=(0, -6, 6)))
 
+  def test_raster_after_the_ray_caster_draws_the_same(self):
+    """A forest whose mesh the ray caster's tree took over still rasterises to the bytes of one never ray-cast."""
+    forest_world(self.folder)
+    frame(flags=RAY, eye=(0, -6, 6))
+    after = frame(flags=0, shadow=0, eye=(0, -6, 6))
+    forest_world(self.folder)
+    fresh = frame(flags=0, shadow=0, eye=(0, -6, 6))
+    for left, right in zip(after, fresh):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
+
+  def test_forest_added_again_draws_the_same(self):
+    """A forest removed after its first frame and created again from the same file draws the first frame's bytes."""
+    body = forest_world(self.folder)
+    first = frame(flags=RAY | MAP, eye=(0, -6, 6))
+    p.removeBody(body)
+    frame(flags=RAY | MAP, eye=(0, -6, 6))
+    shape = p.createVisualShape(p.GEOM_MESH, fileName=os.path.join(self.folder, "forest.fst"),
+                                flags=INSTANCED | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY, specularColor=[0, 0, 0])
+    p.createMultiBody(0, -1, shape)
+    again = frame(flags=RAY | MAP, eye=(0, -6, 6))
+    for left, right in zip(first[:2], again[:2]):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
+
   def test_mask_names_the_forest_body(self):
     """Every placement's pixels carry the forest body's id in the segmentation mask."""
     body = forest_world(self.folder)

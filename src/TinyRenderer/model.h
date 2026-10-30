@@ -24,6 +24,8 @@ private:
 
 	void load_texture(std::string filename, const char* suffix, TGAImage& img);
 	void detachMesh();
+	// Refills released mesh arrays before a read.
+	void needArrays() const;
 
 public:
 	Model(const char* filename);
@@ -90,6 +92,13 @@ public:
 	const float* uvArray() const;
 	// Content hash of the mesh arrays, the same across processes for the same vertices and faces.
 	unsigned long long meshHash() const;
+	// Models holding this Model's mesh, itself included.
+	int meshOwners() const;
+	// Frees the mesh arrays, keeping their counts, hash and box; the first later read calls restore(context), which
+	// refills them with restoreMeshArrays. False, freeing nothing, when they are released already or were ever written.
+	bool releaseMeshArrays(void (*restore)(void*), void* context);
+	// Inside a restore call: refills released arrays from what setMeshFromArrays was given, exactly as it wrote them.
+	void restoreMeshArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
 
 	Vec2f uv(int iface, int nthvert);
 	TGAColor diffuse(Vec2f uv);

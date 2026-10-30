@@ -99,6 +99,8 @@ public:
 	void syncObject(TinyRenderObjectData* renderObj, const btTransform& worldTransform, const btVector3& localScaling);
 	// Records renderObj's rewritten vertices for a refit at the next commit; true when other render objects share the tree.
 	bool meshChanged(TinyRenderObjectData* renderObj);
+	// True once renderObj is a forest batch with its mesh tree built.
+	bool batchBuilt(TinyRenderObjectData* renderObj) const;
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
 	// Rebuilds the top-level tree after a batch of sync calls; the mover tree only when moverShadows asks for it.
