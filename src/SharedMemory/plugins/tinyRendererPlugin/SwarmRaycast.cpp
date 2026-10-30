@@ -229,6 +229,9 @@ struct CachedTree
 	IdleTrees::iterator m_idle;
 	// Built with Embree's robust flag; forest trees are not, and never share a tree with a mesh that is.
 	bool m_robust;
+	// The arrays m_geometry reads in place: the one copy every mesh tree drawing this tree reads too.
+	std::vector<float> m_vertices;
+	std::vector<unsigned> m_indices;
 };
 
 // One tree per distinct mesh, shared by every mover instance drawn from that mesh. A world tree
@@ -240,6 +243,7 @@ struct MeshTree
 	RTCGeometry m_geometry;
 	// The process-wide tree m_scene and m_geometry belong to, until the mesh is rewritten; 0 when they are this tree's own.
 	CachedTree* m_cached;
+	// Empty while m_cached holds the arrays; read them through vertices() and indices().
 	std::vector<float> m_vertices;
 	std::vector<unsigned> m_indices;
 	// Per-vertex unit normals in the mesh's own frame, and uv pairs, indexed like m_vertices.
@@ -259,6 +263,10 @@ struct MeshTree
 	std::vector<RasterChunk> m_chunks;
 	float m_chunksLo[3];
 	float m_chunksHi[3];
+
+	// The vertex and index arrays the tree draws: the cached tree's while it has one, else its own.
+	const std::vector<float>& vertices() const { return m_cached ? m_cached->m_vertices : m_vertices; }
+	const std::vector<unsigned>& indices() const { return m_cached ? m_cached->m_indices : m_indices; }
 };
 
 // A world tree on disk: <SWARM_BVH_CACHE_DIR>/<key>.rtree holds the world-space vertex, index,
@@ -577,7 +585,7 @@ void keepHit(const RTCFilterFunctionNArguments* args)
 		else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
 			args->valid[0] = 0;
 		else if (batch->m_hasAlpha && ctx->m_alphaCutout &&
-				 cutOutAt(batch->m_obj->m_model, batch->m_tree->m_vertices.data(), batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit,
+				 cutOutAt(batch->m_obj->m_model, batch->m_tree->vertices().data(), batch->m_tree->m_uvs.data(), batch->m_tree->indices(), hit,
 						  ray, ctx->m_pixelSpread))
 			args->valid[0] = 0;
 		return;
@@ -590,7 +598,7 @@ void keepHit(const RTCFilterFunctionNArguments* args)
 	else if (ctx->m_anyWinding && ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
 	else if (inst->m_hasAlpha && ctx->m_alphaCutout &&
-			 cutOutAt(inst->m_obj->m_model, inst->m_tree->m_vertices.data(), inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit, ray,
+			 cutOutAt(inst->m_obj->m_model, inst->m_tree->vertices().data(), inst->m_tree->m_uvs.data(), inst->m_tree->indices(), hit, ray,
 					  ctx->m_pixelSpread))
 		args->valid[0] = 0;
 }
@@ -622,7 +630,7 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 	{
 		if (ctx->m_leafNoShadow && leafCard(batch->m_doubleSided, batch->m_hasAlpha))
 			args->valid[0] = 0;
-		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->m_indices, hit))
+		else if (batch->m_hasAlpha && ctx->m_alphaCutout && cutOut(batch->m_obj->m_model, batch->m_tree->m_uvs.data(), batch->m_tree->indices(), hit))
 			args->valid[0] = 0;
 		return;
 	}
@@ -631,7 +639,7 @@ void shadowFilter(const RTCFilterFunctionNArguments* args)
 		return;
 	if (ctx->m_leafNoShadow && leafCard(inst->m_doubleSided, inst->m_hasAlpha))
 		args->valid[0] = 0;
-	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->m_indices, hit))
+	else if (inst->m_hasAlpha && ctx->m_alphaCutout && cutOut(inst->m_obj->m_model, inst->m_tree->m_uvs.data(), inst->m_tree->indices(), hit))
 		args->valid[0] = 0;
 }
 
@@ -860,8 +868,8 @@ size_t gIdleWeight = 0;
 // Renderers of every client in the process share the cache, and a body removed on one client can meet a frame on another.
 std::mutex gTreeCacheMutex;
 
-// The cached tree over arrays equal byte for byte to these, built here when the process has none yet.
-CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertices, const std::vector<unsigned>& indices, bool robust)
+// The cached tree over arrays equal byte for byte to these, built here when the process has none yet, taking the arrays.
+CachedTree* acquireCachedTree(RTCDevice device, std::vector<float>& vertices, std::vector<unsigned>& indices, bool robust)
 {
 	const std::lock_guard<std::mutex> guard(gTreeCacheMutex);
 	const size_t numVertices = (vertices.size() - kVertexPadding) / 3, numTriangles = indices.size() / 3;
@@ -887,14 +895,10 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	tree->m_scene = rtcNewScene(device);
 	rtcSetSceneFlags(tree->m_scene, robust ? RTC_SCENE_FLAG_ROBUST : RTC_SCENE_FLAG_NONE);
 	rtcSetSceneBuildQuality(tree->m_scene, RTC_BUILD_QUALITY_MEDIUM);
-	// Embree owns the copies, so they last as long as any instance still draws the tree, evicted or not.
-	tree->m_geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
-	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3 * sizeof(float), numVertices),
-		   &vertices[0], numVertices * 3 * sizeof(float));
-	memcpy(rtcSetNewGeometryBuffer(tree->m_geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, 3 * sizeof(unsigned), numTriangles),
-		   &indices[0], indices.size() * sizeof(unsigned));
-	rtcSetGeometryIntersectFilterFunction(tree->m_geometry, hitFilter);
-	rtcSetGeometryOccludedFilterFunction(tree->m_geometry, shadowFilter);
+	// The tree owns the arrays, so they last as long as any instance still draws the tree, evicted or not.
+	tree->m_vertices.swap(vertices);
+	tree->m_indices.swap(indices);
+	tree->m_geometry = newTriangles(device, tree->m_vertices, tree->m_indices);
 	rtcCommitGeometry(tree->m_geometry);
 	rtcAttachGeometry(tree->m_scene, tree->m_geometry);
 	// A tree another process of this machine built over the same arrays is loaded instead of built; the load checks the
@@ -902,8 +906,8 @@ CachedTree* acquireCachedTree(RTCDevice device, const std::vector<float>& vertic
 	std::string diskPath;
 	std::vector<char> image;
 	unsigned long long diskKey = b3DiskCacheHash("SWCTREE1", 8);
-	diskKey = b3DiskCacheHash(&vertices[0], numVertices * 3 * sizeof(float), diskKey);
-	diskKey = b3DiskCacheHash(&indices[0], indices.size() * sizeof(unsigned), diskKey);
+	diskKey = b3DiskCacheHash(&tree->m_vertices[0], numVertices * 3 * sizeof(float), diskKey);
+	diskKey = b3DiskCacheHash(&tree->m_indices[0], tree->m_indices.size() * sizeof(unsigned), diskKey);
 	if (!robust)
 		diskKey = b3DiskCacheHash("FAST", 4, diskKey);
 	const bool onDisk = b3DiskCachePath(diskKey, "ctree", diskPath);
@@ -1885,6 +1889,9 @@ struct SwarmRaycast::Data
 		if (!tree.m_world)
 		{
 			tree.m_cached = acquireCachedTree(m_device, tree.m_vertices, tree.m_indices, tree.m_robust);
+			// The cached tree holds the one copy of the arrays, whether it took these or already had equal ones.
+			std::vector<float>().swap(tree.m_vertices);
+			std::vector<unsigned>().swap(tree.m_indices);
 			tree.m_scene = tree.m_cached->m_scene;
 			tree.m_geometry = tree.m_cached->m_geometry;
 			return;
@@ -1937,8 +1944,8 @@ struct SwarmRaycast::Data
 		std::map<unsigned long long, MeshTree*>& shared = robust ? m_sharedTrees : m_forestTrees;
 		std::map<unsigned long long, MeshTree*>::iterator found = shared.find(hash);
 		// A hash match must also match in size, so a collision builds its own tree instead of borrowing one.
-		if (hash && found != shared.end() && found->second->m_indices.size() == (size_t)model->nfaces() * 3 &&
-			found->second->m_vertices.size() == (size_t)model->nverts() * 3 + kVertexPadding)
+		if (hash && found != shared.end() && found->second->indices().size() == (size_t)model->nfaces() * 3 &&
+			found->second->vertices().size() == (size_t)model->nverts() * 3 + kVertexPadding)
 		{
 			found->second->m_refs++;
 			return found->second;
@@ -1987,8 +1994,11 @@ struct SwarmRaycast::Data
 
 	void refitTree(TinyRender::Model* model, MeshTree& tree)
 	{
-		if ((size_t)model->nverts() * 3 + kVertexPadding != tree.m_vertices.size())
+		if ((size_t)model->nverts() * 3 + kVertexPadding != tree.vertices().size())
 			return;
+		// The rewritten mesh leaves the cached tree below, so it takes its own copy of the indices first.
+		if (tree.m_cached)
+			tree.m_indices = tree.m_cached->m_indices;
 		copyLocalVertices(model, tree.m_vertices);
 		copyAttributes(model, tree.m_indices, 0, tree.m_normals, tree.m_uvs, true);
 		tree.m_chunks.clear();
@@ -2862,8 +2872,8 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_rotation = 0;
 		surface->m_normals = batch->m_tree->m_normals.empty() ? 0 : &batch->m_tree->m_normals[0];
 		surface->m_uvs = batch->m_tree->m_uvs.data();
-		vertices = &batch->m_tree->m_vertices[0];
-		indices = &batch->m_tree->m_indices[0];
+		vertices = &batch->m_tree->vertices()[0];
+		indices = &batch->m_tree->indices()[0];
 		transform = placement;
 		cornerRotation = &batch->m_normalRotations[(size_t)hit.instPrimID[1] * 9];
 		surface->m_transformedNormals = surface->m_normals != 0;
@@ -2905,8 +2915,8 @@ bool resolveHit(const RTCHit& hit, unsigned staticId, const std::vector<StaticMe
 		surface->m_rotation = inst->m_rotation;
 		surface->m_normals = inst->m_tree->m_normals.empty() ? 0 : &inst->m_tree->m_normals[0];
 		surface->m_uvs = inst->m_tree->m_uvs.data();
-		vertices = &inst->m_tree->m_vertices[0];
-		indices = &inst->m_tree->m_indices[0];
+		vertices = &inst->m_tree->vertices()[0];
+		indices = &inst->m_tree->indices()[0];
 		transform = inst->m_transform;
 		cornerRotation = inst->m_rotation;
 		surface->m_transformedNormals = inst->m_staticShared && surface->m_normals;
@@ -5207,8 +5217,8 @@ void paintJob(RasterLane& lane, const RasterView& view, const RasterJob& job)
 		addRayRect(lane, view, rect);
 		return;
 	}
-	const float* vertices = inst ? &inst->m_tree->m_vertices[0] : &job.m_member->m_vertices[0];
-	const unsigned* indices = inst ? &inst->m_tree->m_indices[0] : &job.m_member->m_indices[0];
+	const float* vertices = inst ? &inst->m_tree->vertices()[0] : &job.m_member->m_vertices[0];
+	const unsigned* indices = inst ? &inst->m_tree->indices()[0] : &job.m_member->m_indices[0];
 	const bool doubleSided = inst ? inst->m_doubleSided : job.m_member->m_doubleSided;
 	const unsigned instId = inst ? inst->m_geomId : view.m_staticId;
 	const unsigned geomId = inst ? 0u : job.m_member->m_geomId;
@@ -5272,7 +5282,7 @@ void buildForestGrid(ForestGrid& grid, const std::vector<Batch*>& batches)
 		const Batch* batch = batches[b];
 		if (!batch)
 			continue;
-		const std::vector<float>& vertices = batch->m_tree->m_vertices;
+		const std::vector<float>& vertices = batch->m_tree->vertices();
 		float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
 		for (size_t i = 0; i + kVertexPadding < vertices.size(); i += 3)
 			for (int k = 0; k < 3; k++)
@@ -6969,7 +6979,7 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 				continue;
 			MeshTree* tree = inst->m_tree;
 			if (tree->m_chunks.empty())
-				buildRasterChunks(tree->m_vertices, tree->m_indices, tree->m_chunks, tree->m_chunksLo, tree->m_chunksHi);
+				buildRasterChunks(tree->vertices(), tree->indices(), tree->m_chunks, tree->m_chunksLo, tree->m_chunksHi);
 			float lo[3], hi[3];
 			worldBox(m, tree->m_chunksLo, tree->m_chunksHi, lo, hi);
 			if (!boxVisible(rasterView, lo, hi))
@@ -6979,9 +6989,9 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 			{
 				RasterSource s;
 				s.m_model = inst->m_obj->m_model;
-				s.m_vertices = &tree->m_vertices[0];
+				s.m_vertices = &tree->vertices()[0];
 				s.m_uvs = tree->m_uvs.data();
-				s.m_indices = &tree->m_indices;
+				s.m_indices = &tree->indices();
 				s.m_objectSpace = true;
 				for (int r = 0; r < 3; r++)
 					for (int c = 0; c < 3; c++)

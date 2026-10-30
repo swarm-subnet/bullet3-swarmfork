@@ -156,6 +156,25 @@ class TestRaycastSyncPaths(unittest.TestCase):
     self.assertNotEqual(before[1].tobytes(), after[1].tobytes())
     self.assertEqual(depth.tobytes(), after[1].tobytes())
 
+  def test_rewrite_leaves_the_shared_tree_alone(self):
+    """Rewriting a mover that shares its cached tree leaves the tree as it was: a later body from the same arrays draws the old shape."""
+    rewritten, vertices = self.grid_body((-1.2, 0, 0))
+    untouched, _ = self.grid_body((1.2, 0, 0))
+    before = self.colour()
+    raised = [list(v) for v in vertices]
+    raised[len(raised) // 2][2] = 0.8
+    p.resetMeshData(rewritten, raised)
+    after = self.colour()
+    self.assertNotEqual(before[1].tobytes(), after[1].tobytes())
+    keep = (before[2] == untouched) & (after[2] == untouched)
+    self.assertGreater(int(keep.sum()), 0)
+    self.assertEqual(before[1][keep].tobytes(), after[1][keep].tobytes())
+    p.removeBody(rewritten)
+    self.colour()
+    successor, _ = self.grid_body((-1.2, 0, 0))
+    again = self.colour()
+    self.assertEqual(before[1].tobytes(), again[1].tobytes())
+
   def test_change_survives_a_depth_only_frame(self):
     """A body moved before a depth-only frame is still moved in the colour frame after it."""
     box = p.createMultiBody(0, -1, p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5] * 3))
