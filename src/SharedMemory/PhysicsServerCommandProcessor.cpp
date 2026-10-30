@@ -5690,6 +5690,9 @@ bool PhysicsServerCommandProcessor::processCreateCollisionShapeCommand(const str
 					{
 						BT_PROFILE("convert vertices");
 
+						// Three new corners and indices per triangle, reserved once instead of doubling as they arrive.
+						meshInterface->preallocateVertices((glmesh->m_numIndices / 3) * 3);
+						meshInterface->preallocateIndices((glmesh->m_numIndices / 3) * 3);
 						for (int i = 0; i < glmesh->m_numIndices / 3; i++)
 						{
 							const btVector3& v0 = convertedVerts[glmesh->m_indices->at(i * 3)];
