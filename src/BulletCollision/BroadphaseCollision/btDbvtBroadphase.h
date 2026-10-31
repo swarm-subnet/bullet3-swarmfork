@@ -49,11 +49,17 @@ struct btDbvtProxy : btBroadphaseProxy
 	int stage;
 	// True while the leaf's volume holds the proxy's bounds and they are a box with no NaN.
 	bool settled;
+	// When it was last staged, a pinned proxy's skipped restages included; every stage list runs latest first.
+	unsigned long long stamp;
+	// The stage list a pinned proxy's last restage stands for.
+	int pinnedStage;
 	/* ctor			*/
 	btDbvtProxy(const btVector3& aabbMin, const btVector3& aabbMax, void* userPtr, int collisionFilterGroup, int collisionFilterMask) : btBroadphaseProxy(aabbMin, aabbMax, userPtr, collisionFilterGroup, collisionFilterMask)
 	{
 		links[0] = links[1] = 0;
 		settled = false;
+		stamp = 0;
+		pinnedStage = 0;
 	}
 };
 
@@ -89,6 +95,7 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	int m_pid;                                  // Parse id
 	int m_cid;                                  // Cleanup index
 	int m_gid;                                  // Gen id
+	unsigned long long m_stamps;                // Stagings so far, the source of each proxy's stamp
 	bool m_releasepaircache;                    // Release pair cache on delete
 	bool m_deferedcollide;                      // Defere dynamic/static collision to collide call
 	bool m_needcleanup;                         // Need to run cleanup?
