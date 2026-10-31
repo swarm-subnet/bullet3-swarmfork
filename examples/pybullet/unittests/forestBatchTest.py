@@ -86,10 +86,37 @@ def identity_hash(folder):
   return hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()
 
 
-def child(threads):
-  """Hash of a forest frame rendered in a fresh process at a thread count."""
+def raster_hash():
+  """Hash of the forest's colour, depth and mask on the raster path."""
+  return hashlib.sha256(b"".join(a.tobytes() for a in frame(flags=0, shadow=0, eye=(0, -6, 6)))).hexdigest()
+
+
+def files_gone_hashes(folder, how):
+  """Raster hashes of a forest never ray-cast and of one rasterised after its first ray-cast frame lost its mesh files.
+
+  how is "deleted" (files removed), "changed" (caching switched off, which empties the parse cache, then files
+  rewritten) or "uncached" (caching off from the start, then files removed).
+  """
+  if how == "uncached":
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+  forest_world(folder)
+  fresh = raster_hash()
+  forest_world(folder)
+  frame(flags=RAY, eye=(0, -6, 6))
+  if how == "changed":
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+  for name in ("flat.obj", "stand.obj"):
+    os.remove(os.path.join(folder, name))
+  if how == "changed":
+    write_obj(os.path.join(folder, "flat.obj"), 0.8)
+    write_obj(os.path.join(folder, "stand.obj"), 0.8, double_sided_quad=True)
+  return fresh, raster_hash()
+
+
+def child(threads, mode="identity"):
+  """Last JSON line printed by this file run in a fresh process at a thread count, in one of its modes."""
   env = dict(os.environ, SWARM_RENDER_THREADS=threads)
-  output = subprocess.check_output([sys.executable, __file__, "identity"], env=env, text=True)
+  output = subprocess.check_output([sys.executable, __file__, mode], env=env, text=True)
   return json.loads(output.strip().splitlines()[-1])
 
 
@@ -173,6 +200,13 @@ class TestForestBatch(unittest.TestCase):
     for left, right in zip(after, fresh):
       self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
 
+  def test_raster_after_the_mesh_files_are_gone_draws_the_same(self):
+    """Mesh files deleted, rewritten with the parse cache emptied, or never cached: the raster frame after a ray-cast
+    frame still equals a never ray-cast forest's, drawn in a fresh process so a bad read fails this test alone."""
+    for how in ("deleted", "changed", "uncached"):
+      fresh, after = child("2", how)
+      self.assertEqual(fresh, after, how)
+
   def test_forest_added_again_draws_the_same(self):
     """A forest removed after its first frame and created again from the same file draws the first frame's bytes."""
     body = forest_world(self.folder)
@@ -232,6 +266,11 @@ if __name__ == "__main__":
     p.connect(p.DIRECT)
     with tempfile.TemporaryDirectory() as folder:
       print(json.dumps(identity_hash(folder)))
+    p.disconnect()
+  elif len(sys.argv) > 1:
+    p.connect(p.DIRECT)
+    with tempfile.TemporaryDirectory() as folder:
+      print(json.dumps(files_gone_hashes(folder, sys.argv[1])))
     p.disconnect()
   else:
     unittest.main()

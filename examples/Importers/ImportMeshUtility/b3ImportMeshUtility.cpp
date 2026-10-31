@@ -260,7 +260,7 @@ static void groupShapesByMaterial(std::vector<bt_tinyobj::shape_t>& shapes)
 	}
 }
 
-//one group per material, covering the index range its shapes occupy in the flattened mesh
+//one group per material, covering the index range its shapes occupy in the flattened mesh; no fileIO loads no texture
 static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, const char* pathPrefix, CommonFileIOInterface* fileIO, b3AlignedObjectArray<b3ImportMeshMaterialGroup>& groups, bool textureHandover)
 {
 	int indexStart = 0;
@@ -290,7 +290,7 @@ static void buildMaterialGroups(const std::vector<bt_tinyobj::shape_t>& shapes, 
 			group.m_isCached = false;
 			group.m_textureWidth = 0;
 			group.m_textureHeight = 0;
-			if (material.diffuse_texname.length() > 0)
+			if (fileIO && material.diffuse_texname.length() > 0)
 			{
 				group.m_textureImage = loadDiffuseTexture(material.diffuse_texname.c_str(), pathPrefix, fileIO, group.m_textureWidth, group.m_textureHeight, group.m_isCached, group.m_textureAlpha, group.m_textureName, textureHandover);
 			}
@@ -312,6 +312,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 	meshData.m_isCached = false;
 	meshData.m_textureName.clear();
 	meshData.m_materialGroups.clear();
+	meshData.m_parse.reset();
 
 	char relativeFileName[1024];
 	if (fileIO->findResourcePath(fileName.c_str(), relativeFileName, 1024))
@@ -325,7 +326,7 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 		bt_tinyobj::attrib_t attribute;
 		{
 			B3_PROFILE("tinyobj::LoadObj");
-			std::string err = LoadFromCachedOrFromObj(attribute, shapes, relativeFileName, pathPrefix, fileIO, splitOnMaterial);
+			std::string err = LoadFromCachedOrFromObj(attribute, shapes, relativeFileName, pathPrefix, fileIO, splitOnMaterial, &meshData.m_parse);
 			//std::string err = tinyobj::LoadObj(shapes, relativeFileName, pathPrefix);
 		}
 		if (splitOnMaterial)
@@ -374,4 +375,20 @@ bool b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(const std::string&
 	}
 
 	return false;
+}
+
+bool b3ImportMeshUtility::meshFromHeldParse(const b3HeldObjParse& parse, b3ImportMeshData& meshData, bool splitOnMaterial)
+{
+	meshData.m_parse = parse;
+	std::vector<bt_tinyobj::shape_t> shapes = parse->m_shapes;
+	if (splitOnMaterial)
+	{
+		groupShapesByMaterial(shapes);
+	}
+	meshData.m_gfxShape = btgCreateGraphicsShapeFromWavefrontObj(parse->m_attribute, shapes);
+	if (splitOnMaterial)
+	{
+		buildMaterialGroups(shapes, 0, 0, meshData.m_materialGroups, false);
+	}
+	return true;
 }

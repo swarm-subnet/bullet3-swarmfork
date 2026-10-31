@@ -117,7 +117,8 @@ struct InstancedPrototype
 	bool m_hasPathPrefix;
 	int m_flags;
 	bool m_materialsFromMtl;
-	CommonFileIOInterface* m_fileIO;
+	// The cached parse of the mesh file, held so a conversion again needs neither the file nor the cache; empty when not cached.
+	b3HeldObjParse m_parse;
 };
 
 struct TinyRendererVisualShapeConverterInternalData
@@ -494,7 +495,7 @@ void TinyRendererVisualShapeConverter::setSpotLight(bool enabled, const float sp
 }
 
 // materialGroupsOut, when given, asks for one group per OBJ material instead of one texture and colour per file
-static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPathPrefix, const btTransform& visualTransform, btAlignedObjectArray<GLInstanceVertex>& verticesOut, btAlignedObjectArray<int>& indicesOut, btAlignedObjectArray<MyTexture2>& texturesOut, b3VisualShapeData& visualShapeOut, struct CommonFileIOInterface* fileIO, int flags, btAlignedObjectArray<b3ImportMeshMaterialGroup>* materialGroupsOut)
+static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPathPrefix, const btTransform& visualTransform, btAlignedObjectArray<GLInstanceVertex>& verticesOut, btAlignedObjectArray<int>& indicesOut, btAlignedObjectArray<MyTexture2>& texturesOut, b3VisualShapeData& visualShapeOut, struct CommonFileIOInterface* fileIO, int flags, btAlignedObjectArray<b3ImportMeshMaterialGroup>* materialGroupsOut, b3HeldObjParse* parse = 0)
 {
 	visualShapeOut.m_visualGeometryType = visual->m_geometry.m_type;
 	visualShapeOut.m_dimensions[0] = 0;
@@ -721,8 +722,12 @@ static void convertURDFToVisualShape(const UrdfShape* visual, const char* urdfPa
 			//glmesh = LoadMeshFromObj(fullPath,visualPathPrefix);
 			b3ImportMeshData meshData;
 
-			if (b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO, materialGroupsOut != 0, true))
+			// A parse given is converted again from memory; otherwise the file is loaded and its parse handed back.
+			if (parse && *parse ? b3ImportMeshUtility::meshFromHeldParse(*parse, meshData, materialGroupsOut != 0)
+								: b3ImportMeshUtility::loadAndRegisterMeshFromFileInternal(visual->m_geometry.m_meshFileName, meshData, fileIO, materialGroupsOut != 0, true))
 			{
+				if (parse)
+					*parse = meshData.m_parse;
 				if (materialGroupsOut)
 				{
 					for (int i = 0; i < meshData.m_materialGroups.size(); i++)
@@ -1100,11 +1105,11 @@ static int groupSlice(const btAlignedObjectArray<int>& indices, const b3ImportMe
 	return lastVertex - firstVertex + 1;
 }
 
-// Converts a prototype again and refills every model of it whose mesh arrays were released; the conversion's textures,
-// already held by the models, are dropped.
+// Converts a prototype again from its held parse and refills every model of it whose mesh arrays were released.
 static void restorePrototypeMeshes(void* context)
 {
 	InstancedPrototype& prototype = *(InstancedPrototype*)context;
+	b3HeldObjParse parse = prototype.m_parse;
 	b3VisualShapeData shape;
 	memset(&shape, 0, sizeof(shape));
 	btAlignedObjectArray<MyTexture2> textures;
@@ -1114,7 +1119,7 @@ static void restorePrototypeMeshes(void* context)
 	btTransform identity;
 	identity.setIdentity();
 	convertURDFToVisualShape(&prototype.m_canonical, prototype.m_hasPathPrefix ? prototype.m_pathPrefix.c_str() : 0, identity, vertices, indices,
-							 textures, shape, prototype.m_fileIO, prototype.m_flags, prototype.m_materialsFromMtl ? &materialGroups : 0);
+							 textures, shape, 0, prototype.m_flags, prototype.m_materialsFromMtl ? &materialGroups : 0, &parse);
 	if (vertices.size() && indices.size() && materialGroups.size())
 	{
 		for (int g = 0; g < materialGroups.size() && g < (int)prototype.m_models.size(); g++)
@@ -1127,22 +1132,6 @@ static void restorePrototypeMeshes(void* context)
 	}
 	else if (vertices.size() && indices.size() && prototype.m_models.size())
 		prototype.m_models[0]->restoreMeshArrays(&vertices[0].xyzw[0], vertices.size(), &indices[0], indices.size());
-	// Texels the loader did not keep in its cache belong to this call; one image can be both a group's and the mesh's.
-	std::set<unsigned char*> owned;
-	for (int g = 0; g < materialGroups.size(); g++)
-		if (!materialGroups[g].m_isCached)
-		{
-			owned.insert(materialGroups[g].m_textureImage);
-			owned.insert(materialGroups[g].m_textureAlpha);
-		}
-	for (int i = 0; i < textures.size(); i++)
-		if (!textures[i].m_isCached)
-		{
-			owned.insert(textures[i].textureData1);
-			owned.insert(textures[i].m_alpha);
-		}
-	for (std::set<unsigned char*>::iterator it = owned.begin(); it != owned.end(); ++it)
-		free(*it);
 }
 
 #ifdef SWARM_RAYCAST
@@ -1150,8 +1139,9 @@ void TinyRendererVisualShapeConverterInternalData::releaseBatchMesh(TinyRenderOb
 {
 	InstancedPrototype* prototype = (InstancedPrototype*)renderObj->m_meshSource;
 	renderObj->m_meshSource = 0;
-	// Held by the prototype and this batch alone, so any later reader of the arrays is one the prototype outlives.
-	if (renderObj->m_model->meshOwners() == 2)
+	// Held by the prototype and this batch alone, so any later reader of the arrays is one the prototype outlives;
+	// without a parse held in memory nothing could refill them, so they stay.
+	if (prototype->m_parse && renderObj->m_model->meshOwners() == 2)
 		renderObj->m_model->releaseMeshArrays(restorePrototypeMeshes, prototype);
 }
 #endif
@@ -1171,7 +1161,6 @@ static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConve
 	prototype.m_pathPrefix = pathPrefix ? pathPrefix : "";
 	prototype.m_flags = data->m_flags;
 	prototype.m_materialsFromMtl = materialsFromMtl;
-	prototype.m_fileIO = fileIO;
 	b3VisualShapeData& shape = prototype.m_shape;
 	memset(&shape, 0, sizeof(shape));
 	for (int i = 0; i < 4; i++)
@@ -1186,7 +1175,8 @@ static const InstancedPrototype& instancedPrototype(TinyRendererVisualShapeConve
 	btAlignedObjectArray<b3ImportMeshMaterialGroup> materialGroups;
 	btTransform identity;
 	identity.setIdentity();
-	convertURDFToVisualShape(&canonical, pathPrefix, identity, vertices, indices, textures, shape, fileIO, data->m_flags, materialsFromMtl ? &materialGroups : 0);
+	convertURDFToVisualShape(&canonical, pathPrefix, identity, vertices, indices, textures, shape, fileIO, data->m_flags, materialsFromMtl ? &materialGroups : 0,
+							 &prototype.m_parse);
 	const float color[4] = {(float)shape.m_rgbaColor[0], (float)shape.m_rgbaColor[1], (float)shape.m_rgbaColor[2], (float)shape.m_rgbaColor[3]};
 	if (vertices.size() && indices.size() && materialGroups.size())
 	{

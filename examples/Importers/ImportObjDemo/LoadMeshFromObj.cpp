@@ -11,25 +11,12 @@
 #include "Bullet3Common/b3DiskCache.h"
 #include "../../CommonInterfaces/CommonFileIOInterface.h"
 
-struct CachedObjResult
-{
-	std::string m_msg;
-	std::vector<bt_tinyobj::shape_t> m_shapes;
-	bt_tinyobj::attrib_t m_attribute;
-};
-
-// Held by pointer: growing the table must not deep copy every mesh it already carries.
-static b3HashMap<b3HashString, CachedObjResult*> gCachedObjResults;
+// Held by shared pointer: growing the table must not deep copy every mesh it carries, and a holder keeps a parse past a clear.
+static b3HashMap<b3HashString, b3HeldObjParse> gCachedObjResults;
 static int gEnableFileCaching = 1;
 
 static void clearCachedObjResults()
 {
-	for (int i = 0; i < gCachedObjResults.size(); i++)
-	{
-		CachedObjResult** entry = gCachedObjResults.getAtIndex(i);
-		if (entry)
-			delete *entry;
-	}
 	gCachedObjResults.clear();
 }
 
@@ -185,16 +172,19 @@ std::string LoadFromCachedOrFromObj(
 	const char* filename,
 	const char* mtl_basepath,
 	struct CommonFileIOInterface* fileIO,
-	bool splitOnMaterial)
+	bool splitOnMaterial,
+	b3HeldObjParse* held)
 {
 	// the two shape groupings of one file must not share a cache entry
 	std::string cacheKey = splitOnMaterial ? std::string(filename) + "|mtl" : std::string(filename);
-	CachedObjResult** resultPtr = gCachedObjResults[cacheKey.c_str()];
+	b3HeldObjParse* resultPtr = gCachedObjResults[cacheKey.c_str()];
 	if (resultPtr && *resultPtr)
 	{
 		const CachedObjResult& result = **resultPtr;
 		shapes = result.m_shapes;
 		attribute = result.m_attribute;
+		if (held)
+			*held = *resultPtr;
 		return result.m_msg;
 	}
 
@@ -220,7 +210,10 @@ std::string LoadFromCachedOrFromObj(
 		result->m_msg = err;
 		result->m_shapes = shapes;
 		result->m_attribute = attribute;
-		gCachedObjResults.insert(cacheKey.c_str(), result);
+		const b3HeldObjParse entry(result);
+		gCachedObjResults.insert(cacheKey.c_str(), entry);
+		if (held)
+			*held = entry;
 	}
 	return err;
 }
