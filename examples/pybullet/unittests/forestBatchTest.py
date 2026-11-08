@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 import numpy as np
@@ -206,6 +207,63 @@ class TestForestBatch(unittest.TestCase):
     for how in ("deleted", "changed", "uncached"):
       fresh, after = child("2", how)
       self.assertEqual(fresh, after, how)
+
+  def test_rendering_while_another_client_changes_meshes_keeps_every_byte(self):
+    """Forest release and refill during another client's mesh churn complete with the serial frame bytes."""
+    forest_world(self.folder)
+    expected = [tuple(a.tobytes() for a in frame(flags=flags, shadow=0, eye=(0, -6, 6), size=96))
+                for flags in (RAY, 0)]
+    other = p.connect(p.DIRECT)
+    errors = []
+    ready = threading.Barrier(2, timeout=10)
+    go = threading.Event()
+
+    def change_meshes():
+      """Create shared and distinct meshes and remove their owners during each forest render pair."""
+      try:
+        for _ in range(40):
+          ready.wait()
+          if not go.wait(timeout=10):
+            raise TimeoutError("forest renderer did not start")
+          bodies = []
+          for i in range(16):
+            shape = p.createVisualShape(p.GEOM_MESH, fileName=os.path.join(self.folder, "flat.obj"),
+                                        meshScale=[1 + (i % 4) * 0.125, 1, 1], physicsClientId=other)
+            bodies.append(p.createMultiBody(0, -1, shape, physicsClientId=other))
+          for body in bodies:
+            p.removeBody(body, physicsClientId=other)
+          p.resetSimulation(physicsClientId=other)
+          ready.wait()
+      except Exception as error:
+        errors.append(error)
+        ready.abort()
+
+    worker = threading.Thread(target=change_meshes, daemon=True)
+    worker.start()
+    try:
+      for _ in range(40):
+        forest_world(self.folder)
+        go.clear()
+        ready.wait()
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1000.0)
+        try:
+          go.set()
+          for flags, alone in zip((RAY, 0), expected):
+            actual = frame(flags=flags, shadow=0, eye=(0, -6, 6), size=96)
+            self.assertEqual(tuple(a.tobytes() for a in actual), alone)
+        finally:
+          sys.setswitchinterval(interval)
+        ready.wait()
+    except BaseException:
+      ready.abort()
+      raise
+    finally:
+      worker.join(timeout=10)
+      if not worker.is_alive():
+        p.disconnect(physicsClientId=other)
+    self.assertFalse(worker.is_alive(), "mesh worker did not finish")
+    self.assertEqual(errors, [])
 
   def test_forest_added_again_draws_the_same(self):
     """A forest removed after its first frame and created again from the same file draws the first frame's bytes."""

@@ -45,8 +45,8 @@ struct SharedMesh
 				   wasRegistered_(false), numVerts_(0), numNorms_(0), numCorners_(0), restore_(0), restoreContext_(0) {}
 };
 
-// Serialises refills, which may be asked for by any thread that reads a released mesh.
-static std::mutex gRestoreMutex;
+// Registry ownership and refills share one lock because a refill callback re-enters the mesh API.
+static std::recursive_mutex gSharedMeshMutex;
 
 struct SharedTexture
 {
@@ -121,6 +121,7 @@ static unsigned long long arraysHash(const float* vertices, int numVertices, con
 
 static void releaseMesh(SharedMesh* mesh)
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	if (!mesh || --mesh->refs_ > 0)
 		return;
 	if (mesh->registered_)
@@ -352,6 +353,7 @@ void Model::loadDiffuseTexture(const char *relativeFileName)
 
 void Model::setMeshFromArrays(const float* vertices, int numVertices, const int* indices, int numIndices)
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	const unsigned long long hash = arraysHash(vertices, numVertices, indices, numIndices);
 
 	if (sharingEnabled())
@@ -409,6 +411,7 @@ void Model::setMeshFromArrays(const float* vertices, int numVertices, const int*
 // Any write goes to a private block: clone when shared, unregister when this is the only owner.
 void Model::detachMesh()
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	needArrays();
 	m_mesh->hasAABB_ = false;
 	m_mesh->uvByVertex_ = -1;
@@ -501,6 +504,7 @@ Model::~Model()
 
 void Model::shareFrom(const Model& other)
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	if (&other == this)
 		return;
 	other.m_mesh->refs_++;
@@ -555,6 +559,7 @@ unsigned long long Model::meshHash() const
 
 int Model::meshOwners() const
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	return m_mesh->refs_;
 }
 
@@ -562,7 +567,7 @@ void Model::needArrays() const
 {
 	if (!m_mesh->released_.load(std::memory_order_acquire))
 		return;
-	const std::lock_guard<std::mutex> guard(gRestoreMutex);
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	if (m_mesh->released_.load(std::memory_order_acquire))
 		m_mesh->restore_(m_mesh->restoreContext_);
 	if (m_mesh->released_.load(std::memory_order_acquire))
@@ -571,8 +576,9 @@ void Model::needArrays() const
 
 bool Model::releaseMeshArrays(void (*restore)(void*), void* context)
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	SharedMesh* mesh = m_mesh;
-	if (mesh->released_ || mesh->written_ || mesh->verts_.empty() || !restore)
+	if (mesh->refs_ != 2 || mesh->released_ || mesh->written_ || mesh->verts_.empty() || !restore)
 		return false;
 	// The box and the uv layout are kept answered, so reading them needs no refill.
 	Vec3f aabbMin, aabbMax;
@@ -608,6 +614,7 @@ bool Model::releaseMeshArrays(void (*restore)(void*), void* context)
 
 void Model::restoreMeshArrays(const float* vertices, int numVertices, const int* indices, int numIndices)
 {
+	const std::lock_guard<std::recursive_mutex> guard(gSharedMeshMutex);
 	SharedMesh* mesh = m_mesh;
 	if (!mesh->released_)
 		return;
