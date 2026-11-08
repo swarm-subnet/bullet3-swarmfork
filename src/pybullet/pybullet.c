@@ -1,5 +1,6 @@
 //#include "D:/dev/VisualLeakDetector/include/vld.h"
 
+#include <stdint.h>
 #include "../SharedMemory/PhysicsClientC_API.h"
 #include "../SharedMemory/PhysicsDirectC_API.h"
 #include "../SharedMemory/SharedMemoryInProcessPhysicsC_API.h"
@@ -9523,6 +9524,7 @@ static PyObject* swarmStreamLook(PyObject* args, int byteFrame)
 	PyObject *frameObj, *outObj;
 	int quality;
 	Py_buffer frame, out;
+	uintptr_t frameStart, outStart;
 	int height, width, threads;
 	float *luma, *cb, *cr, *shift;
 	if (!PyArg_ParseTuple(args, "OOi", &frameObj, &outObj, &quality))
@@ -9551,6 +9553,15 @@ static PyObject* swarmStreamLook(PyObject* args, int byteFrame)
 		PyBuffer_Release(&out);
 		PyErr_SetString(SpamError, byteFrame ? "swarmStreamLookBytes: frame must be uint8, height x width x 3 or 4, and out float32, height x width x 3, both multiples of 16."
 											 : "swarmStreamLook: frame and out must be float32 arrays of one shape, height x width x 3, both multiples of 16.");
+		return NULL;
+	}
+	frameStart = (uintptr_t)frame.buf;
+	outStart = (uintptr_t)out.buf;
+	if (frameStart <= outStart ? outStart - frameStart < (uintptr_t)frame.len : frameStart - outStart < (uintptr_t)out.len)
+	{
+		PyBuffer_Release(&frame);
+		PyBuffer_Release(&out);
+		PyErr_SetString(SpamError, byteFrame ? "swarmStreamLookBytes: frame and out must not overlap." : "swarmStreamLook: frame and out must not overlap.");
 		return NULL;
 	}
 	luma = (float*)malloc(sizeof(float) * (size_t)height * width);

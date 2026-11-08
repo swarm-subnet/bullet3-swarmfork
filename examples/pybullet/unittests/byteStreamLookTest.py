@@ -36,5 +36,51 @@ class ByteStreamLookTest(unittest.TestCase):
         p.swarmStreamLookBytes(source, out, 70)
 
 
+  def test_overlapping_rgb_and_rgba_are_refused(self):
+    """Exact and partial overlap in either direction fails before either buffer changes."""
+    for channels in (3, 4):
+      for source_offset, out_offset in ((0, 0), (0, 4), (4, 0)):
+        with self.subTest(channels=channels, source_offset=source_offset, out_offset=out_offset):
+          storage = np.arange(4096, dtype=np.uint8)
+          source = np.ndarray((16, 16, channels), np.uint8, storage, offset=source_offset)
+          out = np.ndarray((16, 16, 3), np.float32, storage, offset=out_offset)
+          before = storage.tobytes()
+          with self.assertRaisesRegex(p.error, "must not overlap"):
+            p.swarmStreamLookBytes(source, out, 70)
+          self.assertEqual(storage.tobytes(), before)
+
+  def test_adjacent_rgb_and_rgba_are_allowed(self):
+    """Buffers touching at either end are disjoint and give the separate-buffer look."""
+    for channels in (3, 4):
+      source_bytes = 16 * 16 * channels
+      out_bytes = 16 * 16 * 3 * 4
+      for source_offset, out_offset in ((0, source_bytes), (out_bytes, 0)):
+        storage = np.arange(source_bytes + out_bytes, dtype=np.uint8)
+        source = np.ndarray((16, 16, channels), np.uint8, storage, offset=source_offset)
+        out = np.ndarray((16, 16, 3), np.float32, storage, offset=out_offset)
+        expected = np.empty_like(out)
+        p.swarmStreamLookBytes(source.copy(), expected, 70)
+        p.swarmStreamLookBytes(source, out, 70)
+        self.assertEqual(out.tobytes(), expected.tobytes())
+
+  def test_invalid_outputs_and_qualities_are_refused(self):
+    """Read-only, wrong dtype or shape, strided output and invalid qualities fail without writes."""
+    readonly = np.zeros((16, 16, 3), np.float32)
+    readonly.flags.writeable = False
+    for channels in (3, 4):
+      source = np.zeros((16, 16, channels), np.uint8)
+      for out, quality, error in ((readonly, 70, ValueError),
+                                  (np.zeros((16, 16, 3), np.float64), 70, p.error),
+                                  (np.zeros((16, 16, 4), np.float32), 70, p.error),
+                                  (np.zeros((16, 32, 3), np.float32)[:, ::2], 70, ValueError),
+                                  (np.zeros((16, 16, 3), np.float32), 0, p.error),
+                                  (np.zeros((16, 16, 3), np.float32), 101, p.error)):
+        with self.subTest(channels=channels, dtype=out.dtype, shape=out.shape, quality=quality):
+          before = out.tobytes()
+          with self.assertRaises(error):
+            p.swarmStreamLookBytes(source, out, quality)
+          self.assertEqual(out.tobytes(), before)
+
+
 if __name__ == '__main__':
   unittest.main()

@@ -54,6 +54,37 @@ class StreamLookTest(unittest.TestCase):
       p.swarmStreamLook(good, out, 70)
 
 
+  def test_overlapping_frames_are_refused(self):
+    """Exact and partial overlap in either direction fails before either buffer changes."""
+    for source_offset, out_offset in ((0, 0), (0, 4), (4, 0)):
+      storage = np.zeros(16 * 16 * 3 + 1, np.float32)
+      source = np.ndarray((16, 16, 3), np.float32, storage, offset=source_offset)
+      out = np.ndarray((16, 16, 3), np.float32, storage, offset=out_offset)
+      before = storage.tobytes()
+      with self.assertRaisesRegex(p.error, "must not overlap"):
+        p.swarmStreamLook(source, out, 70)
+      self.assertEqual(storage.tobytes(), before)
+
+  def test_adjacent_frames_are_allowed(self):
+    """Disjoint views of the same allocation can touch at either end."""
+    storage = np.zeros((2, 16, 16, 3), np.float32)
+    for source, out in ((storage[0], storage[1]), (storage[1], storage[0])):
+      expected = np.empty_like(out)
+      p.swarmStreamLook(source.copy(), expected, 70)
+      p.swarmStreamLook(source, out, 70)
+      self.assertEqual(out.tobytes(), expected.tobytes())
+
+  def test_wrong_dtype_and_noncontiguous_outputs_are_refused(self):
+    """A wrong output dtype or strided columns are refused before any writes."""
+    source = np.zeros((16, 16, 3), np.float32)
+    for out, error in ((np.zeros((16, 16, 3), np.float64), p.error),
+                       (np.zeros((16, 32, 3), np.float32)[:, ::2], ValueError)):
+      before = out.tobytes()
+      with self.assertRaises(error):
+        p.swarmStreamLook(source, out, 70)
+      self.assertEqual(out.tobytes(), before)
+
+
 def looks():
   """Print the hash of frame()'s look at quality 70, then of small and odd-sized frames at other qualities."""
   out = np.empty((480, 640, 3), np.float32)
