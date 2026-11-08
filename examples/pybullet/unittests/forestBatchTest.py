@@ -209,7 +209,7 @@ class TestForestBatch(unittest.TestCase):
       self.assertEqual(fresh, after, how)
 
   def test_rendering_while_another_client_changes_meshes_keeps_every_byte(self):
-    """Forest release and refill during another client's mesh churn complete with the serial frame bytes."""
+    """Forest release and refill while another client creates and removes meshes keep the serial frame bytes."""
     forest_world(self.folder)
     expected = [tuple(a.tobytes() for a in frame(flags=flags, shadow=0, eye=(0, -6, 6), size=96))
                 for flags in (RAY, 0)]

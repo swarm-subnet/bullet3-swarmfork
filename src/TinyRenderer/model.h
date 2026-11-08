@@ -95,7 +95,8 @@ public:
 	// Models holding this Model's mesh, itself included.
 	int meshOwners() const;
 	// Frees the mesh arrays, keeping their counts, hash and box; the first later read calls restore(context), which
-	// refills them with restoreMeshArrays. False, freeing nothing, when they are released already or were ever written.
+	// refills them with restoreMeshArrays. False, freeing nothing, when they are released already, were ever written,
+	// or are held by any Model but this one and the one it shares them with.
 	bool releaseMeshArrays(void (*restore)(void*), void* context);
 	// Inside a restore call: refills released arrays from what setMeshFromArrays was given, exactly as it wrote them.
 	void restoreMeshArrays(const float* vertices, int numVertices, const int* indices, int numIndices);
