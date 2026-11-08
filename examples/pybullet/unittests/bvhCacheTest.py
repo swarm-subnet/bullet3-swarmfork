@@ -4,6 +4,9 @@ import os
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
+from typing import Any
+
 import pybullet as p
 
 # A bumpy 12 x 12 grid, so the concave mesh has a real tree with many leaves.
@@ -36,11 +39,18 @@ class TestConcaveBvhCache(unittest.TestCase):
     """Every file the engine left in the cache folder."""
     return sorted(glob.glob(os.path.join(self.cache_dir, "*")))
 
-  def hits(self, flags=FLAGS, scale=(1, 1, 1), mesh=None):
-    """Ray hits and the body AABB from a fresh world holding one concave mesh, the grid unless mesh names its source."""
+  def hits(self,
+           flags: int = FLAGS,
+           scale: tuple[float, float, float] = (1, 1, 1),
+           mesh: dict[str, Any] | None = None) -> tuple[list[tuple[Any, ...]], tuple[Any, ...]]:
+    """Ray hits and body AABB from a fresh world with one concave mesh, the grid by default."""
     cli = p.connect(p.DIRECT)
     source = mesh if mesh is not None else {"vertices": VERTICES, "indices": INDICES}
-    col = p.createCollisionShape(p.GEOM_MESH, flags=flags, meshScale=list(scale), physicsClientId=cli, **source)
+    col = p.createCollisionShape(p.GEOM_MESH,
+                                 flags=flags,
+                                 meshScale=list(scale),
+                                 physicsClientId=cli,
+                                 **source)
     body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, physicsClientId=cli)
     rays = p.rayTestBatch(RAYS_FROM, RAYS_TO, physicsClientId=cli)
     result = ([(r[0], r[2], r[3], r[4]) for r in rays], p.getAABB(body, physicsClientId=cli))
@@ -86,16 +96,18 @@ class TestConcaveBvhCache(unittest.TestCase):
     self.assertGreater(os.path.getsize(path), 64)
     self.assertEqual(self.hits(), built)
 
-  def test_file_mesh_matches_memory_mesh(self):
-    """A concave mesh read from an OBJ file hits exactly where the same triangles given in memory do."""
-    # Heights on quarter steps, so the file's float text and the in-memory doubles are the same numbers.
+  def test_file_mesh_matches_memory_mesh(self) -> None:
+    """A concave mesh read from an OBJ file hits exactly where the same triangles in memory do."""
+    # Heights on quarter steps, so the file's float text and the in-memory doubles are the same.
     exact = [[x, y, 0.25 * round(z / 0.2)] for x, y, z in VERTICES]
-    path = os.path.join(self.cache_dir, "grid.obj")
-    with open(path, "w") as f:
-      f.writelines("v %r %r %r\n" % tuple(v) for v in exact)
-      f.writelines("f %d %d %d\n" % tuple(i + 1 for i in INDICES[k:k + 3]) for k in range(0, len(INDICES), 3))
-    from_file = self.hits(flags=p.GEOM_FORCE_CONCAVE_TRIMESH, scale=(1, 1, 2), mesh={"fileName": path})
-    in_memory = self.hits(flags=p.GEOM_FORCE_CONCAVE_TRIMESH, scale=(1, 1, 2), mesh={"vertices": exact, "indices": INDICES})
+    path = Path(self.cache_dir) / "grid.obj"
+    faces = [INDICES[k:k + 3] for k in range(0, len(INDICES), 3)]
+    with path.open("w") as f:
+      f.writelines(f"v {x!r} {y!r} {z!r}\n" for x, y, z in exact)
+      f.writelines(f"f {a + 1} {b + 1} {c + 1}\n" for a, b, c in faces)
+    concave, tall = p.GEOM_FORCE_CONCAVE_TRIMESH, (1, 1, 2)
+    from_file = self.hits(flags=concave, scale=tall, mesh={"fileName": str(path)})
+    in_memory = self.hits(flags=concave, scale=tall, mesh={"vertices": exact, "indices": INDICES})
     # The two paths pad the box by different margins, so only the hits are compared.
     self.assertEqual(from_file[0], in_memory[0])
     self.assertTrue(any(fraction < 1.0 for _, fraction, _, _ in from_file[0]))

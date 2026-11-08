@@ -156,8 +156,8 @@ class TestRaycastSyncPaths(unittest.TestCase):
     self.assertNotEqual(before[1].tobytes(), after[1].tobytes())
     self.assertEqual(depth.tobytes(), after[1].tobytes())
 
-  def test_rewrite_leaves_the_shared_tree_alone(self):
-    """Rewriting a mover that shares its cached tree leaves the tree as it was: a later body from the same arrays draws the old shape."""
+  def test_rewrite_leaves_the_shared_tree_alone(self) -> None:
+    """Rewriting a mover that shares a cached tree leaves the tree for a later twin to draw."""
     rewritten, vertices = self.grid_body((-1.2, 0, 0))
     untouched, _ = self.grid_body((1.2, 0, 0))
     before = self.colour()
@@ -171,7 +171,7 @@ class TestRaycastSyncPaths(unittest.TestCase):
     self.assertEqual(before[1][keep].tobytes(), after[1][keep].tobytes())
     p.removeBody(rewritten)
     self.colour()
-    successor, _ = self.grid_body((-1.2, 0, 0))
+    self.grid_body((-1.2, 0, 0))
     again = self.colour()
     self.assertEqual(before[1].tobytes(), again[1].tobytes())
 

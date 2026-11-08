@@ -54,7 +54,7 @@ class StreamLookTest(unittest.TestCase):
       p.swarmStreamLook(good, out, 70)
 
 
-  def test_overlapping_frames_are_refused(self):
+  def test_overlapping_frames_are_refused(self) -> None:
     """Exact and partial overlap in either direction fails before either buffer changes."""
     for source_offset, out_offset in ((0, 0), (0, 4), (4, 0)):
       storage = np.zeros(16 * 16 * 3 + 1, np.float32)
@@ -65,7 +65,7 @@ class StreamLookTest(unittest.TestCase):
         p.swarmStreamLook(source, out, 70)
       self.assertEqual(storage.tobytes(), before)
 
-  def test_adjacent_frames_are_allowed(self):
+  def test_adjacent_frames_are_allowed(self) -> None:
     """Disjoint views of the same allocation can touch at either end."""
     storage = np.zeros((2, 16, 16, 3), np.float32)
     for source, out in ((storage[0], storage[1]), (storage[1], storage[0])):
@@ -74,7 +74,7 @@ class StreamLookTest(unittest.TestCase):
       p.swarmStreamLook(source, out, 70)
       self.assertEqual(out.tobytes(), expected.tobytes())
 
-  def test_wrong_dtype_and_noncontiguous_outputs_are_refused(self):
+  def test_wrong_dtype_and_noncontiguous_outputs_are_refused(self) -> None:
     """A wrong output dtype or strided columns are refused before any writes."""
     source = np.zeros((16, 16, 3), np.float32)
     for out, error in ((np.zeros((16, 16, 3), np.float64), p.error),

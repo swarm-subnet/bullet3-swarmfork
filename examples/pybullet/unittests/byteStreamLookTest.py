@@ -2,20 +2,21 @@
 import unittest
 
 import numpy as np
+
 import pybullet as p
 
 
 class ByteStreamLookTest(unittest.TestCase):
   """Compare the byte entry to the released float arithmetic."""
 
-  def test_every_byte_round_trips(self):
+  def test_every_byte_round_trips(self) -> None:
     """Float32 division and rounded multiplication preserve all 256 bytes."""
     values = np.arange(256, dtype=np.uint8)
     normalised = values.astype(np.float32) / np.float32(255.0)
     recovered = np.rint(np.clip(normalised, 0, 1) * np.float32(255.0))
     np.testing.assert_array_equal(recovered.astype(np.uint8), values)
 
-  def test_rgb_rgba_all_qualities(self):
+  def test_rgb_rgba_all_qualities(self) -> None:
     """RGB and RGBA bytes give every float bit of the float entry."""
     rng = np.random.default_rng(73)
     rgba = rng.integers(0, 256, (48, 80, 4), dtype=np.uint8)
@@ -28,15 +29,16 @@ class ByteStreamLookTest(unittest.TestCase):
         p.swarmStreamLookBytes(source, actual, quality)
         self.assertEqual(actual.tobytes(), expected.tobytes())
 
-  def test_invalid_byte_frames(self):
+  def test_invalid_byte_frames(self) -> None:
     """Reject wrong types, noncontiguous bytes and invalid channel counts."""
     out = np.empty((16, 16, 3), np.float32)
-    for source in (out, np.zeros((16, 16, 2), np.uint8), np.zeros((16, 32, 3), np.uint8)[:, ::2]):
-      with self.assertRaises(Exception):
+    strided = np.zeros((16, 32, 3), np.uint8)[:, ::2]
+    for source, error in ((out, p.error), (np.zeros((16, 16, 2), np.uint8), p.error),
+                          (strided, ValueError)):
+      with self.subTest(dtype=source.dtype, shape=source.shape), self.assertRaises(error):
         p.swarmStreamLookBytes(source, out, 70)
 
-
-  def test_overlapping_rgb_and_rgba_are_refused(self):
+  def test_overlapping_rgb_and_rgba_are_refused(self) -> None:
     """Exact and partial overlap in either direction fails before either buffer changes."""
     for channels in (3, 4):
       for source_offset, out_offset in ((0, 0), (0, 4), (4, 0)):
@@ -49,7 +51,7 @@ class ByteStreamLookTest(unittest.TestCase):
             p.swarmStreamLookBytes(source, out, 70)
           self.assertEqual(storage.tobytes(), before)
 
-  def test_adjacent_rgb_and_rgba_are_allowed(self):
+  def test_adjacent_rgb_and_rgba_are_allowed(self) -> None:
     """Buffers touching at either end are disjoint and give the separate-buffer look."""
     for channels in (3, 4):
       source_bytes = 16 * 16 * channels
@@ -63,8 +65,8 @@ class ByteStreamLookTest(unittest.TestCase):
         p.swarmStreamLookBytes(source, out, 70)
         self.assertEqual(out.tobytes(), expected.tobytes())
 
-  def test_invalid_outputs_and_qualities_are_refused(self):
-    """Read-only, wrong dtype or shape, strided output and invalid qualities fail without writes."""
+  def test_invalid_outputs_and_qualities_are_refused(self) -> None:
+    """Read-only, wrong dtype or shape, strided output and bad qualities fail without writes."""
     readonly = np.zeros((16, 16, 3), np.float32)
     readonly.flags.writeable = False
     for channels in (3, 4):
