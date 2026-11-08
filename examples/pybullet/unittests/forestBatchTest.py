@@ -124,7 +124,6 @@ def child(threads: str, mode: str = "identity") -> str | list[str]:
   return json.loads(output.strip().splitlines()[-1])
 
 
-@unittest.skipUnless(INSTANCED and RAY, "wheel without static instancing")
 def change_meshes(folder: str, other: int, ready: threading.Barrier, go: threading.Event,
                   errors: list[Exception]) -> None:
   """Create shared and distinct meshes on another client and remove them during each render pair."""
@@ -149,6 +148,7 @@ def change_meshes(folder: str, other: int, ready: threading.Barrier, go: threadi
     ready.abort()
 
 
+@unittest.skipUnless(INSTANCED and RAY, "wheel without static instancing")
 class TestForestBatch(unittest.TestCase):
   """Compare a forest body with separate bodies on every path that draws or shadows it."""
 

@@ -60,7 +60,7 @@ def fingerprint() -> str:
     state = partial(set_state, cli)
     # Several bodies go to sleep in one step, so more than one leaf leaves the dynamic tree
     # at once.
-    script = {
+    script: dict[int, Callable[[], object]] = {
         60: lambda: place(cli, fixed[24], -0.05),
         90: lambda: state(p.ACTIVATION_STATE_SLEEP, fixed[10], fixed[11], fixed[30], balls[7]),
         150: lambda: state(p.ACTIVATION_STATE_WAKE_UP, fixed[10], balls[7]),
