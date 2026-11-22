@@ -129,7 +129,7 @@ class TestRaycastSyncPaths(unittest.TestCase):
     p.disconnect()
     shutil.rmtree(self.folder)
 
-  def colour(self):
+  def colour(self) -> tuple[np.ndarray, ...]:
     """(rgb, depth, seg) of a ray-cast colour frame."""
     return frame(flags=p.ER_SWARM_RAYCAST, shadow=0)
 
@@ -137,7 +137,9 @@ class TestRaycastSyncPaths(unittest.TestCase):
     """The depth of a ray-cast depth-only frame, which brings the scene up to date as well."""
     return frame(flags=p.ER_SWARM_RAYCAST | p.ER_DEPTH_ONLY, shadow=0)[1]
 
-  def grid_body(self, position=(0, 0, 0)):
+  def grid_body(
+      self, position: tuple[float, float, float] = (0, 0, 0),
+  ) -> tuple[int, list[list[float]]]:
     """A flat grid body built from arrays; every body built from the same arrays shares one mesh."""
     vertices, normals, uvs, triangles = grid(9, 1.0)
     shape = p.createVisualShape(p.GEOM_MESH, vertices=vertices, indices=[i for t in triangles for i in t], normals=normals,

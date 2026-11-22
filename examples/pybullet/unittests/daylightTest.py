@@ -21,7 +21,7 @@ PICTURE = (RAYCAST | SKY | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER
            | getattr(p, "ER_SWARM_LINEAR_LIGHT", 0))
 
 
-def write_png(path, rgba):
+def write_png(path: str | Path, rgba: np.ndarray) -> None:
   """Writes an RGBA uint8 array as a PNG with the standard library only."""
   import struct
   import zlib
@@ -68,7 +68,7 @@ def linear(bytes_):
   return np.array(out)
 
 
-def write_obj(path, size, double_sided_quad=False):
+def write_obj(path: str | Path, size: float, double_sided_quad: bool = False) -> None:
   """A square of half side `size` in the xy plane at z = 0 (or the xz plane when a standing quad), with uvs."""
   if double_sided_quad:
     verts = [(-size, 0, 0), (size, 0, 0), (size, 0, 2 * size), (-size, 0, 2 * size)]

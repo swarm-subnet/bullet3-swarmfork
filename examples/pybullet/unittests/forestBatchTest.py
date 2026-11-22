@@ -57,7 +57,8 @@ def ground():
   p.createMultiBody(0, -1, shape, basePosition=[0, 0, -0.05])
 
 
-def forest_world(folder, base=(0, 0, 0), flags=INSTANCED, binary=False):
+def forest_world(folder: str, base: tuple[float, float, float] = (0, 0, 0), flags: int = INSTANCED,
+                 binary: bool = False) -> int:
   """The placements as one forest body; returns its body id."""
   p.resetSimulation()
   ground()

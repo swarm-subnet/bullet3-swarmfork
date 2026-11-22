@@ -34,11 +34,11 @@ def textured_scene() -> Scene:
   noise = rng.integers(0, 256, size=(64, 64, 4), dtype=np.uint8)
   noise[:, :, 3] = 255
   png = folder / "noise.png"
-  write_png(str(png), noise)  # type: ignore[no-untyped-call]
+  write_png(str(png), noise)
   texture = p.loadTexture(str(png))
   p.changeVisualShape(scene.ground, -1, textureUniqueId=texture)
   path = folder / "slab.obj"
-  write_obj(str(path), 1.5)  # type: ignore[no-untyped-call]
+  write_obj(str(path), 1.5)
   vis = p.createVisualShape(p.GEOM_MESH, fileName=str(path), rgbaColor=[0.8, 0.7, 0.6, 1],
                             specularColor=[0, 0, 0])
   tilt = p.getQuaternionFromEuler([0.3, 0.0, 0.4])

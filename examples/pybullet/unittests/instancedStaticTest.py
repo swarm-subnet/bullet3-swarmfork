@@ -22,7 +22,10 @@ LEAF = getattr(p, "ER_SWARM_LEAF_NO_SHADOW", 0)
 CUTOUT = getattr(p, "ER_ALPHA_CUTOUT", 0)
 
 
-def frame(flags=RAY | MAP, shadow=1, eye=(0, 0, 8), target=(0, 0, 0), core=0, size=96):
+def frame(  # noqa: PLR0913, PLR0917 - one argument per camera setting the tests vary
+    flags: int = RAY | MAP, shadow: int = 1, eye: tuple[float, ...] = (0, 0, 8),
+    target: tuple[float, ...] = (0, 0, 0), core: float = 0, size: int = 96,
+) -> tuple[np.ndarray, ...]:
   """Return all three camera buffers with a fixed light and no mover shadow rays."""
   view = p.computeViewMatrix(eye, target, [0, 1, 0])
   proj = p.computeProjectionMatrixFOV(60, 1, 0.1, 100)
