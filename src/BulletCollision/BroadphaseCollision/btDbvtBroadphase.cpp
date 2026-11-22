@@ -62,6 +62,16 @@ static inline void listappend(T* item, T*& list)
 
 //
 template <typename T>
+static inline void listinsertafter(T* item, T* after)
+{
+	item->links[0] = after;
+	item->links[1] = after->links[1];
+	if (after->links[1]) after->links[1]->links[0] = item;
+	after->links[1] = item;
+}
+
+//
+template <typename T>
 static inline void listremove(T* item, T*& list)
 {
 	if (item->links[0])
@@ -154,9 +164,10 @@ btDbvtBroadphase::btDbvtBroadphase(btOverlappingPairCache* paircache)
 	m_updates_ratio = 0;
 	m_paircache = paircache ? paircache : new (btAlignedAlloc(sizeof(btHashedOverlappingPairCache), 16)) btHashedOverlappingPairCache();
 	m_gid = 0;
+	m_stamps = 0;
 	m_pid = 0;
 	m_cid = 0;
-	for (int i = 0; i <= STAGECOUNT; ++i)
+	for (int i = 0; i <= PINNED; ++i)
 	{
 		m_stageRoots[i] = 0;
 	}
@@ -197,6 +208,7 @@ btBroadphaseProxy* btDbvtBroadphase::createProxy(const btVector3& aabbMin,
 
 	//bproxy->aabb			=	btDbvtVolume::FromMM(aabbMin,aabbMax);
 	proxy->stage = m_stageCurrent;
+	proxy->stamp = ++m_stamps;
 	proxy->m_uniqueId = ++m_gid;
 	proxy->leaf = m_sets[0].insert(aabb, proxy);
 	proxy->settled = holdsBounds(proxy->leaf, aabb);
@@ -318,17 +330,45 @@ void btDbvtBroadphase::aabbTest(const btVector3& aabbMin, const btVector3& aabbM
 }
 
 //
-bool btDbvtBroadphase::setAabbUnchanged(btBroadphaseProxy* absproxy)
+bool btDbvtBroadphase::setAabbUnchanged(btBroadphaseProxy* absproxy, bool pin)
 {
 	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	// A proxy restaged every step never goes stale, so a pinned one waits out of the stage lists collide() empties; only
+	// the order of the others in those lists decides which leaves move to the fixed set, and in what order.
+	if (pin && proxy->stage == PINNED)
+	{
+		proxy->stamp = ++m_stamps;
+		proxy->pinnedStage = m_stageCurrent;
+		return true;
+	}
 	// The same-bounds branch of setAabb below, without comparing the bounds.
 	if (proxy->stage == STAGECOUNT || !proxy->settled)
 		return false;
 	++m_updates_call;
 	listremove(proxy, m_stageRoots[proxy->stage]);
-	proxy->stage = m_stageCurrent;
-	listappend(proxy, m_stageRoots[m_stageCurrent]);
+	proxy->stage = pin ? PINNED : m_stageCurrent;
+	proxy->stamp = ++m_stamps;
+	proxy->pinnedStage = m_stageCurrent;
+	listappend(proxy, m_stageRoots[proxy->stage]);
 	return true;
+}
+
+//
+void btDbvtBroadphase::unpin(btBroadphaseProxy* absproxy)
+{
+	btDbvtProxy* proxy = (btDbvtProxy*)absproxy;
+	if (!proxy || proxy->stage != PINNED)
+		return;
+	// Back where its last restage would have left it: in that stage's list, after every proxy staged since.
+	listremove(proxy, m_stageRoots[PINNED]);
+	proxy->stage = proxy->pinnedStage;
+	btDbvtProxy* after = 0;
+	for (btDbvtProxy* next = m_stageRoots[proxy->stage]; next && next->stamp > proxy->stamp; next = next->links[1])
+		after = next;
+	if (after)
+		listinsertafter(proxy, after);
+	else
+		listappend(proxy, m_stageRoots[proxy->stage]);
 }
 
 //
@@ -345,6 +385,7 @@ void btDbvtBroadphase::setAabb(btBroadphaseProxy* absproxy,
 		++m_updates_call;
 		listremove(proxy, m_stageRoots[proxy->stage]);
 		proxy->stage = m_stageCurrent;
+		proxy->stamp = ++m_stamps;
 		listappend(proxy, m_stageRoots[m_stageCurrent]);
 		return;
 	}
@@ -392,6 +433,7 @@ void btDbvtBroadphase::setAabb(btBroadphaseProxy* absproxy,
 		proxy->m_aabbMin = aabbMin;
 		proxy->m_aabbMax = aabbMax;
 		proxy->stage = m_stageCurrent;
+		proxy->stamp = ++m_stamps;
 		proxy->settled = holdsBounds(proxy->leaf, aabb);
 		listappend(proxy, m_stageRoots[m_stageCurrent]);
 		if (docollide)
@@ -435,6 +477,7 @@ void btDbvtBroadphase::setAabbForceUpdate(btBroadphaseProxy* absproxy,
 	proxy->m_aabbMin = aabbMin;
 	proxy->m_aabbMax = aabbMax;
 	proxy->stage = m_stageCurrent;
+	proxy->stamp = ++m_stamps;
 	proxy->settled = holdsBounds(proxy->leaf, aabb);
 	listappend(proxy, m_stageRoots[m_stageCurrent]);
 	if (docollide)
@@ -722,7 +765,7 @@ void btDbvtBroadphase::resetPool(btDispatcher* dispatcher)
 		m_gid = 0;
 		m_pid = 0;
 		m_cid = 0;
-		for (int i = 0; i <= STAGECOUNT; ++i)
+		for (int i = 0; i <= PINNED; ++i)
 		{
 			m_stageRoots[i] = 0;
 		}

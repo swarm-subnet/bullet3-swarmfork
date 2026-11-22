@@ -49,11 +49,17 @@ struct btDbvtProxy : btBroadphaseProxy
 	int stage;
 	// True while the leaf's volume holds the proxy's bounds and they are a box with no NaN.
 	bool settled;
+	// When it was last staged, a pinned proxy's skipped restages included; every stage list runs latest first.
+	unsigned long long stamp;
+	// The stage list a pinned proxy's last restage stands for.
+	int pinnedStage;
 	/* ctor			*/
 	btDbvtProxy(const btVector3& aabbMin, const btVector3& aabbMax, void* userPtr, int collisionFilterGroup, int collisionFilterMask) : btBroadphaseProxy(aabbMin, aabbMax, userPtr, collisionFilterGroup, collisionFilterMask)
 	{
 		links[0] = links[1] = 0;
 		settled = false;
+		stamp = 0;
+		pinnedStage = 0;
 	}
 };
 
@@ -69,11 +75,12 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	{
 		DYNAMIC_SET = 0, /* Dynamic set index	*/
 		FIXED_SET = 1,   /* Fixed set index		*/
-		STAGECOUNT = 2   /* Number of stages		*/
+		STAGECOUNT = 2,  /* Number of stages		*/
+		PINNED = 3       /* Pinned list index	*/
 	};
 	/* Fields		*/
 	btDbvt m_sets[2];                           // Dbvt sets
-	btDbvtProxy* m_stageRoots[STAGECOUNT + 1];  // Stages list
+	btDbvtProxy* m_stageRoots[PINNED + 1];      // Stages list, then the pinned proxies
 	btOverlappingPairCache* m_paircache;        // Pair cache
 	btScalar m_prediction;                      // Velocity prediction
 	int m_stageCurrent;                         // Current stage
@@ -88,6 +95,7 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	int m_pid;                                  // Parse id
 	int m_cid;                                  // Cleanup index
 	int m_gid;                                  // Gen id
+	unsigned long long m_stamps;                // Stagings so far, the source of each proxy's stamp
 	bool m_releasepaircache;                    // Release pair cache on delete
 	bool m_deferedcollide;                      // Defere dynamic/static collision to collide call
 	bool m_needcleanup;                         // Need to run cleanup?
@@ -112,7 +120,8 @@ struct btDbvtBroadphase : btBroadphaseInterface
 	/* btBroadphaseInterface Implementation	*/
 	btBroadphaseProxy* createProxy(const btVector3& aabbMin, const btVector3& aabbMax, int shapeType, void* userPtr, int collisionFilterGroup, int collisionFilterMask, btDispatcher* dispatcher);
 	virtual void destroyProxy(btBroadphaseProxy* proxy, btDispatcher* dispatcher);
-	virtual bool setAabbUnchanged(btBroadphaseProxy* proxy);
+	virtual bool setAabbUnchanged(btBroadphaseProxy* proxy, bool pin = false);
+	virtual void unpin(btBroadphaseProxy* proxy);
 	virtual void setAabb(btBroadphaseProxy* proxy, const btVector3& aabbMin, const btVector3& aabbMax, btDispatcher* dispatcher);
 	virtual void rayTest(const btVector3& rayFrom, const btVector3& rayTo, btBroadphaseRayCallback& rayCallback, const btVector3& aabbMin = btVector3(0, 0, 0), const btVector3& aabbMax = btVector3(0, 0, 0));
 	virtual void aabbTest(const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback);

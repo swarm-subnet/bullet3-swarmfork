@@ -224,9 +224,10 @@ void btCollisionWorld::updateAabbs()
 			if (colObj->isStaticObject() && colObj->m_staticAabbShape == colObj->getCollisionShape() &&
 				colObj->m_staticAabbRevision == m_staticAabbRevision && colObj->m_staticAabbThreshold == gContactBreakingThreshold)
 			{
-				// No transform write since then: if the proxy still holds those bounds, setAabb would only restage it.
+				// No transform write since then: if the proxy still holds those bounds, setAabb would only restage it. An
+				// object that can never sleep is restaged every step, which a pinned proxy stands for.
 				if (colObj->m_staticAabbTransformRevision == colObj->m_transformRevision && colObj->m_staticAabbHeld &&
-					m_broadphasePairCache->setAabbUnchanged(colObj->getBroadphaseHandle()))
+					m_broadphasePairCache->setAabbUnchanged(colObj->getBroadphaseHandle(), colObj->getActivationState() == DISABLE_DEACTIVATION))
 					continue;
 				if (colObj->m_staticAabbTransformRevision == colObj->m_transformRevision ||
 					!memcmp(&colObj->m_staticAabbTransform, &colObj->m_worldTransform, sizeof(btTransform)))
@@ -239,6 +240,8 @@ void btCollisionWorld::updateAabbs()
 			}
 			updateSingleAabb(colObj);
 		}
+		else
+			m_broadphasePairCache->unpin(colObj->getBroadphaseHandle());
 	}
 }
 
