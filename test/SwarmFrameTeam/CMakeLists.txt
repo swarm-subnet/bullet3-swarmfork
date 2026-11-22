@@ -1,0 +1,7 @@
+FIND_PACKAGE(OpenMP)
+IF (OPENMP_FOUND)
+	INCLUDE_DIRECTORIES(../../src/SharedMemory/plugins/tinyRendererPlugin)
+	ADD_EXECUTABLE(Test_frameTeamNesting test_frameTeamNesting.cpp)
+	SET_TARGET_PROPERTIES(Test_frameTeamNesting PROPERTIES COMPILE_FLAGS "${OpenMP_CXX_FLAGS}" LINK_FLAGS "${OpenMP_CXX_FLAGS}")
+	ADD_TEST(Test_frameTeamNesting_PASS Test_frameTeamNesting)
+ENDIF()

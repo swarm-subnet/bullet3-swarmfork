@@ -31,6 +31,7 @@
 #include "../../../TinyRenderer/TinyRenderer.h"
 #include "../../../TinyRenderer/SwarmGamma.h"
 #include "SwarmDaylight.h"
+#include "SwarmFrameTeam.h"
 #include "SwarmLowLight.h"
 #include "SwarmSky.h"
 #include "SwarmThermal.h"
@@ -1725,8 +1726,8 @@ struct SwarmRaycast::Data
 		const int row1 = vMax + 2.0f >= (float)map.m_rows ? map.m_rows : (int)vMax + 2;
 		if (!(col0 < col1 && row0 < row1))
 			return;
-#pragma omp parallel for num_threads(threads) schedule(static)
-		for (int row = row0; row < row1; row++)
+		SwarmFrameTeam::forEach(threads, row1 - row0, SwarmFrameTeam::kRowChunk, [&](int i) {
+			const int row = row0 + i;
 			for (int blockCol = col0 / kShadowBlock; blockCol <= (col1 - 1) / kShadowBlock; blockCol++)
 				if (map.m_blocks[(size_t)(row / kShadowBlock) * map.m_blockCols + blockCol].load(std::memory_order_relaxed) == 2)
 				{
@@ -1734,6 +1735,7 @@ struct SwarmRaycast::Data
 					const int c1 = (blockCol + 1) * kShadowBlock < col1 ? (blockCol + 1) * kShadowBlock : col1;
 					castShadowCells(map, c0, c1, row, row + 1);
 				}
+		});
 	}
 
 	// Recasts both maps for a new light, core or cut-out setting, otherwise only the cells under the members that changed.
@@ -3521,14 +3523,16 @@ struct ShadeWait
 	float m_dir[3];
 	float m_shadow;
 	float m_distance;
-	// Which shading waits: an opaque daylight surface, a glass-backed module in daylight, or the fragment shader.
+	// Which shading waits: an opaque daylight surface, a glass-backed module in daylight, the fragment shader, or a
+	// thermal frame's radiance.
 	enum Kind
 	{
 		kDaylight,
 		kModule,
-		kFragment
+		kFragment,
+		kThermal
 	} m_kind;
-	// For the fragment shader: the hit point, which the spot light reads.
+	// For the fragment shader and a thermal hit: the hit point, which the spot light and the shadow maps read.
 	float m_point[3];
 	// The footprint is worked out with the tile's others when m_footprintLater; the camera ray and wound normal it needs.
 	// The shadow likewise when m_shadowLater, from the hit point and face normal.
@@ -4056,17 +4060,22 @@ float veilCoverage(const HitSurface& surface, const RTCHit& hit, const float duv
 	return surface.m_model->alphaFiltered(uv, rx2 > ry2 ? rx2 : ry2, averaged) / 255.0f;
 }
 
-// In-band radiance leaving a hit towards the camera: the surface's emission at its temperature, plus the sky or the
-// surroundings its emissivity leaves it to reflect, mirrored about its normal when it is glossy.
-float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
-				 const float point[3], const float duvdx[2], const float duvdy[2])
+// Whether a hit's temperature takes the sun's shadow map: a passive surface facing a sun above the horizon.
+inline bool thermalSunLit(const SwarmRaycastShading& shading, const HitSurface& surface, const float normal[3])
+{
+	const TinyRenderThermal& thermal = *surface.m_thermal;
+	return !thermal.m_heatTexels && !thermal.m_hasTemperature && shading.m_lightDir[shading.m_glint.m_upAxis] > 0.0f &&
+		   dot3(normal, shading.m_lightDir) > 0.0f;
+}
+
+// In-band radiance leaving a hit towards the camera from its surface, read up to its maps: `open` is the shelter map's
+// lit share from overhead, `lit` the sun's shadow map's where thermalSunLit says the temperature takes it.
+float thermalRadiance(const TileJob& job, const float dir[3], const HitSurface& surface, const float normal[3], const float base[3],
+					  const TinyRender::Vec2f& uv, float open, float lit)
 {
 	const SwarmRaycastShading& shading = *job.m_shading;
 	const int upAxis = shading.m_glint.m_upAxis;
 	const float air = shading.m_airTemperature, zenith = shading.m_skyTemperature;
-	float normal[3], base[3];
-	TinyRender::Vec2f uv(0.0f, 0.0f);
-	surfaceAt(surface, hit, faceNormal, true, duvdx, duvdy, normal, base, &uv);
 	const float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
 	TGAColor mean = surface.m_model->diffuseMean(uv);
 	float detail = albedo - texelLuminance(mean, surface.m_model->getColorRGBA());
@@ -4074,9 +4083,6 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 
 	// Open sky: the shelter map read as if lit from straight overhead, times the share of the sky the surface's tilt
 	// faces. A leaf or grass card is a thin blade open on both sides, so it takes the open sky whole.
-	float up[3] = {0.0f, 0.0f, 0.0f};
-	up[upAxis] = 1.0f;
-	const float open = job.m_shelterMap ? shadowMapLit(*job.m_shelterMap, point, up) : 1.0f;
 	const float skyView = leafCard(surface.m_doubleSided, surface.m_hasAlpha) ? open : open * 0.5f * (1.0f + normal[upAxis]);
 
 	const TinyRenderThermal& thermal = *surface.m_thermal;
@@ -4091,7 +4097,6 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 		const float nDotL = dot3(normal, shading.m_lightDir);
 		if (shading.m_lightDir[upAxis] > 0.0f && nDotL > 0.0f)
 		{
-			const float lit = job.m_shadowMap ? shadowMapLit(*job.m_shadowMap, point, normal) : 1.0f;
 			const float sun = (0.2126f * shading.m_lightColor[0] + 0.7152f * shading.m_lightColor[1]) + 0.0722f * shading.m_lightColor[2];
 			temperature += kSunHeating * sun * (1.0f - albedo) * nDotL * lit;
 		}
@@ -4116,6 +4121,89 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	else
 		environment = skyView * job.m_sky.m_hemisphere + (1.0f - skyView) * job.m_sky.m_air;
 	return (1.0f - reflectance) * SwarmThermal::radiance(temperature) + reflectance * environment;
+}
+
+// In-band radiance leaving a hit towards the camera: the surface's emission at its temperature, plus the sky or the
+// surroundings its emissivity leaves it to reflect, mirrored about its normal when it is glossy.
+float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surface, const RTCHit& hit, const float faceNormal[3],
+				 const float point[3], const float duvdx[2], const float duvdy[2])
+{
+	float normal[3], base[3];
+	TinyRender::Vec2f uv(0.0f, 0.0f);
+	surfaceAt(surface, hit, faceNormal, true, duvdx, duvdy, normal, base, &uv);
+	float up[3] = {0.0f, 0.0f, 0.0f};
+	up[job.m_shading->m_glint.m_upAxis] = 1.0f;
+	const float open = job.m_shelterMap ? shadowMapLit(*job.m_shelterMap, point, up) : 1.0f;
+	const float lit = job.m_shadowMap && thermalSunLit(*job.m_shading, surface, normal) ? shadowMapLit(*job.m_shadowMap, point, normal) : 1.0f;
+	return thermalRadiance(job, dir, surface, normal, base, uv, open, lit);
+}
+
+// The tile's thermal hits shaded together: their footprints, textures and both shadow maps read eight at a time, then
+// each hit's radiance as thermalHit works it out, written where `radianceOut` points.
+void finishTileThermal(const TileJob& job, const CameraSetup& setup, ShadeWait* shades, float* const* radianceOut, int numShades)
+{
+	if (!numShades)
+		return;
+	const int upAxis = job.m_shading->m_glint.m_upAxis;
+	int all[kTileSize * kTileSize];
+	for (int i = 0; i < numShades; i++)
+		all[i] = i;
+	if (job.m_filtered)
+		footprintMany(setup, shades, all, numShades);
+	TinyRender::Model* models[kTileSize * kTileSize];
+	TinyRender::Vec2f uvs[kTileSize * kTileSize], duvdx[kTileSize * kTileSize], duvdy[kTileSize * kTileSize];
+	TGAColor texels[kTileSize * kTileSize];
+	float normals[kTileSize * kTileSize][3];
+	for (int i = 0; i < numShades; i++)
+	{
+		const ShadeWait& wait = shades[i];
+		surfaceFrame(*wait.m_surface, wait.m_u, wait.m_v, wait.m_faceNormal, normals[i], uvs[i]);
+		models[i] = wait.m_surface->m_model;
+		duvdx[i] = TinyRender::Vec2f(wait.m_duvdx[0], wait.m_duvdx[1]);
+		duvdy[i] = TinyRender::Vec2f(wait.m_duvdy[0], wait.m_duvdy[1]);
+	}
+	TinyRender::Model::diffuseFilteredMany(models, uvs, duvdx, duvdy, numShades, 4, texels);
+	const ShadowMap* maps[kTileSize * kTileSize];
+	float points[kTileSize * kTileSize][3], ups[kTileSize * kTileSize][3], open[kTileSize * kTileSize];
+	for (int i = 0; i < numShades; i++)
+	{
+		maps[i] = job.m_shelterMap;
+		for (int c = 0; c < 3; c++)
+		{
+			points[i][c] = shades[i].m_point[c];
+			ups[i][c] = c == upAxis ? 1.0f : 0.0f;
+		}
+		open[i] = 1.0f;
+	}
+	if (job.m_shelterMap)
+		shadowLitMany(maps, points, ups, numShades, open);
+	// The sun's shadow map only for the hits whose temperature takes it, as thermalHit reads it.
+	int sunny[kTileSize * kTileSize], numSunny = 0;
+	float sunPoints[kTileSize * kTileSize][3], sunNormals[kTileSize * kTileSize][3], sunLit[kTileSize * kTileSize], lit[kTileSize * kTileSize];
+	for (int i = 0; i < numShades; i++)
+	{
+		lit[i] = 1.0f;
+		if (!job.m_shadowMap || !thermalSunLit(*job.m_shading, *shades[i].m_surface, normals[i]))
+			continue;
+		maps[numSunny] = job.m_shadowMap;
+		for (int c = 0; c < 3; c++)
+		{
+			sunPoints[numSunny][c] = points[i][c];
+			sunNormals[numSunny][c] = normals[i][c];
+		}
+		sunny[numSunny++] = i;
+	}
+	if (numSunny)
+		shadowLitMany(maps, sunPoints, sunNormals, numSunny, sunLit);
+	for (int n = 0; n < numSunny; n++)
+		lit[sunny[n]] = sunLit[n];
+	for (int i = 0; i < numShades; i++)
+	{
+		const ShadeWait& wait = shades[i];
+		float base[3];
+		surfaceTint(*wait.m_surface, texels[i], base);
+		*radianceOut[i] = thermalRadiance(job, wait.m_dir, *wait.m_surface, normals[i], base, uvs[i], open[i], lit[i]);
+	}
 }
 
 // How far past the farthest known hit around its pixel a hinted ray searches, for the step across a slanted surface.
@@ -4602,9 +4690,12 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		shadow = shadowAt(job, point, faceNormal, leafCard(surface.m_doubleSided, surface.m_hasAlpha), shadowArgs);
 	}
 
+	// A thermal hit waits for its tile likewise, unless it is a cut-out that may be a veil, which needs its radiance now.
+	const bool thermalLater = deferColour && memo && shading->m_thermal && !(job.m_pixelSpread > 0.0f && surface.m_hasAlpha);
+
 	// A hit whose shading waits for its tile leaves its footprint to be worked out with the tile's others, unless a step
-	// before the wait reads it: a thermal frame, a cut-out that may be a veil, or a pane the ray passes through.
-	const bool footprintLater = waitable && filtered;
+	// before the wait reads it: a cut-out that may be a veil, or a pane the ray passes through.
+	const bool footprintLater = (waitable || thermalLater) && filtered;
 	float duvdx[2] = {0.0f, 0.0f}, duvdy[2] = {0.0f, 0.0f};
 	if (filtered && !footprintLater)
 		footprintAt(setup, rawDir, surface, woundNormal, rayhit.hit, duvdx, duvdy);
@@ -4612,6 +4703,12 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 	if (shading->m_thermal)
 	{
 		const float point[3] = {hx, hy, hz};
+		if (thermalLater)
+		{
+			waitForTile(out, surface, rayhit.hit, faceNormal, duvdx, duvdy, dir, 1.0f, t, ShadeWait::kThermal, point, footprintLater, rawDir,
+						woundNormal, false);
+			return true;
+		}
 		float radiance = thermalHit(job, dir, surface, rayhit.hit, faceNormal, point, duvdx, duvdy);
 		bool averaged = false;
 		const float coverage = job.m_pixelSpread > 0.0f && surface.m_hasAlpha ? veilCoverage(surface, rayhit.hit, duvdx, duvdy, &averaged) : 1.0f;
@@ -6146,6 +6243,9 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 	memo.clear();
 	// Shading and daylight colours wait here and are done together once the tile's samples are in.
 	const bool defer = job.m_shading && !radiance;
+	// So does a thermal frame's radiance, written where thermalOut points once its tile is done.
+	const bool deferThermal = job.m_shading && job.m_shading->m_thermal && radiance;
+	float* thermalOut[kTileSize * kTileSize];
 	// A painted sample on a known triangle takes the short route; any other goes through traceRay.
 	const bool fast = job.m_raster && defer && !job.m_shading->m_thermal;
 	DaylightColour waiting[kTileSize * kTileSize];
@@ -6173,9 +6273,11 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 				if (job.m_raster)
 					paintedFound(paint, k, found);
 				hit = traceRay(job, setup, pixelNdcX(col, width), ndcY, args, shadowArgs, sample, reach, landed, job.m_raster ? &found : 0,
-							   &memo, defer);
+							   &memo, defer || deferThermal);
 			}
-			if (radiance)
+			if (radiance && hit && sample.m_shadeDeferred)
+				thermalOut[numShades++] = &radiance[offset];
+			else if (radiance)
 				radiance[offset] = sample.m_radiance;
 			if (target.m_background && !(hit && sample.m_shaded))
 				target.m_background->pixel(row, col, &target.m_rgb[offset * 3]);
@@ -6211,7 +6313,10 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 					target.m_rgb[offset * 3 + i] = sample.m_rgb[i];
 		}
 	}
-	finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
+	if (deferThermal)
+		finishTileThermal(job, setup, shades, thermalOut, numShades);
+	else
+		finishTileShading(job, setup, shadowArgs, shades, shadeOut, numShades, waiting, waitingOut, numWaiting);
 }
 
 // A pixel is an edge when one of its four neighbours landed on another body, or when its 1/zEye is
@@ -6820,6 +6925,13 @@ void frameKey(std::vector<unsigned char>& key, const void* reuseKey, size_t reus
 void SwarmRaycast::render(const Target* targets, int numTargets, const float projMat[16], int width, int height,
 						  const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const
 {
+	// One team of render threads serves every parallel pass of the frame, so a sleeping helper is woken once a frame.
+	SwarmFrameTeam::run(threads, [&]() { renderFrame(targets, numTargets, projMat, width, height, shading, threads, alphaCutout, reuseKey, reuseKeyBytes); });
+}
+
+void SwarmRaycast::renderFrame(const Target* targets, int numTargets, const float projMat[16], int width, int height,
+							   const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const
+{
 	if (!m_data->m_top || m_data->m_objects.empty() || width <= 0 || height <= 0 || numTargets <= 0)
 	{
 		for (int i = 0; i < numTargets && width > 0 && height > 0; i++)
@@ -7103,85 +7215,86 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 	nextTile[1] = 0;
 	float farthest = 0.0f;
 
-#pragma omp parallel num_threads(threads)
+	if (lastPoints)
 	{
-		QueryContext ctx;
-		rtcInitRayQueryContext(&ctx.m_context);
-		ctx.m_instances = job.m_instances;
-		ctx.m_batches = job.m_batches;
-		ctx.m_forestId = job.m_forestId;
-		ctx.m_anyWinding = false;
-		ctx.m_alphaCutout = alphaCutout;
-		ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
-		ctx.m_pixelSpread = job.m_pixelSpread;
-		ctx.m_farthest = 0.0f;
-		ctx.m_directBatch = 0;
-		ctx.m_directPlacement = 0;
-		RTCIntersectArguments args;
-		rtcInitIntersectArguments(&args);
-		args.context = &ctx.m_context;
-		RTCOccludedArguments shadowArgs;
-		rtcInitOccludedArguments(&shadowArgs);
-		shadowArgs.context = &ctx.m_context;
-
-		if (lastPoints)
-		{
-			// Each thread fills its own frame, then each pixel takes the maximum, the same whichever thread took which hit.
-#ifdef _OPENMP
-			const int team = omp_get_num_threads(), member = omp_get_thread_num();
-#else
-			const int team = 1, member = 0;
-#endif
-			float* own = hintFrames[(size_t)member];
-			for (size_t i = 0; i < numPixels; i++)
-				own[i] = -1.0f;
-#pragma omp for schedule(static)
-			for (long long i = 0; i < (long long)numPixels; i++)
+		// Each thread fills its own frame from the first points it takes, then each pixel takes the maximum over the
+		// frames filled, the same whichever thread took which hit.
+		std::vector<char> filled((size_t)threads, 0);
+		const long long pointChunks = ((long long)numPixels + SwarmFrameTeam::kPixelChunk - 1) / SwarmFrameTeam::kPixelChunk;
+		SwarmFrameTeam::forChunks(threads, pointChunks, [&](long long chunk, int worker) {
+			float* own = hintFrames[(size_t)worker];
+			if (!filled[(size_t)worker])
+			{
+				for (size_t i = 0; i < numPixels; i++)
+					own[i] = -1.0f;
+				filled[(size_t)worker] = 1;
+			}
+			const size_t first = (size_t)chunk * SwarmFrameTeam::kPixelChunk;
+			for (size_t i = first; i < first + SwarmFrameTeam::kPixelChunk && i < numPixels; i++)
 				hintPoint(viewProj, lastPoints + i * 3, width, height, own);
-#pragma omp for schedule(static)
-			for (long long i = 0; i < (long long)numPixels; i++)
-			{
-				float far = hintFrames[0][i];
-				for (int k = 1; k < team; k++)
-					far = hintFrames[(size_t)k][i] > far ? hintFrames[(size_t)k][i] : far;
-				hintFrames[0][i] = far;
-			}
-		}
+		});
+		std::vector<const float*> filledFrames;
+		for (int k = 0; k < threads; k++)
+			if (filled[(size_t)k])
+				filledFrames.push_back(hintFrames[(size_t)k]);
+		float* hint = hintFrames[0];
+		SwarmFrameTeam::forEach(threads, (int)numPixels, SwarmFrameTeam::kPixelChunk, [&](int i) {
+			float far = -1.0f;
+			for (size_t k = 0; k < filledFrames.size(); k++)
+				far = filledFrames[k][i] > far ? filledFrames[k][i] : far;
+			hint[i] = far;
+		});
+	}
 
-		// Every thread paints the chunks and trees it takes into its own lane, going on to the trees as soon as the chunks
-		// run out; the trees' barrier then hands all the lanes to whichever thread traces a tile. Chunks cost very different amounts, so threads take them a few at a time as
-		// they finish; which lane holds what never changes a tile, since painting keeps the nearest hit and the lesser key.
-		if (job.m_raster)
-		{
-#ifdef _OPENMP
-			RasterLane& lane = m_data->m_rasterLanes[(size_t)omp_get_thread_num()];
-#else
-			RasterLane& lane = m_data->m_rasterLanes[0];
-#endif
-			const long long numJobs = (long long)m_data->m_rasterJobs.size();
-#pragma omp for schedule(dynamic, 4) nowait
-			for (long long i = 0; i < numJobs; i++)
-				paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
-#pragma omp for schedule(dynamic, 16)
-			for (long long i = 0; i < forestCells; i++)
-				paintForestCell(lane, rasterView, m_data->m_forestGrid, (size_t)i, m_data->m_batches);
-		}
+	// Every thread paints the chunks and trees it takes into its own lane, going on to the trees as soon as the chunks run
+	// out; once all are painted, every lane goes to whichever thread traces a tile. Chunks cost very different amounts, so
+	// threads take them a few at a time as they finish; which lane holds what never changes a tile, since painting keeps
+	// the nearest hit and the lesser key.
+	if (job.m_raster)
+	{
+		const long long numJobs = (long long)m_data->m_rasterJobs.size();
+		const long long jobChunks = (numJobs + 3) / 4, cellChunks = (forestCells + 15) / 16;
+		SwarmFrameTeam::forChunks(threads, jobChunks + cellChunks, [&](long long chunk, int worker) {
+			RasterLane& lane = m_data->m_rasterLanes[(size_t)worker];
+			if (chunk < jobChunks)
+				for (long long i = chunk * 4; i < chunk * 4 + 4 && i < numJobs; i++)
+					paintJob(lane, rasterView, m_data->m_rasterJobs[(size_t)i]);
+			else
+				for (long long i = (chunk - jobChunks) * 16; i < (chunk - jobChunks) * 16 + 16 && i < forestCells; i++)
+					paintForestCell(lane, rasterView, m_data->m_forestGrid, (size_t)i, m_data->m_batches);
+		});
+	}
 
-		// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every thread
-		// finishes pass 1, and the pass-1 colours are copied aside, before any thread starts pass 2.
-		const int passes = scratch.empty() ? 1 : 2;
-		ProjectionCache cache;
-		int cacheCamera = -1;
-		for (int pass = 0; pass < passes; pass++)
-		{
-			if (pass == 1)
-			{
-#pragma omp barrier
-#pragma omp single
-				for (size_t i = 0; i < scratch.size(); i++)
-					if (!scratch[i].m_ids.empty())
-						scratch[i].m_rgb1.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
-			}
+	// Pass 2 reads the neighbours pass 1 wrote and the colours pass 1 shaded, so every tile of pass 1 is finished, and the
+	// pass-1 colours are copied aside, before any thread starts pass 2.
+	const int passes = scratch.empty() ? 1 : 2;
+	for (int pass = 0; pass < passes; pass++)
+	{
+		if (pass == 1)
+			for (size_t i = 0; i < scratch.size(); i++)
+				if (!scratch[i].m_ids.empty())
+					scratch[i].m_rgb1.assign(targets[i].m_rgb, targets[i].m_rgb + numPixels * 3);
+		SwarmFrameTeam::share(threads, [&](int) {
+			QueryContext ctx;
+			rtcInitRayQueryContext(&ctx.m_context);
+			ctx.m_instances = job.m_instances;
+			ctx.m_batches = job.m_batches;
+			ctx.m_forestId = job.m_forestId;
+			ctx.m_anyWinding = false;
+			ctx.m_alphaCutout = alphaCutout;
+			ctx.m_leafNoShadow = shading && shading->m_leafNoShadow;
+			ctx.m_pixelSpread = job.m_pixelSpread;
+			ctx.m_farthest = 0.0f;
+			ctx.m_directBatch = 0;
+			ctx.m_directPlacement = 0;
+			RTCIntersectArguments args;
+			rtcInitIntersectArguments(&args);
+			args.context = &ctx.m_context;
+			RTCOccludedArguments shadowArgs;
+			rtcInitOccludedArguments(&shadowArgs);
+			shadowArgs.context = &ctx.m_context;
+			ProjectionCache cache;
+			int cacheCamera = -1;
 			for (int tile = nextTile[pass]++; tile < numTiles; tile = nextTile[pass]++)
 			{
 				const int camIndex = tile / tilesPerCamera;
@@ -7208,10 +7321,10 @@ void SwarmRaycast::render(const Target* targets, int numTargets, const float pro
 							   movers[(size_t)camIndex]);
 				}
 			}
-		}
 #pragma omp critical
-		if (farthest == farthest && !(ctx.m_farthest <= farthest))
-			farthest = ctx.m_farthest;
+			if (farthest == farthest && !(ctx.m_farthest <= farthest))
+				farthest = ctx.m_farthest;
+		});
 	}
 	if (memory && reuseKey)
 		m_data->keepFrame(*memory, key, setups[0].m_cam, targets[0], radiance, farthest, shading, width, height);

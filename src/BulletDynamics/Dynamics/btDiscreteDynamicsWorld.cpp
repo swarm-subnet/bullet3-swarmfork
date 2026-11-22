@@ -248,12 +248,11 @@ btDiscreteDynamicsWorld::~btDiscreteDynamicsWorld()
 
 void btDiscreteDynamicsWorld::saveKinematicState(btScalar timeStep)
 {
-	///would like to iterate over m_nonStaticRigidBodies, but unfortunately old API allows
-	///to switch status _after_ adding kinematic objects to the world
-	///fix it for Bullet 3.x release
-	for (int i = 0; i < m_collisionObjects.size(); i++)
+	const btAlignedObjectArray<btCollisionObject*>& kinematicObjects = getKinematicObjects();
+	for (int i = 0; i < kinematicObjects.size(); i++)
 	{
-		btCollisionObject* colObj = m_collisionObjects[i];
+		btCollisionObject* colObj = kinematicObjects[i];
+		const int worldIndex = colObj->getWorldArrayIndex();
 		btRigidBody* body = btRigidBody::upcast(colObj);
 		if (body && body->getActivationState() != ISLAND_SLEEPING)
 		{
@@ -262,6 +261,17 @@ void btDiscreteDynamicsWorld::saveKinematicState(btScalar timeStep)
 				//to calculate velocities next frame
 				body->saveKinematicState(timeStep);
 			}
+		}
+		// A motion state changed the world or a flag: the rest of this step walks the world as the full loop did.
+		if (m_kinematicObjectsDirty)
+		{
+			for (int j = worldIndex + 1; j < m_collisionObjects.size(); j++)
+			{
+				btRigidBody* other = btRigidBody::upcast(m_collisionObjects[j]);
+				if (other && other->getActivationState() != ISLAND_SLEEPING && other->isKinematicObject())
+					other->saveKinematicState(timeStep);
+			}
+			return;
 		}
 	}
 }

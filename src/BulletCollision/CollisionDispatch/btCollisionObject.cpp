@@ -31,6 +31,7 @@ btCollisionObject::btCollisionObject()
 	  m_islandTag1(-1),
 	  m_companionId(-1),
 	  m_worldArrayIndex(-1),
+	  m_kinematicObjectsDirty(0),
 	  m_activationState1(1),
 	  m_staticAabbShape(0),
 	  m_staticAabbThreshold(0),

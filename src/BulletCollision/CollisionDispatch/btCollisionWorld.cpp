@@ -66,7 +66,9 @@ subject to the following restrictions:
 #include "BulletCollision/CollisionShapes/btStaticPlaneShape.h"
 
 btCollisionWorld::btCollisionWorld(btDispatcher* dispatcher, btBroadphaseInterface* pairCache, btCollisionConfiguration* collisionConfiguration)
-	: m_dispatcher1(dispatcher),
+	: m_kinematicObjectsDirty(true),
+	  m_kinematicObjectsWorldSize(0),
+	  m_dispatcher1(dispatcher),
 	  m_broadphasePairCache(pairCache),
 	  m_debugDrawer(0),
 	  m_forceUpdateAllAabbs(true),
@@ -81,6 +83,7 @@ btCollisionWorld::~btCollisionWorld()
 	for (i = 0; i < m_collisionObjects.size(); i++)
 	{
 		btCollisionObject* collisionObject = m_collisionObjects[i];
+		collisionObject->m_kinematicObjectsDirty = 0;
 
 		btBroadphaseProxy* bp = collisionObject->getBroadphaseHandle();
 		if (bp)
@@ -133,6 +136,8 @@ void btCollisionWorld::addCollisionObject(btCollisionObject* collisionObject, in
 
 	collisionObject->setWorldArrayIndex(m_collisionObjects.size());
 	m_collisionObjects.push_back(collisionObject);
+	collisionObject->m_kinematicObjectsDirty = &m_kinematicObjectsDirty;
+	m_kinematicObjectsDirty = true;
 
 	//calculate new AABB
 	btTransform trans = collisionObject->getWorldTransform();
@@ -150,6 +155,37 @@ void btCollisionWorld::addCollisionObject(btCollisionObject* collisionObject, in
 		collisionFilterGroup,
 		collisionFilterMask,
 		m_dispatcher1));
+}
+
+const btAlignedObjectArray<btCollisionObject*>& btCollisionWorld::getKinematicObjects()
+{
+	// The list must still sit in the world array in the same order; anything that moved it outside add and remove
+	// shows here, at a cost of one look per kinematic object.
+	if (!m_kinematicObjectsDirty)
+	{
+		if (m_kinematicObjectsWorldSize != m_collisionObjects.size())
+			m_kinematicObjectsDirty = true;
+		for (int i = 0, last = -1; i < m_kinematicObjects.size() && !m_kinematicObjectsDirty; i++)
+		{
+			const int index = m_kinematicObjects[i]->getWorldArrayIndex();
+			if (index <= last || index >= m_collisionObjects.size() || m_collisionObjects[index] != m_kinematicObjects[i])
+				m_kinematicObjectsDirty = true;
+			last = index;
+		}
+	}
+	if (m_kinematicObjectsDirty)
+	{
+		// Rebuild in world order, including objects re-flagged after they were added.
+		m_kinematicObjects.resize(0);
+		for (int i = 0; i < m_collisionObjects.size(); i++)
+		{
+			if (m_collisionObjects[i]->isKinematicObject())
+				m_kinematicObjects.push_back(m_collisionObjects[i]);
+		}
+		m_kinematicObjectsWorldSize = m_collisionObjects.size();
+		m_kinematicObjectsDirty = false;
+	}
+	return m_kinematicObjects;
 }
 
 void btCollisionWorld::updateSingleAabb(btCollisionObject* colObj)
@@ -305,6 +341,8 @@ void btCollisionWorld::removeCollisionObject(btCollisionObject* collisionObject)
 		m_collisionObjects.remove(collisionObject);
 	}
 	collisionObject->setWorldArrayIndex(-1);
+	collisionObject->m_kinematicObjectsDirty = 0;
+	m_kinematicObjectsDirty = true;
 }
 
 void btCollisionWorld::rayTestSingle(const btTransform& rayFromTrans, const btTransform& rayToTrans,

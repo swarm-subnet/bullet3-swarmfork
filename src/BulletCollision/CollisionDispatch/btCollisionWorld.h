@@ -87,6 +87,12 @@ class btCollisionWorld
 protected:
 	btAlignedObjectArray<btCollisionObject*> m_collisionObjects;
 
+	btAlignedObjectArray<btCollisionObject*> m_kinematicObjects;
+	bool m_kinematicObjectsDirty;
+	int m_kinematicObjectsWorldSize;
+
+	const btAlignedObjectArray<btCollisionObject*>& getKinematicObjects();
+
 	btDispatcher* m_dispatcher1;
 
 	btDispatcherInfo m_dispatchInfo;

@@ -142,6 +142,10 @@ public:
 				const void* reuseKey = 0, size_t reuseKeyBytes = 0) const;
 
 private:
+	// render's frame, run inside the one team of render threads that serves all of its parallel passes.
+	void renderFrame(const Target* targets, int numTargets, const float projMat[16], int width, int height,
+					 const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const;
+
 	struct Data;
 	Data* m_data;
 };

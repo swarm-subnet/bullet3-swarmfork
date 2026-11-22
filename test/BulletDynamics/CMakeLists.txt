@@ -23,3 +23,6 @@ IF (INTERNAL_ADD_POSTFIX_EXECUTABLE_NAMES)
 			SET_TARGET_PROPERTIES(Test_btKinematicCharacterController PROPERTIES  MINSIZEREL_POSTFIX "_MinsizeRel")
 			SET_TARGET_PROPERTIES(Test_btKinematicCharacterController PROPERTIES  RELWITHDEBINFO_POSTFIX "_RelWithDebugInfo")
 ENDIF(INTERNAL_ADD_POSTFIX_EXECUTABLE_NAMES)
+
+ADD_EXECUTABLE(Test_kinematicState test_kinematicState.cpp)
+ADD_TEST(Test_kinematicState_PASS Test_kinematicState)
