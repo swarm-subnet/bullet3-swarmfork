@@ -14032,6 +14032,7 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_CREASE_FILL", ER_SWARM_CREASE_FILL);
 	PyModule_AddIntConstant(m, "ER_SWARM_RASTER", ER_SWARM_RASTER);
 	PyModule_AddIntConstant(m, "ER_SWARM_NO_DEPTH", ER_SWARM_NO_DEPTH);
+	PyModule_AddIntConstant(m, "ER_SWARM_VEIL_MAP", ER_SWARM_VEIL_MAP);
 
 	PyModule_AddIntConstant(m, "IK_DLS", IK_DLS);
 	PyModule_AddIntConstant(m, "IK_SDLS", IK_SDLS);

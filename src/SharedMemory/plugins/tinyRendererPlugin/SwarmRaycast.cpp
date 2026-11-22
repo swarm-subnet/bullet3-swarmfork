@@ -65,6 +65,8 @@ const float kPaneBacking = 254.0f;
 const unsigned char kAlphaCutoff = 128;
 // A cut-out read over many texels is a veil the ray stops on from this much coverage of the pixel, and shades by it.
 const unsigned char kVeilCoverage = 8;
+// ER_SWARM_VEIL_MAP: below this coverage a veil's pixel shows mostly what lies behind it, so the mask names that body.
+const float kVeilMapCoverage = 0.5f;
 // Near infrared: a leaf reflects about half of it, far more than of visible green, which is why foliage glows there.
 const float kLeafNearInfrared = 0.5f;
 
@@ -3525,6 +3527,10 @@ struct Sample
 	float m_depth;
 	float m_inverseEyeDepth;
 	int m_segmentation;
+	// The body the mask names: the hit's own, or under ER_SWARM_VEIL_MAP what a veil covering less than kVeilMapCoverage
+	// lets through.
+	// Edges are still found on m_segmentation, so the picture does not change with it.
+	int m_mapSegmentation;
 	HitId m_hit;
 	bool m_shaded;
 	unsigned char m_rgb[3];
@@ -4544,6 +4550,7 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 		}
 	}
 	out.m_segmentation = segmentation;
+	out.m_mapSegmentation = segmentation;
 	out.m_hit.m_inst = rayhit.hit.instID[0];
 	out.m_hit.m_geom = rayhit.hit.geomID;
 	out.m_hit.m_prim = rayhit.hit.primID;
@@ -4623,6 +4630,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				const float t2 = next.ray.tfar;
 				const float point2[3] = {cam.m_origin[0] + dir[0] * t2, cam.m_origin[1] + dir[1] * t2, cam.m_origin[2] + dir[2] * t2};
 				behind = thermalHit(job, dir, back, next.hit, backFace, point2, duv2x, duv2y);
+				if (shading->m_veilMap && coverage < kVeilMapCoverage)
+					out.m_mapSegmentation = backSegmentation;
 			}
 			else
 				behind = SwarmThermal::skyRadiance(job.m_sky, dir[shading->m_glint.m_upAxis]);
@@ -4689,6 +4698,8 @@ bool traceRay(const TileJob& job, const CameraSetup& setup, double ndcX, double 
 				float backNormal[3], backBase[3];
 				surfaceAt(back, next.hit, backFace, filtered, duv2x, duv2y, backNormal, backBase);
 				daylightLight(*shading, back, backNormal, backBase, dir, shadow2, behind);
+				if (shading->m_veilMap && coverage < kVeilMapCoverage)
+					out.m_mapSegmentation = backSegmentation;
 			}
 			for (int i = 0; i < 3; i++)
 				lit[i] = coverage * lit[i] + (1.0f - coverage) * behind[i];
@@ -5779,6 +5790,7 @@ bool paintedHit(const TileJob& job, const CameraSetup& setup, const TilePaint& p
 	out.m_depth = -(cam.m_p22 * zEye + cam.m_p23);
 	out.m_inverseEyeDepth = 1.0f / zEye;
 	out.m_segmentation = entry.m_segmentation;
+	out.m_mapSegmentation = entry.m_segmentation;
 	out.m_hit.m_inst = tri->m_inst;
 	out.m_hit.m_geom = tri->m_geom;
 	out.m_hit.m_prim = tri->m_prim;
@@ -6164,7 +6176,7 @@ void renderTile(const TileJob& job, const CameraSetup& setup, const SwarmRaycast
 			}
 			target.m_depth[offset] = sample.m_depth;
 			if (target.m_seg)
-				target.m_seg[offset] = sample.m_segmentation;
+				target.m_seg[offset] = sample.m_mapSegmentation;
 			if (scratch)
 			{
 				scratch->m_ids[offset] = sample.m_segmentation;

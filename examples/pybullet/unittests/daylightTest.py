@@ -78,6 +78,29 @@ def write_obj(path, size, double_sided_quad=False):
     handle.write("\n".join(lines) + "\n")
 
 
+def chain_link_card(folder, wire=3):
+  """A 60 by 20 m card standing at y = 0, facing -y, of dark lines `wire` texels thick every 25 cm, as a body;
+  at the default 3 texels 18 % of it is wire."""
+  tex = np.zeros((256, 256, 4), dtype=np.uint8)
+  tex[..., :3] = 60
+  lines = np.zeros((256, 256), dtype=bool)
+  for k in range(0, 256, 32):
+    lines[k:k + wire, :] = True
+    lines[:, k:k + wire] = True
+  tex[lines, 3] = 255
+  png = os.path.join(folder, "link%d.png" % wire)
+  write_png(png, tex)
+  obj = os.path.join(folder, "link.obj")
+  with open(obj, "w") as handle:
+    handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\nvt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
+                 "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
+  vis = p.createVisualShape(p.GEOM_MESH, fileName=obj, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0],
+                            flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+  uid = p.createMultiBody(0, -1, vis)
+  p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(png))
+  return uid
+
+
 @unittest.skipUnless(RAYCAST and DAYLIGHT and SKY, "wheel without the daylight model")
 class TestDaylight(unittest.TestCase):
   """Renders small worlds with the daylight flag on and off and checks what each term does."""
@@ -304,24 +327,7 @@ class TestDaylight(unittest.TestCase):
 
   def chain_link_card(self):
     """A 60 by 20 m card of thin dark lines every 25 cm in front of the sky, 18 % of it wire; returns its body."""
-    tex = np.zeros((256, 256, 4), dtype=np.uint8)
-    tex[..., :3] = 60
-    lines = np.zeros((256, 256), dtype=bool)
-    for k in range(0, 256, 32):
-      lines[k:k + 3, :] = True
-      lines[:, k:k + 3] = True
-    tex[lines, 3] = 255
-    png = os.path.join(self.folder, "link.png")
-    write_png(png, tex)
-    obj = os.path.join(self.folder, "link.obj")
-    with open(obj, "w") as handle:
-      handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\nvt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
-                   "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
-    vis = p.createVisualShape(p.GEOM_MESH, fileName=obj, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0],
-                              flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
-    uid = p.createMultiBody(0, -1, vis)
-    p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(png))
-    return uid
+    return chain_link_card(self.folder)
 
   def test_far_chain_link_is_an_even_veil_and_near_stays_sharp(self):
     """Far, thin wire darkens the sky behind it evenly by its coverage; per-texel reads break it up; near, lines stay crisp."""

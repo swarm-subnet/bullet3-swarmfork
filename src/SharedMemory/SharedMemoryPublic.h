@@ -928,6 +928,9 @@ enum EnumRendererAuxFlags
 	// The depth buffer is neither converted nor sent: the picture call hands back None for it, for a caller that reads
 	// only colour and mask.
 	ER_SWARM_NO_DEPTH = 8388608,
+	// Ray-cast path: where a far cut-out drawn as a veil covers less than half of a pixel, the segmentation mask names
+	// the body seen through it instead of the cut-out; colour and depth are unchanged.
+	ER_SWARM_VEIL_MAP = 134217728,
 };
 
 // The fields a thermal update of a visual shape carries, for ER_SWARM_THERMAL.

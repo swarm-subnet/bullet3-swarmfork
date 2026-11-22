@@ -47,6 +47,8 @@ struct SwarmRaycastShading
 	// ER_SWARM_RASTER: a lone camera paints the triangles in view, keeping the nearest per pixel, and casts a ray only
 	// where a forest tree or a mesh too dense to paint may lie nearer than what was painted there.
 	bool m_raster;
+	// ER_SWARM_VEIL_MAP: a veil covering less than half of a pixel leaves the mask to the body seen through it.
+	bool m_veilMap;
 	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
 	// encoded bytes as TinyRenderer's shader does.
