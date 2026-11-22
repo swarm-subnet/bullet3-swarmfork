@@ -12,10 +12,10 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import pybullet as p
-
 from daylightTest import RAYCAST, write_obj, write_png
 from thermalTest import FRAME, SUN_45, THERMAL, Scene, full_scene
+
+import pybullet as p
 
 # sha256 of the frame below drawn one hit at a time, before tiles shaded thermal hits together.
 EXPECTED = "d881ec20a758209eefdd0485693d4198b32ca4dd66fb1d6e270b2af311d4dbf8"
