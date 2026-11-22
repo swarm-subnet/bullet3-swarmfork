@@ -4,6 +4,8 @@ texture taps along the footprint. Ray-cast colour path only, off by default."""
 import os
 import tempfile
 import unittest
+from pathlib import Path
+
 import numpy as np
 import pybullet as p
 
@@ -78,9 +80,8 @@ def write_obj(path, size, double_sided_quad=False):
     handle.write("\n".join(lines) + "\n")
 
 
-def chain_link_card(folder, wire=3):
-  """A 60 by 20 m card standing at y = 0, facing -y, of dark lines `wire` texels thick every 25 cm, as a body;
-  at the default 3 texels 18 % of it is wire."""
+def chain_link_card(folder: str, wire: int = 3) -> int:
+  """A 60 by 20 m chain-link card at y = 0 facing -y, `wire` texels thick (18 % at 3), as a body."""
   tex = np.zeros((256, 256, 4), dtype=np.uint8)
   tex[..., :3] = 60
   lines = np.zeros((256, 256), dtype=bool)
@@ -88,17 +89,18 @@ def chain_link_card(folder, wire=3):
     lines[k:k + wire, :] = True
     lines[:, k:k + wire] = True
   tex[lines, 3] = 255
-  png = os.path.join(folder, "link%d.png" % wire)
+  png = Path(folder) / f"link{wire}.png"
   write_png(png, tex)
-  obj = os.path.join(folder, "link.obj")
-  with open(obj, "w") as handle:
-    handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\nvt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
+  obj = Path(folder) / "link.obj"
+  with obj.open("w") as handle:
+    handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\n"
+                 "vt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
                  "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
-  vis = p.createVisualShape(p.GEOM_MESH, fileName=obj, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0],
-                            flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+  vis = p.createVisualShape(p.GEOM_MESH, fileName=str(obj), rgbaColor=[1, 1, 1, 1],
+                            specularColor=[0, 0, 0], flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
   uid = p.createMultiBody(0, -1, vis)
-  p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(png))
-  return uid
+  p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(str(png)))
+  return int(uid)
 
 
 @unittest.skipUnless(RAYCAST and DAYLIGHT and SKY, "wheel without the daylight model")

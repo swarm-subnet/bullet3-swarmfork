@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pybullet as p
-
 from daylightTest import RAYCAST
 from thermalTest import FRAME, NIGHT, SUN_45, THERMAL, full_scene
+
+import pybullet as p
 
 LOW_LIGHT = getattr(p, "ER_SWARM_LOW_LIGHT", 0)
 RASTER = getattr(p, "ER_SWARM_RASTER", 0)
