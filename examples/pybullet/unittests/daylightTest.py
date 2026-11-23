@@ -4,6 +4,8 @@ texture taps along the footprint. Ray-cast colour path only, off by default."""
 import os
 import tempfile
 import unittest
+from pathlib import Path
+
 import numpy as np
 import pybullet as p
 
@@ -19,7 +21,7 @@ PICTURE = (RAYCAST | SKY | getattr(p, "ER_SWARM_SHADOW_MAP", 0) | getattr(p, "ER
            | getattr(p, "ER_SWARM_LINEAR_LIGHT", 0))
 
 
-def write_png(path, rgba):
+def write_png(path: str | Path, rgba: np.ndarray) -> None:
   """Writes an RGBA uint8 array as a PNG with the standard library only."""
   import struct
   import zlib
@@ -66,7 +68,7 @@ def linear(bytes_):
   return np.array(out)
 
 
-def write_obj(path, size, double_sided_quad=False):
+def write_obj(path: str | Path, size: float, double_sided_quad: bool = False) -> None:
   """A square of half side `size` in the xy plane at z = 0 (or the xz plane when a standing quad), with uvs."""
   if double_sided_quad:
     verts = [(-size, 0, 0), (size, 0, 0), (size, 0, 2 * size), (-size, 0, 2 * size)]
@@ -76,6 +78,29 @@ def write_obj(path, size, double_sided_quad=False):
   lines += ["vn 0 0 1" if not double_sided_quad else "vn 0 -1 0", "f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"]
   with open(path, "w") as handle:
     handle.write("\n".join(lines) + "\n")
+
+
+def chain_link_card(folder: str, wire: int = 3) -> int:
+  """A 60 by 20 m chain-link card at y = 0 facing -y, `wire` texels thick (18 % at 3), as a body."""
+  tex = np.zeros((256, 256, 4), dtype=np.uint8)
+  tex[..., :3] = 60
+  lines = np.zeros((256, 256), dtype=bool)
+  for k in range(0, 256, 32):
+    lines[k:k + wire, :] = True
+    lines[:, k:k + wire] = True
+  tex[lines, 3] = 255
+  png = Path(folder) / f"link{wire}.png"
+  write_png(png, tex)
+  obj = Path(folder) / "link.obj"
+  with obj.open("w") as handle:
+    handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\n"
+                 "vt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
+                 "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
+  vis = p.createVisualShape(p.GEOM_MESH, fileName=str(obj), rgbaColor=[1, 1, 1, 1],
+                            specularColor=[0, 0, 0], flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
+  uid = p.createMultiBody(0, -1, vis)
+  p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(str(png)))
+  return int(uid)
 
 
 @unittest.skipUnless(RAYCAST and DAYLIGHT and SKY, "wheel without the daylight model")
@@ -304,24 +329,7 @@ class TestDaylight(unittest.TestCase):
 
   def chain_link_card(self):
     """A 60 by 20 m card of thin dark lines every 25 cm in front of the sky, 18 % of it wire; returns its body."""
-    tex = np.zeros((256, 256, 4), dtype=np.uint8)
-    tex[..., :3] = 60
-    lines = np.zeros((256, 256), dtype=bool)
-    for k in range(0, 256, 32):
-      lines[k:k + 3, :] = True
-      lines[:, k:k + 3] = True
-    tex[lines, 3] = 255
-    png = os.path.join(self.folder, "link.png")
-    write_png(png, tex)
-    obj = os.path.join(self.folder, "link.obj")
-    with open(obj, "w") as handle:
-      handle.write("v -30 0 0\nv 30 0 0\nv 30 0 20\nv -30 0 20\nvt 0 0\nvt 30 0\nvt 30 10\nvt 0 10\nvn 0 -1 0\n"
-                   "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
-    vis = p.createVisualShape(p.GEOM_MESH, fileName=obj, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0],
-                              flags=p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY)
-    uid = p.createMultiBody(0, -1, vis)
-    p.changeVisualShape(uid, -1, textureUniqueId=p.loadTexture(png))
-    return uid
+    return chain_link_card(self.folder)
 
   def test_far_chain_link_is_an_even_veil_and_near_stays_sharp(self):
     """Far, thin wire darkens the sky behind it evenly by its coverage; per-texel reads break it up; near, lines stay crisp."""

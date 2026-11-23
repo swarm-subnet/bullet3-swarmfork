@@ -6,7 +6,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pybullet as p
@@ -55,7 +57,8 @@ def ground():
   p.createMultiBody(0, -1, shape, basePosition=[0, 0, -0.05])
 
 
-def forest_world(folder, base=(0, 0, 0), flags=INSTANCED, binary=False):
+def forest_world(folder: str, base: tuple[float, float, float] = (0, 0, 0), flags: int = INSTANCED,
+                 binary: bool = False) -> int:
   """The placements as one forest body; returns its body id."""
   p.resetSimulation()
   ground()
@@ -86,11 +89,64 @@ def identity_hash(folder):
   return hashlib.sha256(b"".join(a.tobytes() for a in buffers)).hexdigest()
 
 
-def child(threads):
-  """Hash of a forest frame rendered in a fresh process at a thread count."""
+def raster_hash() -> str:
+  """Hash of the forest's colour, depth and mask on the raster path."""
+  arrays = frame(flags=0, shadow=0, eye=(0, -6, 6))
+  return hashlib.sha256(b"".join(a.tobytes() for a in arrays)).hexdigest()
+
+
+def files_gone_hashes(folder: str, how: str) -> tuple[str, str]:
+  """Raster hashes of a forest never ray-cast and of one drawn after its mesh files went.
+
+  how is "deleted" (files removed), "changed" (caching switched off, which empties the parse cache,
+  then files rewritten) or "uncached" (caching off from the start, then files removed).
+  """
+  if how == "uncached":
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+  forest_world(folder)
+  fresh = raster_hash()
+  forest_world(folder)
+  frame(flags=RAY, eye=(0, -6, 6))
+  if how == "changed":
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+  for name in ("flat.obj", "stand.obj"):
+    (Path(folder) / name).unlink()
+  if how == "changed":
+    write_obj(str(Path(folder) / "flat.obj"), 0.8)
+    write_obj(str(Path(folder) / "stand.obj"), 0.8, double_sided_quad=True)
+  return fresh, raster_hash()
+
+
+def child(threads: str, mode: str = "identity") -> str | list[str]:
+  """Last JSON line printed by this file run in a fresh process at a thread count, in one mode."""
   env = dict(os.environ, SWARM_RENDER_THREADS=threads)
-  output = subprocess.check_output([sys.executable, __file__, "identity"], env=env, text=True)
+  # Runs this same test file with this same interpreter.
+  output = subprocess.check_output([sys.executable, __file__, mode], env=env, text=True)  # noqa: S603
   return json.loads(output.strip().splitlines()[-1])
+
+
+def change_meshes(folder: str, other: int, ready: threading.Barrier, go: threading.Event,
+                  errors: list[Exception]) -> None:
+  """Create shared and distinct meshes on another client and remove them during each render pair."""
+  try:
+    for _ in range(40):
+      ready.wait()
+      if not go.wait(timeout=10):
+        raise TimeoutError("forest renderer did not start")
+      bodies: list[int] = []
+      for i in range(16):
+        shape = p.createVisualShape(p.GEOM_MESH,
+                                    fileName=str(Path(folder) / "flat.obj"),
+                                    meshScale=[1 + (i % 4) * 0.125, 1, 1],
+                                    physicsClientId=other)
+        bodies.append(p.createMultiBody(0, -1, shape, physicsClientId=other))
+      for body in bodies:
+        p.removeBody(body, physicsClientId=other)
+      p.resetSimulation(physicsClientId=other)
+      ready.wait()
+  except Exception as error:
+    errors.append(error)
+    ready.abort()
 
 
 @unittest.skipUnless(INSTANCED and RAY, "wheel without static instancing")
@@ -163,6 +219,77 @@ class TestForestBatch(unittest.TestCase):
     separate_world(self.folder)
     self.assertPixelsEqual(together, frame(flags=0, shadow=0, eye=(0, -6, 6)))
 
+  def test_raster_after_the_ray_caster_draws_the_same(self) -> None:
+    """A forest whose mesh the ray caster's tree took over rasterises like one never ray-cast."""
+    forest_world(self.folder)
+    frame(flags=RAY, eye=(0, -6, 6))
+    after = frame(flags=0, shadow=0, eye=(0, -6, 6))
+    forest_world(self.folder)
+    fresh = frame(flags=0, shadow=0, eye=(0, -6, 6))
+    for left, right in zip(after, fresh, strict=True):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
+
+  def test_raster_after_the_mesh_files_are_gone_draws_the_same(self) -> None:
+    """With mesh files deleted, rewritten or uncached, a raster frame matches a fresh forest."""
+    # Each case draws in a fresh process, so a bad read fails this test alone.
+    for how in ("deleted", "changed", "uncached"):
+      hashes = child("2", how)
+      self.assertEqual(hashes[0], hashes[1], how)
+
+  def test_rendering_while_another_client_changes_meshes_keeps_every_byte(self) -> None:
+    """Forest release and refill while another client changes meshes keep the serial frame bytes."""
+    forest_world(self.folder)
+    expected = [tuple(a.tobytes() for a in frame(flags=flags, shadow=0, eye=(0, -6, 6), size=96))
+                for flags in (RAY, 0)]
+    other = p.connect(p.DIRECT)
+    errors: list[Exception] = []
+    ready = threading.Barrier(2, timeout=10)
+    go = threading.Event()
+
+    worker = threading.Thread(target=change_meshes,
+                              args=(self.folder, other, ready, go, errors),
+                              daemon=True)
+    worker.start()
+    try:
+      for _ in range(40):
+        forest_world(self.folder)
+        go.clear()
+        ready.wait()
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1000.0)
+        try:
+          go.set()
+          for flags, alone in zip((RAY, 0), expected, strict=True):
+            actual = frame(flags=flags, shadow=0, eye=(0, -6, 6), size=96)
+            self.assertEqual(tuple(a.tobytes() for a in actual), alone)
+        finally:
+          sys.setswitchinterval(interval)
+        ready.wait()
+    except BaseException:
+      ready.abort()
+      raise
+    finally:
+      worker.join(timeout=10)
+      if not worker.is_alive():
+        p.disconnect(physicsClientId=other)
+    self.assertFalse(worker.is_alive(), "mesh worker did not finish")
+    self.assertEqual(errors, [])
+
+  def test_forest_added_again_draws_the_same(self) -> None:
+    """A forest removed after one frame and made again from its file draws the same bytes."""
+    body = forest_world(self.folder)
+    first = frame(flags=RAY | MAP, eye=(0, -6, 6))
+    p.removeBody(body)
+    frame(flags=RAY | MAP, eye=(0, -6, 6))
+    shape = p.createVisualShape(p.GEOM_MESH,
+                                fileName=str(Path(self.folder) / "forest.fst"),
+                                flags=INSTANCED | p.VISUAL_SHAPE_DOUBLE_SIDED_MULTIBODY,
+                                specularColor=[0, 0, 0])
+    p.createMultiBody(0, -1, shape)
+    again = frame(flags=RAY | MAP, eye=(0, -6, 6))
+    for left, right in zip(first[:2], again[:2], strict=True):
+      self.assertEqual(np.asarray(left).tobytes(), np.asarray(right).tobytes())
+
   def test_mask_names_the_forest_body(self):
     """Every placement's pixels carry the forest body's id in the segmentation mask."""
     body = forest_world(self.folder)
@@ -209,6 +336,11 @@ if __name__ == "__main__":
     p.connect(p.DIRECT)
     with tempfile.TemporaryDirectory() as folder:
       print(json.dumps(identity_hash(folder)))
+    p.disconnect()
+  elif len(sys.argv) > 1:
+    p.connect(p.DIRECT)
+    with tempfile.TemporaryDirectory() as folder:
+      print(json.dumps(files_gone_hashes(folder, sys.argv[1])))
     p.disconnect()
   else:
     unittest.main()

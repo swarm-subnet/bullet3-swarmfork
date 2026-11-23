@@ -47,6 +47,8 @@ struct SwarmRaycastShading
 	// ER_SWARM_RASTER: a lone camera paints the triangles in view, keeping the nearest per pixel, and casts a ray only
 	// where a forest tree or a mesh too dense to paint may lie nearer than what was painted there.
 	bool m_raster;
+	// ER_SWARM_VEIL_MAP: a veil covering less than half of a pixel leaves the mask to the body seen through it.
+	bool m_veilMap;
 	// The lighting, the glint and the edge blend run on linear light decoded from the bytes through
 	// one fixed table, and the result is encoded back on the write; off, the arithmetic runs on the
 	// encoded bytes as TinyRenderer's shader does.
@@ -99,6 +101,8 @@ public:
 	void syncObject(TinyRenderObjectData* renderObj, const btTransform& worldTransform, const btVector3& localScaling);
 	// Records renderObj's rewritten vertices for a refit at the next commit; true when other render objects share the tree.
 	bool meshChanged(TinyRenderObjectData* renderObj);
+	// True once renderObj is a forest batch with its mesh tree built.
+	bool batchBuilt(TinyRenderObjectData* renderObj) const;
 	void removeObject(TinyRenderObjectData* renderObj);
 	void removeAll();
 	// Rebuilds the top-level tree after a batch of sync calls; the mover tree only when moverShadows asks for it.
@@ -138,6 +142,10 @@ public:
 				const void* reuseKey = 0, size_t reuseKeyBytes = 0) const;
 
 private:
+	// render's frame, run inside the one team of render threads that serves all of its parallel passes.
+	void renderFrame(const Target* targets, int numTargets, const float projMat[16], int width, int height,
+					 const SwarmRaycastShading* shading, int threads, bool alphaCutout, const void* reuseKey, size_t reuseKeyBytes) const;
+
 	struct Data;
 	Data* m_data;
 };

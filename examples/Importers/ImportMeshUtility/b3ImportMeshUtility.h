@@ -2,7 +2,11 @@
 #define B3_IMPORT_MESH_UTILITY_H
 
 #include <string>
+#include <memory>
 #include "Bullet3Common/b3AlignedObjectArray.h"
+
+struct CachedObjResult;
+typedef std::shared_ptr<const CachedObjResult> b3HeldObjParse;
 
 enum b3ImportMeshDataFlags
 {
@@ -42,6 +46,8 @@ struct b3ImportMeshData
 	std::string m_textureName;
 	//filled only when loading with splitOnMaterial; m_textureImage1 stays 0 then
 	b3AlignedObjectArray<b3ImportMeshMaterialGroup> m_materialGroups;
+	//the cached parse the mesh was built from, empty when file caching is off
+	b3HeldObjParse m_parse;
 
 	b3ImportMeshData()
 		:m_gfxShape(0),
@@ -62,6 +68,8 @@ public:
 	// With textureHandover a texture the renderer already holds comes back as its file name alone, with no
 	// texels: the caller looks it up by that name instead of the loader reading and decoding the file again.
 	static bool loadAndRegisterMeshFromFileInternal(const std::string& fileName, b3ImportMeshData& meshData, struct CommonFileIOInterface* fileIO, bool splitOnMaterial = false, bool textureHandover = false);
+	// Into a fresh meshData: the mesh and material ranges loadAndRegisterMeshFromFileInternal built from this parse, reading no file or texture.
+	static bool meshFromHeldParse(const b3HeldObjParse& parse, b3ImportMeshData& meshData, bool splitOnMaterial);
 	// The alpha channel of an image file held in memory, one malloc'd byte per texel, or 0 when the
 	// file has no alpha channel or every texel is opaque. width and height must be the file's own.
 	static unsigned char* loadTextureAlpha(const unsigned char* bytes, int size, int width, int height);

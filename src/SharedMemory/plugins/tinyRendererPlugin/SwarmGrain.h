@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "SwarmDaylight.h"
+#include "SwarmFrameTeam.h"
 
 namespace SwarmGrain
 {
@@ -197,12 +198,10 @@ inline void blur(const float* in, float* out, int width, int height, const std::
 	const float* tap = &taps[(size_t)radius];
 	static thread_local std::vector<float> rowsBuffer;
 	float* rows = reuse(rowsBuffer, (size_t)width * height);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
-		blurRow(in + (size_t)y * width, rows + (size_t)y * width, width, tap, radius);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
-		blurColumn(rows, out + (size_t)y * width, width, height, y, tap, radius);
+	SwarmFrameTeam::forEach(threads, height, SwarmFrameTeam::kRowChunk,
+							[=](int y) { blurRow(in + (size_t)y * width, rows + (size_t)y * width, width, tap, radius); });
+	SwarmFrameTeam::forEach(threads, height, SwarmFrameTeam::kRowChunk,
+							[=](int y) { blurColumn(rows, out + (size_t)y * width, width, height, y, tap, radius); });
 }
 }  // namespace SwarmGrain
 

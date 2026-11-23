@@ -7,6 +7,7 @@
 #endif
 
 #include "../../../TinyRenderer/SwarmGamma.h"
+#include "SwarmFrameTeam.h"
 #include "SwarmGrain.h"
 
 namespace
@@ -168,9 +169,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 		for (int b = 0; b < 256; b++)
 			balanced[k][b] = kSwarmSrgbToLinear[b] * (colour ? settings.m_whiteBalance[k] : 1.0f);
 	const size_t lineFloats = (size_t)3 * width;
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int by = 0; by < hh; by++)
-	{
+	SwarmFrameTeam::forEach(threads, hh, SwarmFrameTeam::kRowChunk, [&](int by) {
 		float* line = SwarmGrain::reuse(lineBuffer, lineFloats);
 		for (int row = 2 * by; row < 2 * by + 2 && row < height; row++)
 		{
@@ -234,7 +233,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 			SwarmGrain::blurRow(line, fineRows + start, width, fineTap, fineRadius);
 		}
 		if (!colour)
-			continue;
+			return;
 		float* cb = line;
 		float* cr = line + hw;
 		const int whole = 2 * by + 1 < height ? width / 2 : 0;
@@ -301,7 +300,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 		}
 		SwarmGrain::blurRow(cb, cbRows + (size_t)by * hw, hw, chromaTap, chromaRadius);
 		SwarmGrain::blurRow(cr, crRows + (size_t)by * hw, hw, chromaTap, chromaRadius);
-	}
+	});
 
 	// Each full-width column's two half-width neighbours and its weight between them, the same for every row.
 	std::vector<int> upLeft(colour ? (size_t)width : 0), upRight(colour ? (size_t)width : 0);
@@ -316,50 +315,54 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 		upWeight[(size_t)col] = fx - (float)x0 < 1.0f ? fx - (float)x0 : 1.0f;
 	}
 
-	// Pass 2: the meter on one thread while the others start; the fine grain blurred down its columns and laid on the
-	// luma, which is blurred along its rows; the colour blurred down its columns and read across bilinearly to full width.
+	// Pass 2: the meter as the first chunk, taken while the other chunks start; the fine grain blurred down its columns and
+	// laid on the luma, which is blurred along its rows; the colour blurred down its columns and read across bilinearly to
+	// full width.
 	float gain = settings.m_gainCap;
-#pragma omp parallel num_threads(threads)
-	{
-#pragma omp single nowait
-		gain = exposureGain(lum, width, height, settings.m_gainCap);
-		float* line = SwarmGrain::reuse(lineBuffer, lineFloats);
-#pragma omp for schedule(dynamic, 8) nowait
-		for (int row = 0; row < height; row++)
+	const int chunk = SwarmFrameTeam::kRowChunk;
+	const long long rowChunks = (height + chunk - 1) / chunk, halfChunks = colour ? (hh + chunk - 1) / chunk : 0;
+	SwarmFrameTeam::forChunks(threads, 1 + rowChunks + halfChunks, [&](long long c, int) {
+		if (c == 0)
 		{
-			const size_t start = (size_t)row * width;
-			SwarmGrain::blurColumn(fineRows, line, width, height, row, fineTap, fineRadius);
-			for (int col = 0; col < width; col++)
-				y[start + col] = lum[start + col] + sigma[start + col] * (line[col] * restore);
-			SwarmGrain::blurRow(y + start, yRows + start, width, lumaTap, lumaRadius);
+			gain = exposureGain(lum, width, height, settings.m_gainCap);
+			return;
 		}
-		if (colour)
+		float* line = SwarmGrain::reuse(lineBuffer, lineFloats);
+		if (c <= rowChunks)
 		{
-			float* cbSmooth = line;
-			float* crSmooth = line + hw;
-#pragma omp for schedule(dynamic, 8) nowait
-			for (int hy = 0; hy < hh; hy++)
+			const int first = (int)(c - 1) * chunk;
+			for (int row = first; row < first + chunk && row < height; row++)
 			{
-				SwarmGrain::blurColumn(cbRows, cbSmooth, hw, hh, hy, chromaTap, chromaRadius);
-				SwarmGrain::blurColumn(crRows, crSmooth, hw, hh, hy, chromaTap, chromaRadius);
-				float* cbOut = cbWide + (size_t)hy * width;
-				float* crOut = crWide + (size_t)hy * width;
+				const size_t start = (size_t)row * width;
+				SwarmGrain::blurColumn(fineRows, line, width, height, row, fineTap, fineRadius);
 				for (int col = 0; col < width; col++)
-				{
-					const int x0 = upLeft[col], x1 = upRight[col];
-					const float ax = upWeight[col];
-					cbOut[col] = cbSmooth[x0] + (cbSmooth[x1] - cbSmooth[x0]) * ax;
-					crOut[col] = crSmooth[x0] + (crSmooth[x1] - crSmooth[x0]) * ax;
-				}
+					y[start + col] = lum[start + col] + sigma[start + col] * (line[col] * restore);
+				SwarmGrain::blurRow(y + start, yRows + start, width, lumaTap, lumaRadius);
+			}
+			return;
+		}
+		float* cbSmooth = line;
+		float* crSmooth = line + hw;
+		const int first = (int)(c - 1 - rowChunks) * chunk;
+		for (int hy = first; hy < first + chunk && hy < hh; hy++)
+		{
+			SwarmGrain::blurColumn(cbRows, cbSmooth, hw, hh, hy, chromaTap, chromaRadius);
+			SwarmGrain::blurColumn(crRows, crSmooth, hw, hh, hy, chromaTap, chromaRadius);
+			float* cbOut = cbWide + (size_t)hy * width;
+			float* crOut = crWide + (size_t)hy * width;
+			for (int col = 0; col < width; col++)
+			{
+				const int x0 = upLeft[col], x1 = upRight[col];
+				const float ax = upWeight[col];
+				cbOut[col] = cbSmooth[x0] + (cbSmooth[x1] - cbSmooth[x0]) * ax;
+				crOut[col] = crSmooth[x0] + (crSmooth[x1] - crSmooth[x0]) * ax;
 			}
 		}
-	}
+	});
 
 	// Pass 3, the noise reduction: smoothed luma takes back the detail the signal can carry; colour is faded by the same
 	// ratio, read down bilinearly; the exposure's gain, and the bytes.
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int row = 0; row < height; row++)
-	{
+	SwarmFrameTeam::forEach(threads, height, SwarmFrameTeam::kRowChunk, [&](int row) {
 		float* ySmooth = SwarmGrain::reuse(lineBuffer, lineFloats);
 		float* out = SwarmGrain::reuse(outBuffer, (size_t)width * 3);
 		SwarmGrain::blurColumn(yRows, ySmooth, width, height, row, lumaTap, lumaRadius);
@@ -382,7 +385,7 @@ void developGrain(unsigned char* rgb, int width, int height, const SwarmLowLight
 			for (int col = 0; col < width; col++)
 				outR[col] = outG[col] = outB[col] = luminance[col] * gain;
 		encodeRow(outR, outG, outB, width, rgb + start * 3);
-	}
+	});
 }
 }  // namespace
 
@@ -401,28 +404,22 @@ void SwarmLowLight::develop(unsigned char* rgb, int width, int height, const Set
 	static thread_local std::vector<float> lightBuffer, lumBuffer;
 	float* light = SwarmGrain::reuse(lightBuffer, (size_t)numPixels * 3);
 	float* lum = SwarmGrain::reuse(lumBuffer, (size_t)numPixels);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int i = 0; i < numPixels; i++)
-	{
+	SwarmFrameTeam::forEach(threads, numPixels, SwarmFrameTeam::kPixelChunk, [&](int i) {
 		float* c = &light[(size_t)i * 3];
 		for (int k = 0; k < 3; k++)
 			c[k] = kSwarmSrgbToLinear[rgb[(size_t)i * 3 + k]] * (settings.m_lowLight && !settings.m_grey ? settings.m_whiteBalance[k] : 1.0f);
 		if (settings.m_grey)
 			c[0] = c[1] = c[2] = luma(c);
 		lum[i] = luma(c);
-	}
+	});
 
 	if (!settings.m_lowLight)
 	{
-#pragma omp parallel for num_threads(threads) schedule(static)
-		for (int i = 0; i < numPixels * 3; i++)
-			rgb[(size_t)i] = swarmLinearToSrgb(light[(size_t)i]);
+		SwarmFrameTeam::forEach(threads, numPixels * 3, SwarmFrameTeam::kPixelChunk, [=](int i) { rgb[(size_t)i] = swarmLinearToSrgb(light[(size_t)i]); });
 		return;
 	}
 
 	// Without grain the frame is only exposed.
 	const float gain = exposureGain(lum, width, height, settings.m_gainCap);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int i = 0; i < numPixels * 3; i++)
-		rgb[(size_t)i] = swarmLinearToSrgb(light[(size_t)i] * gain);
+	SwarmFrameTeam::forEach(threads, numPixels * 3, SwarmFrameTeam::kPixelChunk, [=](int i) { rgb[(size_t)i] = swarmLinearToSrgb(light[(size_t)i] * gain); });
 }

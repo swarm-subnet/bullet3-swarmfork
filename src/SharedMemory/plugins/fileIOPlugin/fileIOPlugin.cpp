@@ -32,6 +32,8 @@ struct InMemoryFile
 {
 	char* m_buffer;
 	int m_fileSize;
+	// Handles reading the file now; WrapperFileIO frees a file it cached itself when the last one closes.
+	int m_numOpenHandles;
 };
 
 struct InMemoryFileAccessor
@@ -107,6 +109,7 @@ struct InMemoryFileIO : public CommonFileIOInterface
 		InMemoryFile* f = new InMemoryFile();
 		f->m_buffer = buffer;
 		f->m_fileSize = len;
+		f->m_numOpenHandles = 0;
 		b3HashString key(fileName);
 		m_fileCache.insert(key,f);
 		return 0;
@@ -120,6 +123,29 @@ struct InMemoryFileIO : public CommonFileIOInterface
 			m_fileCache.remove(fileName);
 			freeBuffer(f->m_buffer);
 			delete (f);
+		}
+	}
+
+	// Frees a file once no handle reads it, counted as clearCache counts what it frees.
+	void releaseUnusedFile(InMemoryFile* f)
+	{
+		if (!f || f->m_numOpenHandles > 0)
+			return;
+		for (int i = 0; i < m_fileCache.size(); i++)
+		{
+			InMemoryFile** memPtr = m_fileCache.getAtIndex(i);
+			if (memPtr && *memPtr == f)
+			{
+				m_fileCache.remove(m_fileCache.getKeyAtIndex(i));
+				if (f->m_buffer)
+				{
+					freeBuffer(f->m_buffer);
+					m_numFrees++;
+				}
+				delete f;
+				m_numFrees++;
+				return;
+			}
 		}
 	}
 
@@ -152,6 +178,7 @@ struct InMemoryFileIO : public CommonFileIOInterface
 			{
 				m_fileHandles[slot].m_curPos = 0;
 				m_fileHandles[slot].m_file = f;
+				f->m_numOpenHandles++;
 			} else
 			{
 				slot=-1;
@@ -200,6 +227,7 @@ struct InMemoryFileIO : public CommonFileIOInterface
 			InMemoryFileAccessor& f = m_fileHandles[fileHandle];
 			if (f.m_file)
 			{
+				f.m_file->m_numOpenHandles--;
 				m_fileHandles[fileHandle].m_file = 0;
 				m_fileHandles[fileHandle].m_curPos = 0;
 				//printf("InMemoryFileIO fileClose %d\n", fileHandle);
@@ -485,8 +513,13 @@ struct WrapperFileIO : public CommonFileIOInterface
 		{
 			if (m_wrapperFileHandles[fileHandle].childFileIO)
 			{
-				m_wrapperFileHandles[fileHandle].childFileIO->fileClose(
-					m_wrapperFileHandles[fileHandle].m_childFileHandle);
+				const int childHandle = m_wrapperFileHandles[fileHandle].m_childFileHandle;
+				InMemoryFile* cached = 0;
+				if (m_wrapperFileHandles[fileHandle].childFileIO == &m_cachedFiles && childHandle >= 0 && childHandle < B3_FILEIO_MAX_FILES)
+					cached = m_cachedFiles.m_fileHandles[childHandle].m_file;
+				m_wrapperFileHandles[fileHandle].childFileIO->fileClose(childHandle);
+				// Every later read comes from the parsed-mesh and texture caches, so the file's bytes need not stay; a reopen reads it again.
+				m_cachedFiles.releaseUnusedFile(cached);
 				m_wrapperFileHandles[fileHandle].childFileIO = 0;
 				m_wrapperFileHandles[fileHandle].m_childFileHandle = -1;
 			}

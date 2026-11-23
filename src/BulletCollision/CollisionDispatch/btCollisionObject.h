@@ -79,6 +79,7 @@ protected:
 	int m_islandTag1;
 	int m_companionId;
 	int m_worldArrayIndex;  // index of object in world's collisionObjects array
+	bool* m_kinematicObjectsDirty;
 
 	mutable int m_activationState1;
 	///a static object's last bounds inputs, next to the flags btCollisionWorld::updateAabbs reads every step
@@ -520,6 +521,8 @@ public:
 
 	void setCollisionFlags(int flags)
 	{
+		if (((m_collisionFlags ^ flags) & CF_KINEMATIC_OBJECT) && m_kinematicObjectsDirty)
+			*m_kinematicObjectsDirty = true;
 		m_collisionFlags = flags;
 	}
 

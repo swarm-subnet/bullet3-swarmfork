@@ -53,8 +53,11 @@ public:
 
 	virtual btBroadphaseProxy* createProxy(const btVector3& aabbMin, const btVector3& aabbMax, int shapeType, void* userPtr, int collisionFilterGroup, int collisionFilterMask, btDispatcher* dispatcher) = 0;
 	virtual void destroyProxy(btBroadphaseProxy* proxy, btDispatcher* dispatcher) = 0;
-	///does what setAabb does with the bounds the proxy already holds and returns true, or returns false and does nothing
-	virtual bool setAabbUnchanged(btBroadphaseProxy* /*proxy*/) { return false; }
+	///does what setAabb does with the bounds the proxy already holds and returns true, or returns false and does nothing;
+	///with pin, for an object updated every step from now on, later calls may skip that work until the proxy is next moved
+	virtual bool setAabbUnchanged(btBroadphaseProxy* /*proxy*/, bool /*pin*/ = false) { return false; }
+	///for a proxy setAabbUnchanged pinned whose object is not updated this step: the state its last update left
+	virtual void unpin(btBroadphaseProxy* /*proxy*/) {}
 	virtual void setAabb(btBroadphaseProxy* proxy, const btVector3& aabbMin, const btVector3& aabbMax, btDispatcher* dispatcher) = 0;
 	virtual void getAabb(btBroadphaseProxy* proxy, btVector3& aabbMin, btVector3& aabbMax) const = 0;
 

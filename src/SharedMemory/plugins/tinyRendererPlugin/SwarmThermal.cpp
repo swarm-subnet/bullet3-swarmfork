@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "SwarmDaylight.h"
+#include "SwarmFrameTeam.h"
 #include "SwarmGrain.h"
 
 namespace
@@ -91,9 +92,7 @@ void lens(const float* in, float* out, int width, int height, int threads)
 			quarter[(size_t)y * qw + x] = sum / (float)count;
 		}
 	blur(&quarter[0], &glow[0], qw, qh, gaussianKernel(kGlowSigmaQuarterPx), threads);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
-	{
+	SwarmFrameTeam::forEach(threads, height, SwarmFrameTeam::kRowChunk, [&](int y) {
 		float fy = ((float)y + 0.5f) * 0.25f - 0.5f;
 		fy = fy < 0.0f ? 0.0f : fy;
 		const int y0 = (int)fy < qh - 1 ? (int)fy : qh - 1;
@@ -111,7 +110,7 @@ void lens(const float* in, float* out, int width, int height, int threads)
 			const size_t i = (size_t)y * width + x;
 			out[i] = out[i] * (1.0f - kGlowShare) + (top + (bottom - top) * ay) * kGlowShare;
 		}
-	}
+	});
 }
 
 // Radiance change per kelvin at the level `level`, from the table around the temperature that radiates it.
@@ -187,13 +186,13 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 		columns[(size_t)x] = kColumnNoiseK * gaussian(kColumnSalt, (unsigned int)x);
 	for (int y = 0; y < height; y++)
 		rows[(size_t)y] = kRowNoiseK * gaussian(mix32(seed) ^ 0x2545f491u, (unsigned int)y);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int y = 0; y < height; y++)
+	SwarmFrameTeam::forEach(threads, height, SwarmFrameTeam::kRowChunk, [&](int y) {
 		for (int x = 0; x < width; x++)
 		{
 			const size_t i = (size_t)y * width + x;
 			frame[i] += perKelvin * ((kNetdK * gaussian(seed, (unsigned int)i) + columns[(size_t)x]) + rows[(size_t)y]);
 		}
+	});
 
 	// Coldest point black, hottest white; between them the straight line blended with the plateau-equalised curve.
 	float lo = frame[0], hi = frame[0];
@@ -231,9 +230,7 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 		below[(size_t)kBins] = (float)cumulative;
 		const float invCumulative = 1.0f / (float)cumulative;
 		const float invSpan = 1.0f / (hi - lo);
-#pragma omp parallel for num_threads(threads) schedule(static)
-		for (int i = 0; i < numPixels; i++)
-		{
+		SwarmFrameTeam::forEach(threads, numPixels, SwarmFrameTeam::kPixelChunk, [&](int i) {
 			const float position = (frame[(size_t)i] - lo) * toBins;
 			int b = (int)position;
 			b = b < 0 ? 0 : (b >= kBins ? kBins - 1 : b);
@@ -241,18 +238,16 @@ void SwarmThermal::develop(const float* radiance, int width, int height, unsigne
 			const float equalised = (below[(size_t)b] + (below[(size_t)b + 1] - below[(size_t)b]) * within) * invCumulative;
 			const float straight = (frame[(size_t)i] - lo) * invSpan;
 			grey[(size_t)i] = straight * (1.0f - kEqualised) + equalised * kEqualised;
-		}
+		});
 	}
 
 	// Detail against a wider blur; the ends stay at 0 and 1, since the blur of values in [0, 1] stays inside it.
 	float* base = SwarmGrain::reuse(baseBuffer, (size_t)numPixels);
 	blur(grey, base, width, height, gaussianKernel(kDetailSigmaPx), threads);
-#pragma omp parallel for num_threads(threads) schedule(static)
-	for (int i = 0; i < numPixels; i++)
-	{
+	SwarmFrameTeam::forEach(threads, numPixels, SwarmFrameTeam::kPixelChunk, [=](int i) {
 		float g = grey[(size_t)i] + kDetailGain * (grey[(size_t)i] - base[(size_t)i]);
 		g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
 		const unsigned char byte = (unsigned char)(g * 255.0f + 0.5f);
 		rgb[(size_t)i * 3] = rgb[(size_t)i * 3 + 1] = rgb[(size_t)i * 3 + 2] = byte;
-	}
+	});
 }
