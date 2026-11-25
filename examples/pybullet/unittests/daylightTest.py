@@ -71,8 +71,10 @@ def linear(bytes_):
 def write_obj(
   path: str | Path, size: float, double_sided_quad: bool = False, copies: int = 1
 ) -> None:
-  """A square of half side `size` in the xy plane at z = 0 (or the xz plane when a standing quad),
-  with uvs that lay its picture `copies` times along x."""
+  """A square of half side `size` with uvs that lay its picture `copies` times along x.
+
+  It lies in the xy plane at z = 0, or in the xz plane when a standing quad.
+  """
   if double_sided_quad:
     verts = [(-size, 0, 0), (size, 0, 0), (size, 0, 2 * size), (-size, 0, 2 * size)]
   else:
