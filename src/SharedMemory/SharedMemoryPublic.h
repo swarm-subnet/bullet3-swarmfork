@@ -939,6 +939,7 @@ enum eThermalFields
 	THERMAL_FIELD_TEMPERATURE = 1,
 	THERMAL_FIELD_EMISSIVITY = 2,
 	THERMAL_FIELD_HEAT_MAP = 4,
+	THERMAL_FIELD_PASSIVE = 8,
 };
 
 ///flags to pick the IK solver and other options

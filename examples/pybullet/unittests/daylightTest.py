@@ -68,13 +68,17 @@ def linear(bytes_):
   return np.array(out)
 
 
-def write_obj(path: str | Path, size: float, double_sided_quad: bool = False) -> None:
-  """A square of half side `size` in the xy plane at z = 0 (or the xz plane when a standing quad), with uvs."""
+def write_obj(
+  path: str | Path, size: float, double_sided_quad: bool = False, copies: int = 1
+) -> None:
+  """A square of half side `size` in the xy plane at z = 0 (or the xz plane when a standing quad),
+  with uvs that lay its picture `copies` times along x."""
   if double_sided_quad:
     verts = [(-size, 0, 0), (size, 0, 0), (size, 0, 2 * size), (-size, 0, 2 * size)]
   else:
     verts = [(-size, -size, 0), (size, -size, 0), (size, size, 0), (-size, size, 0)]
-  lines = ["mtllib none.mtl"] + ["v %f %f %f" % v for v in verts] + ["vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1"]
+  lines = ["mtllib none.mtl"] + [f"v {x:f} {y:f} {z:f}" for x, y, z in verts]
+  lines += ["vt 0 0", f"vt {copies} 0", f"vt {copies} 1", "vt 0 1"]
   lines += ["vn 0 0 1" if not double_sided_quad else "vn 0 -1 0", "f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"]
   with open(path, "w") as handle:
     handle.write("\n".join(lines) + "\n")

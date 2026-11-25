@@ -4010,7 +4010,11 @@ void footprintMany(const CameraSetup& setup, ShadeWait* shades, const int* late,
 // ER_SWARM_THERMAL surfaces. Emissivity when none is set; an open surface cools by kSkyCooling of the air-to-zenith
 // gap and a black one facing a full sun warms by kSunHeating degrees. A texel brighter than its texture's mean is
 // warmer, by kPassiveDetail degrees per unit of linear luminance on a passive surface (soil, grass, moisture) and by
-// kSetDetail on one whose temperature is given (folds and seams), within kDetailLimit either way.
+// kSetDetail on one whose temperature is given (folds and seams), within kDetailLimit either way. A passive surface can
+// be given its own numbers for the sun and the detail (TinyRenderThermal), kSunHeating and kPassiveDetail being its
+// defaults there: a ground laid in tiles is measured against one luminance for all of them and read a few texels wide,
+// so neither a tile's edge nor a photograph's grain shows as heat; what the pixel sees beyond that wider read is
+// kept as fine texture, at kSetDetail.
 const float kThermalEmissivity = 0.95f;
 const float kThermalGlassEmissivity = 0.84f;
 const float kSkyCooling = 0.1f;
@@ -4068,24 +4072,53 @@ inline bool thermalSunLit(const SwarmRaycastShading& shading, const HitSurface& 
 		   dot3(normal, shading.m_lightDir) > 0.0f;
 }
 
+// Linear luminance of a passive surface's texture for its temperature: `albedo`, what the pixel sees, unless the
+// surface asks for a wider read; then the texture read at least that many texels wide, and never narrower than the
+// pixel's own reach across it, the longer of its two gradients whichever way they lie. A mesh that keeps inside one
+// copy of the texture holds the texture's edge, so a tile laid edge to edge with another never takes the colour of
+// its own far edge; a mesh that repeats the texture is read as it repeats.
+inline float passiveAlbedo(const HitSurface& surface, const TinyRender::Vec2f& uv, const float duvdx[2], const float duvdy[2], float albedo)
+{
+	const float footprint = surface.m_thermal->m_passiveFootprint;
+	const int width = surface.m_model->diffuseWidth(), height = surface.m_model->diffuseHeight();
+	if (!(footprint > 0.0f) || width <= 0 || height <= 0)
+		return albedo;
+	const float reach = std::max(sqrtf(duvdx[0] * duvdx[0] + duvdx[1] * duvdx[1]), sqrtf(duvdy[0] * duvdy[0] + duvdy[1] * duvdy[1]));
+	const float du = std::max(footprint / (float)width, reach), dv = std::max(footprint / (float)height, reach);
+	float wide[3];
+	surfaceTint(surface, surface.m_model->diffuseWide(uv, du, dv), wide);
+	return (0.2126f * wide[0] + 0.7152f * wide[1]) + 0.0722f * wide[2];
+}
+
 // In-band radiance leaving a hit towards the camera from its surface, read up to its maps: `open` is the shelter map's
 // lit share from overhead, `lit` the sun's shadow map's where thermalSunLit says the temperature takes it.
 float thermalRadiance(const TileJob& job, const float dir[3], const HitSurface& surface, const float normal[3], const float base[3],
-					  const TinyRender::Vec2f& uv, float open, float lit)
+					  const TinyRender::Vec2f& uv, const float duvdx[2], const float duvdy[2], float open, float lit)
 {
 	const SwarmRaycastShading& shading = *job.m_shading;
 	const int upAxis = shading.m_glint.m_upAxis;
 	const float air = shading.m_airTemperature, zenith = shading.m_skyTemperature;
-	const float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
-	TGAColor mean = surface.m_model->diffuseMean(uv);
-	float detail = albedo - texelLuminance(mean, surface.m_model->getColorRGBA());
+	const TinyRenderThermal& thermal = *surface.m_thermal;
+	const bool passive = !thermal.m_heatTexels && !thermal.m_hasTemperature;
+	float albedo = (0.2126f * base[0] + 0.7152f * base[1]) + 0.0722f * base[2];
+	// A passive surface read wider than the pixel keeps the pixel's own texel as fine texture on top.
+	float fine = 0.0f;
+	const bool wide = passive && thermal.m_passiveFootprint > 0.0f;
+	if (wide)
+	{
+		const float seen = albedo;
+		albedo = passiveAlbedo(surface, uv, duvdx, duvdy, albedo);
+		fine = seen - albedo;
+		fine = kSetDetail * (fine < -kDetailLimit ? -kDetailLimit : (fine > kDetailLimit ? kDetailLimit : fine));
+	}
+	float detail = albedo - (passive && thermal.m_passiveReference >= 0.0f ? thermal.m_passiveReference
+																			 : texelLuminance(surface.m_model->diffuseMean(uv), surface.m_model->getColorRGBA()));
 	detail = detail < -kDetailLimit ? -kDetailLimit : (detail > kDetailLimit ? kDetailLimit : detail);
 
 	// Open sky: the shelter map read as if lit from straight overhead, times the share of the sky the surface's tilt
 	// faces. A leaf or grass card is a thin blade open on both sides, so it takes the open sky whole.
 	const float skyView = leafCard(surface.m_doubleSided, surface.m_hasAlpha) ? open : open * 0.5f * (1.0f + normal[upAxis]);
 
-	const TinyRenderThermal& thermal = *surface.m_thermal;
 	float temperature;
 	if (thermal.m_heatTexels)
 		temperature = heatAt(thermal, uv) + kSetDetail * detail;
@@ -4093,12 +4126,14 @@ float thermalRadiance(const TileJob& job, const float dir[3], const HitSurface& 
 		temperature = thermal.m_temperature + kSetDetail * detail;
 	else
 	{
-		temperature = air - kSkyCooling * (air - zenith) * skyView + kPassiveDetail * detail;
+		temperature = air - kSkyCooling * (air - zenith) * skyView + thermal.m_passiveDetail * detail;
+		if (wide)
+			temperature += fine;
 		const float nDotL = dot3(normal, shading.m_lightDir);
 		if (shading.m_lightDir[upAxis] > 0.0f && nDotL > 0.0f)
 		{
 			const float sun = (0.2126f * shading.m_lightColor[0] + 0.7152f * shading.m_lightColor[1]) + 0.0722f * shading.m_lightColor[2];
-			temperature += kSunHeating * sun * (1.0f - albedo) * nDotL * lit;
+			temperature += thermal.m_passiveSun * sun * (1.0f - albedo) * nDotL * lit;
 		}
 	}
 
@@ -4135,7 +4170,7 @@ float thermalHit(const TileJob& job, const float dir[3], const HitSurface& surfa
 	up[job.m_shading->m_glint.m_upAxis] = 1.0f;
 	const float open = job.m_shelterMap ? shadowMapLit(*job.m_shelterMap, point, up) : 1.0f;
 	const float lit = job.m_shadowMap && thermalSunLit(*job.m_shading, surface, normal) ? shadowMapLit(*job.m_shadowMap, point, normal) : 1.0f;
-	return thermalRadiance(job, dir, surface, normal, base, uv, open, lit);
+	return thermalRadiance(job, dir, surface, normal, base, uv, duvdx, duvdy, open, lit);
 }
 
 // The tile's thermal hits shaded together: their footprints, textures and both shadow maps read eight at a time, then
@@ -4202,7 +4237,7 @@ void finishTileThermal(const TileJob& job, const CameraSetup& setup, ShadeWait* 
 		const ShadeWait& wait = shades[i];
 		float base[3];
 		surfaceTint(*wait.m_surface, texels[i], base);
-		*radianceOut[i] = thermalRadiance(job, wait.m_dir, *wait.m_surface, normals[i], base, uvs[i], open[i], lit[i]);
+		*radianceOut[i] = thermalRadiance(job, wait.m_dir, *wait.m_surface, normals[i], base, uvs[i], wait.m_duvdx, wait.m_duvdy, open[i], lit[i]);
 	}
 }
 
@@ -6987,9 +7022,14 @@ void SwarmRaycast::renderFrame(const Target* targets, int numTargets, const floa
 		job.m_moverShade = &m_data->m_moverShade;
 	if (job.m_filtered)
 	{
-		// Mip chains are built once here, on one thread, so the pixel loop below only reads them.
+		// Mip chains are built once here, on one thread, so the pixel loop below only reads them; so is whether each
+		// mesh repeats its texture, which the thermal frame's wider read asks.
 		for (std::map<TinyRenderObjectData*, ObjectState>::const_iterator it = m_data->m_objects.begin(); it != m_data->m_objects.end(); ++it)
+		{
 			it->first->m_model->buildMipmaps();
+			if (thermal)
+				it->first->m_model->uvRepeats();
+		}
 	}
 
 	// The edge pass runs only for a camera that is both shaded and given a depth buffer to test on.

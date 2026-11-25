@@ -363,6 +363,7 @@ extern "C"
 	B3_SHARED_API void b3UpdateVisualShapeSpecularColor(b3SharedMemoryCommandHandle commandHandle, const double specularColor[/*3*/]);
 	B3_SHARED_API void b3UpdateVisualShapeTemperature(b3SharedMemoryCommandHandle commandHandle, double temperature);
 	B3_SHARED_API void b3UpdateVisualShapeEmissivity(b3SharedMemoryCommandHandle commandHandle, double emissivity);
+	B3_SHARED_API void b3UpdateVisualShapeThermalPassive(b3SharedMemoryCommandHandle commandHandle, const double passive[/*4*/]);
 	B3_SHARED_API void b3UpdateVisualShapeHeatMap(b3SharedMemoryCommandHandle commandHandle, int textureUniqueId, double low, double high);
 
 	B3_SHARED_API b3SharedMemoryCommandHandle b3InitPhysicsParamCommand(b3PhysicsClientHandle physClient);

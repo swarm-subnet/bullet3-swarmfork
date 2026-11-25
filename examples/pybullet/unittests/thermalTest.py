@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pybullet as p
@@ -20,6 +21,7 @@ NIGHT = [0.3, 0.2, -0.9]
 SUN_45 = [0.7071, 0.0, 0.7071]
 AIR, SKY = 20.0, -20.0
 DOWN = ((0, 0, 10), (0, 0, 0))
+CLOSE = ((0, 0, 2.5), (0, 0, 0))
 SIDE = ((0, -6, 1), (0, 0, 0))
 
 
@@ -55,9 +57,26 @@ class Scene(object):
     p.changeVisualShape(body, -1, thermalTextureUniqueId=p.loadTexture(png), temperatureRange=[low, high])
     return body
 
+  def painted_quad(self, centre, bright=170, texels=16, half=1.0, copies=1):
+    """A passive square of half side `half` whose picture, `texels` across and laid `copies` times
+    along x, is dark on its -x half and `bright` on its +x half."""
+    path = str(Path(self.folder) / f"painted_{int(half * 100)}_{copies}.obj")
+    write_obj(path, half, copies=copies)
+    vis = p.createVisualShape(
+      p.GEOM_MESH, fileName=path, rgbaColor=[1, 1, 1, 1], specularColor=[0, 0, 0])
+    body = p.createMultiBody(0, -1, vis, basePosition=list(centre))
+    paint = np.full((texels, texels, 4), 255, dtype=np.uint8)
+    paint[:, :texels // 2, :3] = 90
+    paint[:, texels // 2:, :3] = bright
+    png = str(Path(self.folder) / f"paint_{bright}_{texels}.png")
+    write_png(png, paint)
+    p.changeVisualShape(body, -1, textureUniqueId=p.loadTexture(png))
+    return body
+
   def render(self, flags=FRAME, eye=DOWN, sun=NIGHT, seed=1, renderer=p.ER_TINY_RENDERER, air=AIR, sky=SKY):
     """Returns (grey or rgb, depth, seg, view) of one frame; thermal arguments are passed whatever the flags."""
-    view = p.computeViewMatrix(list(eye[0]), list(eye[1]), [0, 1, 0] if eye == DOWN else [0, 0, 1])
+    up = [0, 1, 0] if eye in (DOWN, CLOSE) else [0, 0, 1]
+    view = p.computeViewMatrix(list(eye[0]), list(eye[1]), up)
     _, _, rgb, depth, seg = p.getCameraImage(SIZE, SIZE, view, self.proj, lightDirection=sun, renderer=renderer,
                                              flags=flags, airTemperature=air, skyTemperature=sky, thermalSeed=seed)
     rgb = np.asarray(rgb, dtype=np.uint8).reshape(SIZE, SIZE, 4)[:, :, :3]
@@ -256,6 +275,137 @@ class TestThermal(unittest.TestCase):
     shade = self.region(rgb[..., 0], depth, seg, view, self.scene.ground, x=(-3.3, -2.7), y=(-0.3, 0.3))
     sunlit = self.region(rgb[..., 0], depth, seg, view, self.scene.ground, x=(2.7, 3.3), y=(-0.3, 0.3))
     self.assertGreater(sunlit, shade + 20)
+
+  def test_a_passive_surface_takes_its_own_numbers(self):
+    """A passive body given the engine's own numbers is drawn byte for byte as one never set.
+    Measured against a darker brightness its ground reads warmer and against a brighter one colder,
+    between two boxes that pin the frame's range; with no warmth from the sun its sunlit ground is
+    no lighter than its shade."""
+    p.changeVisualShape(self.scene.box((3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=40.0)
+    p.changeVisualShape(self.scene.box((-3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=0.0)
+    before = self.scene.render()[0]
+    p.changeVisualShape(self.scene.ground, -1, thermalPassive=[25.0, -1.0, 0.0, 22.0])
+    self.assertTrue(np.array_equal(self.scene.render()[0], before))
+    greys = []
+    for reference in (0.0, 0.5):
+      p.changeVisualShape(self.scene.ground, -1, thermalPassive=[25.0, reference, 0.0, 22.0])
+      rgb, depth, seg, view = self.scene.render()
+      ground = self.scene.ground
+      grey = self.region(rgb[..., 0], depth, seg, view, ground, x=(-4.0, -1.0), y=(-4.0, -1.0))
+      greys.append(grey)
+    self.assertGreater(greys[0], greys[1] + 10)
+    self.scene.box((0, 0, 3), (0.5, 0.5, 0.02))
+    p.changeVisualShape(self.scene.ground, -1, thermalPassive=[25.0, -1.0, 0.0, 0.0])
+    rgb, depth, seg, view = self.scene.render(sun=SUN_45)
+    ground = self.scene.ground
+    shade = self.region(rgb[..., 0], depth, seg, view, ground, x=(-3.3, -2.7), y=(-0.3, 0.3))
+    sunlit = self.region(rgb[..., 0], depth, seg, view, ground, x=(2.7, 3.3), y=(-0.3, 0.3))
+    self.assertAlmostEqual(sunlit, shade, delta=3.0)
+
+  def test_a_wider_read_evens_a_passive_pictures_halves(self):
+    """A passive square's bright half is warmer than its dark half; read wider than its whole
+    picture the two halves come within a quarter of that, the pixel's own texel left as fine
+    texture; a passive body whose temperature is set takes no number of its own."""
+    quad = self.scene.painted_quad((0, 0, 0.5))
+    p.changeVisualShape(self.scene.box((3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=40.0)
+    p.changeVisualShape(self.scene.box((-3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=0.0)
+
+    def halves():
+      """Mean grey of the square's dark and bright halves."""
+      rgb, depth, seg, view = self.scene.render()
+      dark = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.9, -0.2))
+      return dark, self.region(rgb[..., 0], depth, seg, view, quad, x=(0.2, 0.9))
+
+    dark, bright = halves()
+    self.assertGreater(bright, dark + 12)
+    p.changeVisualShape(quad, -1, thermalPassive=[25.0, -1.0, 64.0, 22.0])
+    wide_dark, wide_bright = halves()
+    self.assertGreater(wide_bright, wide_dark)
+    self.assertLess(wide_bright - wide_dark, (bright - dark) / 4.0)
+    p.changeVisualShape(quad, -1, temperature=20.0)
+    set_frame = self.scene.render()[0]
+    p.changeVisualShape(quad, -1, thermalPassive=[0.0, 0.9, 0.0, 0.0])
+    self.assertTrue(np.array_equal(self.scene.render()[0], set_frame))
+
+  def test_the_detail_number_alone_sets_how_much_a_passive_picture_shows(self):
+    """On a passive painted square, a detail of zero evens its dark and bright halves, the engine's
+    own number shows the bright half warmer, and twice that number shows it more: only that one
+    number was changed."""
+    quad = self.scene.painted_quad((0, 0, 0.5))
+    p.changeVisualShape(self.scene.box((3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=40.0)
+    p.changeVisualShape(self.scene.box((-3, 3, 0.5), (0.3, 0.3, 0.5)), -1, temperature=0.0)
+    gaps = []
+    for detail in (0.0, 25.0, 50.0):
+      p.changeVisualShape(quad, -1, thermalPassive=[detail, -1.0, 0.0, 22.0])
+      rgb, depth, seg, view = self.scene.render()
+      dark = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.9, -0.2))
+      bright = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.2, 0.9))
+      gaps.append(bright - dark)
+    self.assertAlmostEqual(gaps[0], 0.0, delta=3.0)
+    self.assertGreater(gaps[1], 12.0)
+    self.assertGreater(gaps[2], gaps[1] + 8.0)
+
+  def test_a_wider_read_keeps_off_the_far_edge_of_its_own_picture(self):
+    """Read four texels wide and seen from close, the dark half is as cold a little in from its
+    outer edge as in its middle: the read does not reach round the picture's edge into the bright
+    half on the other side."""
+    quad = self.scene.painted_quad((0, 0, 0.5))
+    p.changeVisualShape(quad, -1, thermalPassive=[25.0, -1.0, 4.0, 22.0])
+    rgb, depth, seg, view = self.scene.render(eye=CLOSE)
+    edge = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.85, -0.76), y=(-0.5, 0.5))
+    middle = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.6, -0.4), y=(-0.5, 0.5))
+    bright = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.4, 0.6), y=(-0.5, 0.5))
+    self.assertGreater(bright, middle + 60.0)
+    self.assertAlmostEqual(edge, middle, delta=0.05 * (bright - middle))
+
+  def test_a_wider_read_holds_the_edge_of_a_picture_of_any_size(self):
+    """A picture 23 texels across halves to levels that do not line up with it; read at widths that
+    fall between two of them, each half is still as cold or as warm a little in from its outer edge
+    as in its middle."""
+    quad = self.scene.painted_quad((0, 0, 0.5), texels=23)
+    for footprint in (4.1, 5.5):
+      with self.subTest(footprint=footprint):
+        p.changeVisualShape(quad, -1, thermalPassive=[25.0, -1.0, footprint, 22.0])
+        rgb, depth, seg, view = self.scene.render(eye=CLOSE)
+        edge = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.85, -0.76), y=(-0.5, 0.5))
+        middle = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.6, -0.4), y=(-0.5, 0.5))
+        bright = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.4, 0.6), y=(-0.5, 0.5))
+        far_edge = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.76, 0.85), y=(-0.5, 0.5))
+        self.assertGreater(bright, middle + 60.0)
+        self.assertAlmostEqual(edge, middle, delta=0.05 * (bright - middle))
+        self.assertAlmostEqual(far_edge, bright, delta=0.05 * (bright - middle))
+
+  def test_a_wider_read_repeats_a_picture_its_shape_repeats(self):
+    """A square that lays its picture three times side by side is read as it repeats in every copy:
+    the bright half's outer edge takes some of the next copy's dark half, and by the same amount in
+    the first copy as in the second."""
+    quad = self.scene.painted_quad((0, 0, 0.5), half=3.0, copies=3)
+    p.changeVisualShape(quad, -1, thermalPassive=[25.0, -1.0, 4.0, 22.0])
+    rgb, depth, seg, view = self.scene.render(eye=CLOSE)
+    first = self.region(rgb[..., 0], depth, seg, view, quad, x=(-1.24, -1.02), y=(-0.5, 0.5))
+    second = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.76, 0.98), y=(-0.5, 0.5))
+    dark = self.region(rgb[..., 0], depth, seg, view, quad, x=(-0.6, -0.4), y=(-0.5, 0.5))
+    bright = self.region(rgb[..., 0], depth, seg, view, quad, x=(0.2, 0.4), y=(-0.5, 0.5))
+    self.assertGreater(bright, dark + 60.0)
+    self.assertLess(second, bright - 0.1 * (bright - dark))
+    self.assertAlmostEqual(first, second, delta=0.05 * (bright - dark))
+
+  def test_passive_numbers_that_are_refused_fail_and_change_nothing(self):
+    """A NaN, an infinity, a footprint under zero or over 4096 texels, an element that is not a
+    number, or a list that is not four long fails the call, and after each one the frame is still as
+    it was."""
+    before = self.scene.render()[0]
+    refused = (
+      [float("nan"), -1.0, 0.0, 22.0], [25.0, float("inf"), 0.0, 22.0],
+      [25.0, -1.0, float("nan"), 22.0], [25.0, -1.0, -1.0, 22.0], [25.0, -1.0, 5000.0, 22.0],
+      [25.0, -1.0, 0.0, float("-inf")], [object(), -1.0, 4.0, 22.0], [50.0, "a", 4.0, 22.0],
+      [50.0, 0.9, 4.0, None], [50.0, 0.9, 4.0], 50.0,
+    )
+    for bad in refused:
+      with self.subTest(bad=repr(bad)):
+        with self.assertRaises(p.error):
+          p.changeVisualShape(self.scene.ground, -1, thermalPassive=bad)
+        self.assertTrue(np.array_equal(self.scene.render()[0], before))
 
   def test_depth_and_mask_match_the_colour_frame(self):
     """The thermal frame's depth and segmentation are byte-identical to the ray-cast colour frame's."""

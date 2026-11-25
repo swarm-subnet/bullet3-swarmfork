@@ -3086,7 +3086,7 @@ void TinyRendererVisualShapeConverter::changeShapeTexture(int bodyUniqueId, int 
 }
 
 void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
-													 int textureUniqueId, float low, float high)
+													 int textureUniqueId, float low, float high, const float passive[/*4*/])
 {
 	m_data->m_pictureRevision++;
 	// A heat map reads the texels the plugin keeps for a loaded texture; one handed over to a mesh has none left here.
@@ -3131,6 +3131,14 @@ void TinyRendererVisualShapeConverter::changeThermal(int bodyUniqueId, int linkI
 				thermal.m_heatHeight = heatHeight;
 				thermal.m_heatLow = low;
 				thermal.m_heatHigh = high;
+			}
+			// A footprint of one texel or less reads the texture as the pixel sees it, the default.
+			if (fields & THERMAL_FIELD_PASSIVE)
+			{
+				thermal.m_passiveDetail = passive[0];
+				thermal.m_passiveReference = passive[1];
+				thermal.m_passiveFootprint = passive[2] > 1.0f ? passive[2] : 0.f;
+				thermal.m_passiveSun = passive[3];
 			}
 		}
 	}

@@ -28,6 +28,8 @@ struct SharedMesh
 	bool hasAABB_;
 	// -1 until asked: whether every corner's uv index is its vertex index.
 	int uvByVertex_;
+	// -1 until asked: whether any uv lies outside one copy of the texture.
+	int uvRepeats_;
 	Vec3f aabbMin_;
 	Vec3f aabbMax_;
 	// Set once anything wrote the arrays after setMeshFromArrays, such as a normal normalised in place; never released then.
@@ -41,7 +43,7 @@ struct SharedMesh
 	void (*restore_)(void*);
 	void* restoreContext_;
 
-	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false), uvByVertex_(-1), written_(false), released_(false),
+	SharedMesh() : hash_(0), refs_(1), registered_(false), hasAABB_(false), uvByVertex_(-1), uvRepeats_(-1), written_(false), released_(false),
 				   wasRegistered_(false), numVerts_(0), numNorms_(0), numCorners_(0), restore_(0), restoreContext_(0) {}
 };
 
@@ -546,6 +548,21 @@ bool Model::uvIndexedByVertex() const
 	return m_mesh->uvByVertex_ != 0;
 }
 
+bool Model::uvRepeats() const
+{
+	if (m_mesh->uvRepeats_ < 0)
+	{
+		needArrays();
+		// A uv a rounding step past the edge still belongs to the one copy.
+		const float low = -1.f / 4096.f, high = 1.f + 1.f / 4096.f;
+		int repeats = 0;
+		for (size_t i = 0; !repeats && i < m_mesh->uv_.size(); i++)
+			repeats = m_mesh->uv_[i][0] < low || m_mesh->uv_[i][0] > high || m_mesh->uv_[i][1] < low || m_mesh->uv_[i][1] > high;
+		m_mesh->uvRepeats_ = repeats;
+	}
+	return m_mesh->uvRepeats_ != 0;
+}
+
 const float* Model::uvArray() const
 {
 	needArrays();
@@ -584,6 +601,7 @@ bool Model::releaseMeshArrays(void (*restore)(void*), void* context)
 	Vec3f aabbMin, aabbMax;
 	getLocalAABB(aabbMin, aabbMax);
 	uvIndexedByVertex();
+	uvRepeats();
 	mesh->numVerts_ = (int)mesh->verts_.size();
 	mesh->numNorms_ = (int)mesh->norms_.size();
 	mesh->numCorners_ = (int)mesh->faces_.size();
@@ -880,9 +898,9 @@ static inline int wrapTexel(int i, int n)
 	return (i % n + n) % n;
 }
 
-// Four-texel blend inside one level with 8-bit fixed-point weights, repeat wrap.
-// u and v are already in [0, 1).
-static TGAColor sampleBilinear(TGAImage& img, float u, float v)
+// Four-texel blend inside one level with 8-bit fixed-point weights. u and v are already in [0, 1): the texture
+// repeats past its edge, or with `held` (u and v in [0, 1]) the edge texel is read again instead.
+static TGAColor sampleBilinear(TGAImage& img, float u, float v, bool held = false)
 {
 	const int w = img.get_width(), h = img.get_height(), bpp = img.get_bytespp();
 	const float x = u * w - 0.5f;
@@ -891,10 +909,22 @@ static TGAColor sampleBilinear(TGAImage& img, float u, float v)
 	const float fy = std::floor(y);
 	const int wx = (int)((x - fx) * 256.f);
 	const int wy = (int)((y - fy) * 256.f);
-	int x0 = wrapTexel((int)fx, w);
-	int y0 = wrapTexel((int)fy, h);
-	const int x1 = (x0 + 1 == w) ? 0 : x0 + 1;
-	const int y1 = (y0 + 1 == h) ? 0 : y0 + 1;
+	int x0, y0, x1, y1;
+	if (held)
+	{
+		const int ix = (int)fx, iy = (int)fy;
+		x0 = ix < 0 ? 0 : (ix < w ? ix : w - 1);
+		y0 = iy < 0 ? 0 : (iy < h ? iy : h - 1);
+		x1 = ix + 1 < w ? (ix + 1 < 0 ? 0 : ix + 1) : w - 1;
+		y1 = iy + 1 < h ? (iy + 1 < 0 ? 0 : iy + 1) : h - 1;
+	}
+	else
+	{
+		x0 = wrapTexel((int)fx, w);
+		y0 = wrapTexel((int)fy, h);
+		x1 = (x0 + 1 == w) ? 0 : x0 + 1;
+		y1 = (y0 + 1 == h) ? 0 : y0 + 1;
+	}
 	const unsigned char* s = img.buffer();
 	const unsigned char* p00 = s + (x0 + y0 * w) * bpp;
 	const unsigned char* p10 = s + (x1 + y0 * w) * bpp;
@@ -948,14 +978,14 @@ static MipPick pickLevels(SharedTexture& tex, float rho2)
 	return pick;
 }
 
-// One trilinear read from the levels pickLevels chose.
-static TGAColor sampleLevels(const MipPick& pick, float u, float v)
+// One trilinear read from the levels pickLevels chose, each level read as sampleBilinear reads it.
+static TGAColor sampleLevels(const MipPick& pick, float u, float v, bool held = false)
 {
-	TGAColor a = sampleBilinear(*pick.m_a, u, v);
+	TGAColor a = sampleBilinear(*pick.m_a, u, v, held);
 	const int wl = pick.m_weight;
 	if (wl == 0)
 		return a;
-	TGAColor b = sampleBilinear(*pick.m_b, u, v);
+	TGAColor b = sampleBilinear(*pick.m_b, u, v, held);
 	for (int i = 0; i < (int)a.bytespp; i++)
 		a.bgra[i] = (unsigned char)((a.bgra[i] * (256 - wl) + b.bgra[i] * wl + 128) >> 8);
 	return a;
@@ -1237,6 +1267,25 @@ void Model::diffuseFilteredMany(Model* const* models, const Vec2f* uv, const Vec
 		out[k] = models[k]->diffuseFiltered(uv[k], duvdx[k], duvdy[k], maxTaps);
 }
 
+TGAColor Model::diffuseWide(Vec2f uvf, float du, float dv)
+{
+	if (uvRepeats())
+		return diffuseFiltered(uvf, Vec2f(du, 0.f), Vec2f(0.f, dv), 1);
+	if (!m_diffuse)
+		return TGAColor(255, 255, 255, 255);
+	const int w = m_diffuse->img_.get_width(), h = m_diffuse->img_.get_height();
+	if (!w || !h)
+		return TGAColor(255, 255, 255, 255);
+	if (!m_diffuse->mipsBuilt_)
+		buildMips(*m_diffuse);
+	const float sx = du * w, ty = dv * h;
+	const float rx2 = sx * sx, ry2 = ty * ty;
+	// A uv that is not a number reads the first texel.
+	const float u = uvf[0] > 0.f ? (uvf[0] < 1.f ? uvf[0] : 1.f) : 0.f;
+	const float v = uvf[1] > 0.f ? (uvf[1] < 1.f ? uvf[1] : 1.f) : 0.f;
+	return sampleLevels(pickLevels(*m_diffuse, rx2 > ry2 ? rx2 : ry2), u, v, true);
+}
+
 TGAColor Model::diffuseMean(Vec2f uvf)
 {
 	if (!m_diffuse || !m_diffuse->img_.get_width() || !m_diffuse->img_.get_height())
@@ -1244,6 +1293,16 @@ TGAColor Model::diffuseMean(Vec2f uvf)
 	if (!m_diffuse->mipsBuilt_)
 		buildMips(*m_diffuse);
 	return sampleBilinear(m_diffuse->mips_.empty() ? m_diffuse->img_ : *m_diffuse->mips_.back(), wrapUnit(uvf[0]), wrapUnit(uvf[1]));
+}
+
+int Model::diffuseWidth() const
+{
+	return m_diffuse ? m_diffuse->img_.get_width() : 0;
+}
+
+int Model::diffuseHeight() const
+{
+	return m_diffuse ? m_diffuse->img_.get_height() : 0;
 }
 
 unsigned char Model::alphaFiltered(Vec2f uvf, float footprintUv2, bool* averaged) const

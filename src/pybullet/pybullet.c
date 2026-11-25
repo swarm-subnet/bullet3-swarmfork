@@ -7984,21 +7984,49 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 	PyObject* rgbaColorObj = 0;
 	PyObject* specularColorObj = 0;
 	int flags = -1;
-	// ER_SWARM_THERMAL: a temperature (NaN makes the surface passive again), an emissivity, and a heat map texture with
-	// the range its red byte spans (-1 removes it)
+	// ER_SWARM_THERMAL: a temperature (NaN makes the surface passive again), an emissivity, a heat map texture with
+	// the range its red byte spans (-1 removes it), and how a passive surface reads its own texture and the sun
 	PyObject* temperatureObj = 0;
 	PyObject* emissivityObj = 0;
 	int thermalTextureUniqueId = -2;
 	PyObject* temperatureRangeObj = 0;
+	PyObject* thermalPassiveObj = 0;
 	double temperatureRange[2] = {0, 0};
-	int hasTemperature, hasEmissivity;
+	double thermalPassive[4] = {0, 0, 0, 0};
+	int hasTemperature, hasEmissivity, hasThermalPassive;
 	double temperature, emissivity;
 	b3PhysicsClientHandle sm = 0;
-	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", "temperature", "emissivity", "thermalTextureUniqueId", "temperatureRange", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOiiOOiO", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags, &physicsClientId,
-									 &temperatureObj, &emissivityObj, &thermalTextureUniqueId, &temperatureRangeObj))
+	static char* kwlist[] = {"objectUniqueId", "linkIndex", "shapeIndex", "textureUniqueId", "rgbaColor", "specularColor", "flags", "physicsClientId", "temperature", "emissivity", "thermalTextureUniqueId", "temperatureRange", "thermalPassive", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, keywds, "ii|iiOOiiOOiOO", kwlist, &objectUniqueId, &jointIndex, &shapeIndex, &textureUniqueId, &rgbaColorObj, &specularColorObj, &flags, &physicsClientId,
+									 &temperatureObj, &emissivityObj, &thermalTextureUniqueId, &temperatureRangeObj, &thermalPassiveObj))
 	{
 		return NULL;
+	}
+	hasThermalPassive = thermalPassiveObj && thermalPassiveObj != Py_None;
+	// An element that is not a number leaves its error set while the vector reads as filled.
+	if (hasThermalPassive && (!pybullet_internalSetVector4d(thermalPassiveObj, thermalPassive) || PyErr_Occurred()))
+	{
+		PyErr_Clear();
+		PyErr_SetString(SpamError, "thermalPassive needs [detail, reference, footprint, sun]: degrees per unit of luminance, the luminance measured against (below zero: the texture's mean), texels, degrees.");
+		return NULL;
+	}
+	if (hasThermalPassive)
+	{
+		// A number that is not finite would reach every pixel of the body; the footprint is a width in texels.
+		int k;
+		for (k = 0; k < 4; k++)
+		{
+			if (!(thermalPassive[k] - thermalPassive[k] == 0.0) || thermalPassive[k] > 1.0e6 || thermalPassive[k] < -1.0e6)
+			{
+				PyErr_SetString(SpamError, "thermalPassive takes four finite numbers.");
+				return NULL;
+			}
+		}
+		if (thermalPassive[2] < 0.0 || thermalPassive[2] > 4096.0)
+		{
+			PyErr_SetString(SpamError, "thermalPassive's footprint is a width in texels, from 0 to 4096.");
+			return NULL;
+		}
 	}
 	if (thermalTextureUniqueId >= 0 && !pybullet_internalSetVector2d(temperatureRangeObj, temperatureRange))
 	{
@@ -8056,6 +8084,10 @@ static PyObject* pybullet_changeVisualShape(PyObject* self, PyObject* args, PyOb
 		if (thermalTextureUniqueId >= -1)
 		{
 			b3UpdateVisualShapeHeatMap(commandHandle, thermalTextureUniqueId, temperatureRange[0], temperatureRange[1]);
+		}
+		if (hasThermalPassive)
+		{
+			b3UpdateVisualShapeThermalPassive(commandHandle, thermalPassive);
 		}
 
 		statusHandle = b3SubmitClientCommandAndWaitStatus(sm, commandHandle);
@@ -14069,6 +14101,8 @@ initpybullet(void)
 	PyModule_AddIntConstant(m, "ER_SWARM_DAYLIGHT", ER_SWARM_DAYLIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_LEAF_NO_SHADOW", ER_SWARM_LEAF_NO_SHADOW);
 	PyModule_AddIntConstant(m, "ER_SWARM_THERMAL", ER_SWARM_THERMAL);
+	// Present where changeVisualShape takes thermalPassive.
+	PyModule_AddIntConstant(m, "THERMAL_FIELD_PASSIVE", THERMAL_FIELD_PASSIVE);
 	PyModule_AddIntConstant(m, "ER_SWARM_LOW_LIGHT", ER_SWARM_LOW_LIGHT);
 	PyModule_AddIntConstant(m, "ER_SWARM_NEAR_INFRARED", ER_SWARM_NEAR_INFRARED);
 	PyModule_AddIntConstant(m, "ER_SWARM_EDGE_OUTLINE", ER_SWARM_EDGE_OUTLINE);
