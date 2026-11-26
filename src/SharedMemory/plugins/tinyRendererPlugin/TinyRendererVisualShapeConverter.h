@@ -35,7 +35,7 @@ struct TinyRendererVisualShapeConverter : public UrdfRenderingInterface
 	virtual void changeShapeTexture(int bodyUniqueId, int linkIndex, int shapeIndex, int textureUniqueId);
 
 	virtual void changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
-							   int textureUniqueId, float low, float high);
+							   int textureUniqueId, float low, float high, const float passive[/*4*/]);
 
 	virtual void setUpAxis(int axis);
 

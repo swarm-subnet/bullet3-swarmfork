@@ -14798,9 +14798,13 @@ bool PhysicsServerCommandProcessor::processUpdateVisualShapeCommand(const struct
 			InternalTextureHandle* heatHandle = m_data->m_textureHandles.getHandle(thermal.m_heatTextureUniqueId);
 			heatTexture = heatHandle ? heatHandle->m_tinyRendererTextureId : -1;
 		}
+		float passive[4] = {0.f, 0.f, 0.f, 0.f};
+		if (thermal.m_thermalFields & THERMAL_FIELD_PASSIVE)
+			for (int i = 0; i < 4; i++)
+				passive[i] = (float)thermal.m_thermalPassive[i];
 		m_data->m_pluginManager.getRenderInterface()->changeThermal(thermal.m_bodyUniqueId, thermal.m_jointIndex, thermal.m_shapeIndex,
 																	 thermal.m_thermalFields, (float)thermal.m_temperature, (float)thermal.m_emissivity,
-																	 heatTexture, (float)thermal.m_heatRange[0], (float)thermal.m_heatRange[1]);
+																	 heatTexture, (float)thermal.m_heatRange[0], (float)thermal.m_heatRange[1], passive);
 	}
 
 	{

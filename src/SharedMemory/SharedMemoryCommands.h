@@ -451,6 +451,7 @@ struct UpdateVisualShapeDataArgs
 	double m_emissivity;
 	int m_heatTextureUniqueId;
 	double m_heatRange[2];
+	double m_thermalPassive[4];
 };
 
 struct LoadTextureArgs

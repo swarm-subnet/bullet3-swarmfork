@@ -5472,6 +5472,19 @@ B3_SHARED_API void b3UpdateVisualShapeHeatMap(b3SharedMemoryCommandHandle comman
 	}
 }
 
+B3_SHARED_API void b3UpdateVisualShapeThermalPassive(b3SharedMemoryCommandHandle commandHandle, const double passive[/*4*/])
+{
+	struct SharedMemoryCommand* command = (struct SharedMemoryCommand*)commandHandle;
+	b3Assert(command);
+	b3Assert(command->m_type == CMD_UPDATE_VISUAL_SHAPE);
+	if (command->m_type == CMD_UPDATE_VISUAL_SHAPE)
+	{
+		b3UpdateVisualShapeMarkThermal(command, THERMAL_FIELD_PASSIVE);
+		for (int i = 0; i < 4; i++)
+			command->m_updateVisualShapeDataArguments.m_thermalPassive[i] = passive[i];
+	}
+}
+
 B3_SHARED_API b3SharedMemoryCommandHandle b3ApplyExternalForceCommandInit(b3PhysicsClientHandle physClient)
 {
 	PhysicsClient* cl = (PhysicsClient*)physClient;

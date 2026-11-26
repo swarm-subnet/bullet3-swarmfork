@@ -88,6 +88,8 @@ public:
 	const void* meshKey() const { return m_mesh; }
 	// True when every corner names the same index for its position and its uv, so uvArray() reads by vertex index.
 	bool uvIndexedByVertex() const;
+	// True when any uv of the mesh lies outside one copy of the texture, so the mesh lays the texture out repeated.
+	bool uvRepeats() const;
 	// The uv pairs in vertex order, valid only while this Model holds the mesh; 0 when the mesh carries none.
 	const float* uvArray() const;
 	// Content hash of the mesh arrays, the same across processes for the same vertices and faces.
@@ -108,8 +110,14 @@ public:
 	// diffuseFiltered for count reads, each with its own model: the bytes diffuseFiltered gives each, eight reads at a
 	// time in vector lanes where the build has AVX2.
 	static void diffuseFilteredMany(Model* const* models, const Vec2f* uv, const Vec2f* duvdx, const Vec2f* duvdy, int count, int maxTaps, TGAColor* out);
+	// One trilinear read du by dv of uv wide. A mesh that keeps inside one copy of the texture holds the texture's
+	// edge, so the read never reaches round to the far side; a mesh that repeats the texture reads it as it repeats.
+	TGAColor diffuseWide(Vec2f uv, float du, float dv);
 	// The texture's mean, its last mip level, read as diffuseFiltered reads it for a footprint wider than the texture.
 	TGAColor diffuseMean(Vec2f uv);
+	// The diffuse texture's size in texels, zero without one.
+	int diffuseWidth() const;
+	int diffuseHeight() const;
 	bool hasAlpha() const;
 	// Alpha of the texel diffuse(uv) reads, 255 when the texture carries no alpha plane.
 	unsigned char alpha(Vec2f uv) const;

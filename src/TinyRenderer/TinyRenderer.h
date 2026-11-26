@@ -91,9 +91,16 @@ struct TinyRenderThermal
 	int m_heatHeight;
 	float m_heatLow;
 	float m_heatHigh;
+	// How a passive surface reads its own texture: the degrees a texel is warmer per unit of linear luminance over the
+	// reference, the reference (below zero: the texture's mean), the least width in texels the texture is read at for
+	// its temperature (zero: as the pixel sees it), and the degrees a full sun warms a black surface facing it.
+	float m_passiveDetail;
+	float m_passiveReference;
+	float m_passiveFootprint;
+	float m_passiveSun;
 
 	TinyRenderThermal()
-		: m_hasTemperature(false), m_temperature(0.f), m_emissivity(-1.f), m_heatTexels(0), m_heatWidth(0), m_heatHeight(0), m_heatLow(0.f), m_heatHigh(0.f)
+		: m_hasTemperature(false), m_temperature(0.f), m_emissivity(-1.f), m_heatTexels(0), m_heatWidth(0), m_heatHeight(0), m_heatLow(0.f), m_heatHigh(0.f), m_passiveDetail(25.f), m_passiveReference(-1.f), m_passiveFootprint(0.f), m_passiveSun(22.f)
 	{
 	}
 };

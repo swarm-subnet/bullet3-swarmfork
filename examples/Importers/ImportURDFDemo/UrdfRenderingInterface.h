@@ -46,9 +46,11 @@ struct UrdfRenderingInterface
 
 	///ER_SWARM_THERMAL: change the fields of a visual shape that `fields` names (the THERMAL_FIELD_ bits): a temperature
 	///in degrees Celsius, NaN making the surface passive again; an emissivity, below zero for the default; a heat map
-	///texture whose red byte runs from low to high degrees, -1 removing it
+	///texture whose red byte runs from low to high degrees, -1 removing it; and how a passive surface reads: the degrees
+	///per unit of luminance its texture shows, the luminance that is measured against (below zero: the texture's own
+	///mean), the least width in texels the texture is read at, and the degrees a full sun warms a black surface by
 	virtual void changeThermal(int bodyUniqueId, int linkIndex, int shapeIndex, int fields, float temperature, float emissivity,
-							   int textureUniqueId, float low, float high) {}
+							   int textureUniqueId, float low, float high, const float passive[/*4*/]) {}
 
 	//change the instance flags, double-sided rendering
 	virtual void changeInstanceFlags(int bodyUniqueId, int linkIndex, int shapeIndex, int flags) = 0;
